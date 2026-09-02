@@ -1,0 +1,14 @@
+.{
+    .name = .opentype,
+    .version = "0.0.0",
+    .fingerprint = 0x532062a5d01caeb5, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+        "LICENSE",
+    },
+}
