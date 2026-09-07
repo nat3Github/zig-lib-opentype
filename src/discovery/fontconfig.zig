@@ -27,7 +27,10 @@ const discovery = @import("../discovery.zig");
 const FcConfig = opaque {};
 const FcPattern = opaque {};
 const FcObjectSet = opaque {};
+const FcCharSet = opaque {};
 const FcChar8 = u8;
+const FcChar32 = u32;
+const FcBool = c_int;
 
 // `_FcFontSet`'s field layout is part of fontconfig's stable public ABI
 // (accessed directly by every C caller that lists fonts), so hardcoding it
@@ -50,6 +53,7 @@ const FC_SLANT = "slant";
 const FC_WEIGHT = "weight";
 const FC_WIDTH = "width";
 const FC_FAMILY = "family";
+const FC_CHARSET = "charset";
 
 const FC_SLANT_ROMAN: c_int = 0;
 const FC_SLANT_ITALIC: c_int = 100;
@@ -76,6 +80,12 @@ const Lib = struct {
     FcDefaultSubstitute: *const fn (*FcPattern) callconv(.c) void,
     FcFontSort: *const fn (?*FcConfig, *FcPattern, c_int, ?*anyopaque, *FcResult) callconv(.c) ?*FcFontSet,
     FcWeightToOpenTypeDouble: *const fn (f64) callconv(.c) f64,
+    FcPatternCreate: *const fn () callconv(.c) ?*FcPattern,
+    FcCharSetCreate: *const fn () callconv(.c) ?*FcCharSet,
+    FcCharSetDestroy: *const fn (*FcCharSet) callconv(.c) void,
+    FcCharSetAddChar: *const fn (*FcCharSet, FcChar32) callconv(.c) FcBool,
+    FcPatternAddCharSet: *const fn (*FcPattern, [*:0]const u8, *const FcCharSet) callconv(.c) FcBool,
+    FcFontMatch: *const fn (?*FcConfig, *FcPattern, *FcResult) callconv(.c) ?*FcPattern,
 
     // Sonames to try in order: ".so.1" is what every distro package ships;
     // ".so" (dev-package symlink) is a fallback for non-standard setups.
@@ -140,7 +150,7 @@ pub const Fontconfig = struct {
         std.debug.assert(handle_buf.len == properties_buf.len);
 
         var resolved_name_buf: [256]u8 = undefined;
-        const resolved_name = if (isGenericFamilyName(family_name))
+        const resolved_name = if (discovery.FamilyName.isGeneric(family_name))
             try self.selectGenericFontFamily(family_name, &resolved_name_buf)
         else
             family_name;
@@ -192,6 +202,70 @@ pub const Fontconfig = struct {
         return .{ .fonts = handle_buf[0..count], .properties = properties_buf[0..count] };
     }
 
+    /// Lists every font family fontconfig knows about (`FcFontList` with no
+    /// pattern constraints, one `FC_FAMILY` per matched font — hence the
+    /// dedupe in `discovery.FamilyList`, since a family shows up once per
+    /// installed face).
+    pub fn availableFamilies(
+        self: *const Fontconfig,
+        names_buf: [][]const u8,
+        name_storage: []u8,
+    ) []const []const u8 {
+        var list: discovery.FamilyList = .{ .names = names_buf, .storage = name_storage };
+
+        const pattern = self.lib.FcPatternCreate() orelse return list.slice();
+        defer self.lib.FcPatternDestroy(pattern);
+
+        const object_set = self.lib.FcObjectSetCreate() orelse return list.slice();
+        defer self.lib.FcObjectSetDestroy(object_set);
+        _ = self.lib.FcObjectSetAdd(object_set, FC_FAMILY);
+
+        const font_set = self.lib.FcFontList(self.config, pattern, object_set) orelse return list.slice();
+        defer self.lib.FcFontSetDestroy(font_set);
+
+        for (font_set.fonts[0..@intCast(font_set.nfont)]) |maybe_patt| {
+            const patt = maybe_patt orelse continue;
+            list.append(self.getString(patt, FC_FAMILY) orelse continue);
+        }
+        return list.slice();
+    }
+
+    /// Finds a font covering `codepoint` the way every fontconfig-based text
+    /// stack (Pango, HarfBuzz's own hb-ft/uharfbuzz users) does it: put the
+    /// codepoint in an `FcCharSet`, run it through the config's normal
+    /// substitution + match pipeline (`FcConfigSubstitute` pulls in the
+    /// user's configured fallback chain), and take whatever `FcFontMatch`
+    /// picks -- fontconfig already ranks installed fonts by charset coverage.
+    pub fn selectFallbackForCodepoint(
+        self: *const Fontconfig,
+        codepoint: u21,
+        path_storage: []u8,
+    ) discovery.SelectionError!discovery.Handle {
+        const charset = self.lib.FcCharSetCreate() orelse return discovery.SelectionError.NotFound;
+        defer self.lib.FcCharSetDestroy(charset);
+        if (self.lib.FcCharSetAddChar(charset, @intCast(codepoint)) == 0) return discovery.SelectionError.NotFound;
+
+        const pattern = self.lib.FcPatternCreate() orelse return discovery.SelectionError.NotFound;
+        defer self.lib.FcPatternDestroy(pattern);
+        if (self.lib.FcPatternAddCharSet(pattern, FC_CHARSET, charset) == 0) return discovery.SelectionError.NotFound;
+
+        _ = self.lib.FcConfigSubstitute(self.config, pattern, FcMatchPattern);
+        self.lib.FcDefaultSubstitute(pattern);
+
+        var result: FcResult = undefined;
+        const matched = self.lib.FcFontMatch(self.config, pattern, &result) orelse return discovery.SelectionError.NotFound;
+        defer self.lib.FcPatternDestroy(matched);
+        if (result != FcResultMatch) return discovery.SelectionError.NotFound;
+
+        const path = self.getString(matched, FC_FILE) orelse return discovery.SelectionError.NotFound;
+        if (path.len > path_storage.len) return discovery.SelectionError.NotFound;
+        const owned_path = path_storage[0..path.len];
+        @memcpy(owned_path, path);
+
+        const index = self.getInteger(matched, FC_INDEX) orelse 0;
+        return .{ .path = .{ .path = owned_path, .font_index = @intCast(index) } };
+    }
+
     fn selectGenericFontFamily(self: *const Fontconfig, name: []const u8, name_buf: []u8) discovery.SelectionError![]const u8 {
         var buf: [256]u8 = undefined;
         const name_z = std.fmt.bufPrintZ(&buf, "{s}", .{name}) catch return discovery.SelectionError.NotFound;
@@ -224,12 +298,6 @@ pub const Fontconfig = struct {
         return value;
     }
 };
-
-fn isGenericFamilyName(name: []const u8) bool {
-    const generic = [_][]const u8{ "serif", "sans-serif", "monospace", "cursive", "fantasy" };
-    for (generic) |g| if (std.mem.eql(u8, name, g)) return true;
-    return false;
-}
 
 fn slantToStyle(slant: c_int) discovery.Style {
     if (slant >= FC_SLANT_OBLIQUE) return .oblique;

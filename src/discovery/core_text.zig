@@ -44,7 +44,9 @@ pub const CoreText = struct {
         pub const serif = "Times New Roman";
         pub const sans_serif = "Arial";
         pub const monospace = "Courier New";
-        pub const cursive = "Comic Sans MS";
+        // Comic Sans MS is macOS-only; Snell Roundhand ships on both macOS
+        // and iOS, and CTFontCreateWithName substitutes silently on a miss.
+        pub const cursive = "Snell Roundhand";
         pub const fantasy = "Papyrus";
     };
 
@@ -121,7 +123,126 @@ pub const CoreText = struct {
         if (out_count == 0) return discovery.SelectionError.NotFound;
         return .{ .fonts = handle_buf[0..out_count], .properties = properties_buf[0..out_count] };
     }
+
+    /// Lists every font family installed on this machine, in
+    /// `CTFontManagerCopyAvailableFontFamilyNames` order (CoreText's own
+    /// catalog — the same list Font Book shows). See `discovery.FamilyList`
+    /// for the buffer contract.
+    pub fn availableFamilies(
+        self: *const CoreText,
+        names_buf: [][]const u8,
+        name_storage: []u8,
+    ) []const []const u8 {
+        _ = self;
+        var list: discovery.FamilyList = .{ .names = names_buf, .storage = name_storage };
+
+        const families = c.CTFontManagerCopyAvailableFontFamilyNames() orelse return list.slice();
+        defer c.CFRelease(families);
+
+        var buf: [256]u8 = undefined;
+        const count: usize = @intCast(c.CFArrayGetCount(families));
+        for (0..count) |i| {
+            const name: c.CFStringRef = @ptrCast(@alignCast(c.CFArrayGetValueAtIndex(families, @intCast(i)) orelse continue));
+            if (c.CFStringGetCString(name, &buf, buf.len, c.kCFStringEncodingUTF8) == 0) continue;
+            list.append(std.mem.sliceTo(&buf, 0));
+        }
+        return list.slice();
+    }
+
+    /// Finds a font covering `codepoint` via CoreText's own system cascade
+    /// list (`CTFontCreateForString`) -- the same mechanism TextKit uses for
+    /// glyph fallback, so results match what every other Cocoa app already
+    /// renders. No cmap scanning of the local font catalog: CoreText already
+    /// knows which installed font covers what.
+    ///
+    /// Which family a cascade bottoms out at depends on the *base* font
+    /// passed in, not just the codepoint's script: an empty/system-UI base
+    /// resolves CJK to `PingFangUI.ttc`, a private system-UI face whose
+    /// glyphs live only in Apple's proprietary `hvgl` table (no
+    /// glyf/CFF/CFF2 -- unrasterizable by any standard OpenType parser).
+    /// Seeding from each generic content-font family instead (same families
+    /// `generic_family_names` already maps for direct lookups) tends to
+    /// land on the real content font (e.g. `Songti.ttc` for CJK), so try
+    /// each and verify actual outline coverage via `CTFontCopyAvailableTables`
+    /// rather than trusting the first cascade hit.
+    pub fn selectFallbackForCodepoint(
+        self: *const CoreText,
+        codepoint: u21,
+        path_storage: []u8,
+        allocator: std.mem.Allocator,
+    ) discovery.SelectionError!discovery.Handle {
+        _ = self;
+        var utf8_buf: [4]u8 = undefined;
+        const utf8_len = std.unicode.utf8Encode(codepoint, &utf8_buf) catch return discovery.SelectionError.NotFound;
+        const cfstr = c.CFStringCreateWithBytes(null, &utf8_buf, @intCast(utf8_len), c.kCFStringEncodingUTF8, 0) orelse
+            return discovery.SelectionError.NotFound;
+        defer c.CFRelease(cfstr);
+        const range: c.CFRange = .{ .location = 0, .length = c.CFStringGetLength(cfstr) };
+
+        const base_families = [_][]const u8{
+            generic_family_names.serif,
+            generic_family_names.sans_serif,
+            generic_family_names.monospace,
+        };
+        for (base_families) |family_name| {
+            const family_cfstr = c.CFStringCreateWithBytes(null, family_name.ptr, @intCast(family_name.len), c.kCFStringEncodingUTF8, 0) orelse continue;
+            defer c.CFRelease(family_cfstr);
+            // Size is irrelevant here -- only the resulting cascade list matters.
+            const base_font = c.CTFontCreateWithName(family_cfstr, 12.0, null) orelse continue;
+            defer c.CFRelease(base_font);
+
+            const matched_font = c.CTFontCreateForString(base_font, cfstr, range) orelse continue;
+            defer c.CFRelease(matched_font);
+
+            const matched_descriptor = c.CTFontCopyFontDescriptor(matched_font) orelse continue;
+            defer c.CFRelease(matched_descriptor);
+
+            // When nothing installed covers the string, CoreText's cascade
+            // bottoms out at Apple's "Last Resort" font (every codepoint maps
+            // to a boxed placeholder glyph) -- that's a fake match, not real
+            // coverage.
+            if (familyNameIs(matched_descriptor, "LastResort")) continue;
+            if (!hasOutlineTable(matched_font)) continue;
+
+            const path = copyFilePath(matched_descriptor, path_storage) orelse continue;
+            return .{ .path = .{ .path = path, .font_index = resolveFontIndex(matched_descriptor, path, allocator) } };
+        }
+        return discovery.SelectionError.NotFound;
+    }
 };
+
+/// True if `font` has an outline table this codebase can rasterize.
+/// Queried straight from CoreText (`CTFontCopyAvailableTables`) rather than
+/// opening and parsing the file ourselves -- cheaper, and avoids duplicating
+/// dvui's own `hasUsableOutlines` file-based check just to reject a
+/// known-bad candidate one step earlier.
+fn hasOutlineTable(font: c.CTFontRef) bool {
+    const tables = c.CTFontCopyAvailableTables(font, 0) orelse return false;
+    defer c.CFRelease(tables);
+    const count: usize = @intCast(c.CFArrayGetCount(tables));
+    for (0..count) |i| {
+        const tag_ptr = c.CFArrayGetValueAtIndex(tables, @intCast(i)) orelse continue;
+        const tag: u32 = @truncate(@intFromPtr(tag_ptr));
+        switch (tag) {
+            fourCharCode("glyf"), fourCharCode("CFF "), fourCharCode("CFF2") => return true,
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn fourCharCode(comptime tag: *const [4]u8) u32 {
+    return (@as(u32, tag[0]) << 24) | (@as(u32, tag[1]) << 16) | (@as(u32, tag[2]) << 8) | tag[3];
+}
+
+fn familyNameIs(desc: c.CTFontDescriptorRef, name: []const u8) bool {
+    const family_ref = c.CTFontDescriptorCopyAttribute(desc, c.kCTFontFamilyNameAttribute) orelse return false;
+    const family_cfstr: c.CFStringRef = @ptrCast(@alignCast(family_ref));
+    defer c.CFRelease(family_cfstr);
+    var buf: [256]u8 = undefined;
+    if (c.CFStringGetCString(family_cfstr, &buf, buf.len, c.kCFStringEncodingUTF8) == 0) return false;
+    return std.mem.eql(u8, std.mem.sliceTo(&buf, 0), name);
+}
 
 fn copyFilePath(desc: c.CTFontDescriptorRef, buf: []u8) ?[]const u8 {
     const url: c.CFURLRef = @ptrCast(@alignCast(c.CTFontDescriptorCopyAttribute(desc, c.kCTFontURLAttribute) orelse return null));
@@ -222,7 +343,11 @@ fn resolveFontIndex(desc: c.CTFontDescriptorRef, path: []const u8, allocator: st
     if (c.CFStringGetCString(postscript_cfstr, &postscript_buf, postscript_buf.len, c.kCFStringEncodingUTF8) == 0) return 0;
     const postscript_name = std.mem.sliceTo(&postscript_buf, 0);
 
-    const data = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(64 * 1024 * 1024)) catch return 0;
+    // Matches Font.zig's system_font_size_limit -- Apple Color Emoji.ttc is
+    // ~180MB; a lower cap here silently falls back to face index 0 (wrong
+    // face, e.g. a Latin/Roman face instead of the matched script's face)
+    // while the actual font bytes load fine downstream with the correct cap.
+    const data = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(256 * 1024 * 1024)) catch return 0;
     defer allocator.free(data);
 
     const collection = parsing.Collection.parse(allocator, data) catch return 0;

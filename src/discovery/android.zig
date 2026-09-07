@@ -1,5 +1,6 @@
 const std = @import("std");
 const discovery = @import("../discovery.zig");
+const parsing = @import("../parsing.zig");
 
 // NOTE: no vendor reference — font-kit has no Android source (see
 // [[project_font_discovery_branch]]: font-kit only ships CoreText/
@@ -16,6 +17,9 @@ const discovery = @import("../discovery.zig");
 // fallback_fonts.xml format isn't handled; add if a target that old matters.
 const fonts_xml_path = "/system/etc/fonts.xml";
 const fonts_dir = "/system/fonts/";
+// Android system fonts top out around 30MB (NotoSansCJK); the cap only
+// exists so a corrupt/huge file can't be read into memory unbounded.
+const font_size_limit = 64 * 1024 * 1024;
 
 pub const Android = struct {
     /// Android's fonts.xml already defines "sans-serif"/"serif"/"monospace"/
@@ -37,6 +41,27 @@ pub const Android = struct {
 
     pub fn deinit(self: *Android) void {
         self.* = undefined;
+    }
+
+    /// Lists the families fonts.xml defines. Reads the file per call, same
+    /// as `selectFamilyByName`; see `availableFamiliesFromXml`.
+    pub fn availableFamilies(
+        self: *const Android,
+        names_buf: [][]const u8,
+        name_storage: []u8,
+        allocator: std.mem.Allocator,
+    ) []const []const u8 {
+        _ = self;
+
+        var threaded: std.Io.Threaded = .init(allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+
+        const data = std.Io.Dir.cwd().readFileAlloc(io, fonts_xml_path, allocator, .limited(4 * 1024 * 1024)) catch
+            return names_buf[0..0];
+        defer allocator.free(data);
+
+        return availableFamiliesFromXml(data, names_buf, name_storage);
     }
 
     /// Looks up a font family by name (or an alias name from fonts.xml's
@@ -64,7 +89,129 @@ pub const Android = struct {
 
         return selectFamilyFromXml(data, family_name, handle_buf, properties_buf, path_storage);
     }
+
+    /// Finds a font covering `codepoint`. Android has no query API for this
+    /// (no CoreText cascade list, no fontconfig charset match): fonts.xml's
+    /// own document order *is* the fallback order — the named families
+    /// (sans-serif, serif, ...) first, then the unnamed per-script
+    /// `<family lang="und-Arab">` fallback entries — so this walks it in
+    /// order and takes the first font whose `cmap` maps the codepoint,
+    /// which is what minikin's fallback chain resolves to.
+    ///
+    /// Coverage costs a full file read + parse per candidate, since the
+    /// only coverage data is in the fonts themselves. Callers are expected
+    /// to memoize per codepoint (dvui's `discoverDynamicFallback` does); if
+    /// that ever isn't enough, read just the table directory + `cmap` range
+    /// instead of the whole file.
+    pub fn selectFallbackForCodepoint(
+        self: *const Android,
+        codepoint: u21,
+        path_storage: []u8,
+        allocator: std.mem.Allocator,
+    ) discovery.SelectionError!discovery.Handle {
+        _ = self;
+
+        var threaded: std.Io.Threaded = .init(allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+
+        const data = std.Io.Dir.cwd().readFileAlloc(io, fonts_xml_path, allocator, .limited(4 * 1024 * 1024)) catch
+            return discovery.SelectionError.NotFound;
+        defer allocator.free(data);
+
+        return fallbackFromXml(data, codepoint, path_storage, FileCoverage{ .io = io, .allocator = allocator });
+    }
 };
+
+/// Real coverage probe for `fallbackFromXml`: opens the candidate and looks
+/// the codepoint up in its `cmap`. Split behind a `covers` method so the
+/// XML-walk ordering is testable without a device's /system/fonts.
+const FileCoverage = struct {
+    io: std.Io,
+    allocator: std.mem.Allocator,
+
+    fn covers(self: FileCoverage, path: []const u8, font_index: u32, codepoint: u21) bool {
+        const bytes = std.Io.Dir.cwd().readFileAlloc(self.io, path, self.allocator, .limited(font_size_limit)) catch return false;
+        defer self.allocator.free(bytes);
+
+        if (bytes.len >= 4 and std.mem.eql(u8, bytes[0..4], "ttcf")) {
+            const collection = parsing.Collection.parse(self.allocator, bytes) catch return false;
+            defer collection.deinit(self.allocator);
+            if (font_index >= collection.fonts.len) return false;
+            return fontCovers(collection.fonts[font_index], codepoint);
+        }
+
+        const font = parsing.Font.parse(self.allocator, bytes) catch return false;
+        defer font.deinit(self.allocator);
+        return fontCovers(font, codepoint);
+    }
+
+    fn fontCovers(font: parsing.Font, codepoint: u21) bool {
+        const cmap = font.tableData(.{ 'c', 'm', 'a', 'p' }) orelse return false;
+        const glyph = parsing.Table.cmap.lookup(cmap, codepoint) orelse return false;
+        return glyph != 0;
+    }
+};
+
+/// Core fallback walk, split out from `selectFallbackForCodepoint` the same
+/// way `selectFamilyFromXml` is: `coverage` is anything with a
+/// `covers(path, font_index, codepoint) bool` method.
+fn fallbackFromXml(
+    data: []const u8,
+    codepoint: u21,
+    path_storage: []u8,
+    coverage: anytype,
+) discovery.SelectionError!discovery.Handle {
+    var family_pos: usize = 0;
+    while (findTag(data, "family", &family_pos)) |family| {
+        var font_pos: usize = 0;
+        while (findTag(family.body, "font", &font_pos)) |font| {
+            const filename = fontFileName(font.body);
+            if (filename.len == 0) continue;
+            const path_len = fonts_dir.len + filename.len;
+            if (path_len > path_storage.len) continue;
+            const path = path_storage[0..path_len];
+            @memcpy(path[0..fonts_dir.len], fonts_dir);
+            @memcpy(path[fonts_dir.len..], filename);
+
+            const font_index: u32 = @intFromFloat(parseFloat(attrValue(font.attrs, "index")) orelse 0.0);
+            if (coverage.covers(path, font_index, codepoint))
+                return .{ .path = .{ .path = path, .font_index = font_index } };
+        }
+    }
+    return discovery.SelectionError.NotFound;
+}
+
+/// A `<font>` body is the filename, optionally followed by `<axis/>` child
+/// elements (variable-font instances, Android 8+), so it stops at the first
+/// child tag rather than trimming the whole body.
+fn fontFileName(body: []const u8) []const u8 {
+    const text = body[0 .. std.mem.indexOfScalar(u8, body, '<') orelse body.len];
+    return std.mem.trim(u8, text, " \t\r\n");
+}
+
+/// Lists every family name fonts.xml defines, including its `<alias>`
+/// names (which `selectFamilyByName` resolves) — those are real, selectable
+/// names on Android, e.g. "arial" mapping to "sans-serif". Unnamed
+/// `<family>` entries are script fallbacks, not selectable, so they're
+/// skipped. See `discovery.FamilyList` for the buffer contract.
+pub fn availableFamiliesFromXml(
+    data: []const u8,
+    names_buf: [][]const u8,
+    name_storage: []u8,
+) []const []const u8 {
+    var list: discovery.FamilyList = .{ .names = names_buf, .storage = name_storage };
+
+    var family_pos: usize = 0;
+    while (findTag(data, "family", &family_pos)) |family| {
+        list.append(attrValue(family.attrs, "name") orelse continue);
+    }
+    var alias_pos: usize = 0;
+    while (findTag(data, "alias", &alias_pos)) |alias| {
+        list.append(attrValue(alias.attrs, "name") orelse continue);
+    }
+    return list.slice();
+}
 
 /// Core XML-scanning logic, split out from `selectFamilyByName` so it's
 /// testable against an in-memory fonts.xml without needing to run on a real
@@ -97,7 +244,7 @@ fn selectFamilyFromXml(
                 if (weight != wf) continue;
             }
 
-            const filename = std.mem.trim(u8, font.body, " \t\r\n");
+            const filename = fontFileName(font.body);
             if (filename.len == 0) continue;
             const path_len = fonts_dir.len + filename.len;
             if (path_offset + path_len > path_storage.len) break;
@@ -271,4 +418,64 @@ test "Android: selectFamilyFromXml errors on an unknown family" {
         discovery.SelectionError.NotFound,
         selectFamilyFromXml(test_fonts_xml, "Definitely Not A Real Font Family XYZ123", &handle_buf, &properties_buf, &path_storage),
     );
+}
+
+/// Stand-in for `FileCoverage` in tests: "covers" exactly the paths listed.
+const StubCoverage = struct {
+    covering: []const []const u8,
+
+    fn covers(self: StubCoverage, path: []const u8, font_index: u32, codepoint: u21) bool {
+        _ = font_index;
+        _ = codepoint;
+        for (self.covering) |p| {
+            if (std.mem.eql(u8, p, path)) return true;
+        }
+        return false;
+    }
+};
+
+test "Android: fallbackFromXml walks fonts.xml order into unnamed script families" {
+    var path_storage: [1024]u8 = undefined;
+    const coverage = StubCoverage{ .covering = &.{"/system/fonts/NotoNaskhArabic-Regular.ttf"} };
+
+    const handle = try fallbackFromXml(test_fonts_xml, 0x0645, &path_storage, coverage);
+
+    try std.testing.expectEqualStrings("/system/fonts/NotoNaskhArabic-Regular.ttf", handle.path.path);
+}
+
+test "Android: fallbackFromXml prefers the first covering font in document order" {
+    var path_storage: [1024]u8 = undefined;
+    const coverage = StubCoverage{ .covering = &.{
+        "/system/fonts/NotoSerif-Regular.ttf",
+        "/system/fonts/Roboto-Italic.ttf",
+    } };
+
+    const handle = try fallbackFromXml(test_fonts_xml, 'a', &path_storage, coverage);
+
+    try std.testing.expectEqualStrings("/system/fonts/Roboto-Italic.ttf", handle.path.path);
+}
+
+test "Android: fallbackFromXml carries the ttc font_index" {
+    var path_storage: [1024]u8 = undefined;
+    const coverage = StubCoverage{ .covering = &.{"/system/fonts/MyanmarFonts.ttc"} };
+
+    const handle = try fallbackFromXml(test_fonts_xml, 0x1000, &path_storage, coverage);
+
+    try std.testing.expectEqual(@as(u32, 2), handle.path.font_index);
+}
+
+test "Android: fallbackFromXml errors when nothing covers the codepoint" {
+    var path_storage: [1024]u8 = undefined;
+    const coverage = StubCoverage{ .covering = &.{} };
+
+    try std.testing.expectError(
+        discovery.SelectionError.NotFound,
+        fallbackFromXml(test_fonts_xml, 0x1F600, &path_storage, coverage),
+    );
+}
+
+test "Android: fontFileName stops at a variable-font <axis> child" {
+    try std.testing.expectEqualStrings("Roboto-Regular.ttf", fontFileName(
+        "Roboto-Regular.ttf\n  <axis tag=\"wdth\" stylevalue=\"100\"/>\n",
+    ));
 }

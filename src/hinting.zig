@@ -10,7 +10,9 @@
 //! runtime against crafted infinite loops.
 
 const std = @import("std");
-pub var debug_trace = false;
+// Flip to true locally to trace the interpreter; comptime-const so it costs
+// nothing (the whole std.debug.print call folds away) when left off.
+const debug_trace = false;
 
 pub const Point = struct { x: i32 = 0, y: i32 = 0 };
 pub const UnitVector = struct { x: i16 = 0x4000, y: i16 = 0 };

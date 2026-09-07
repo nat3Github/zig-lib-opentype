@@ -14,6 +14,8 @@
 #ifndef CORE_TEXT_SHIM_H
 #define CORE_TEXT_SHIM_H
 
+#include <stdint.h>
+
 typedef unsigned char Boolean;
 typedef unsigned char UInt8;
 typedef signed long CFIndex;
@@ -47,6 +49,11 @@ Boolean CFStringGetCString(CFStringRef theString, char *buffer, CFIndex bufferSi
 
 Boolean CFURLGetFileSystemRepresentation(CFURLRef url, Boolean resolveAgainstBase, UInt8 *buffer, CFIndex maxBufLen);
 
+typedef struct {
+    CFIndex location;
+    CFIndex length;
+} CFRange;
+
 typedef const void *CFDictionaryKeyCallBacks;
 typedef const void *CFDictionaryValueCallBacks;
 extern const CFDictionaryKeyCallBacks kCFTypeDictionaryKeyCallBacks;
@@ -64,6 +71,7 @@ Boolean CFNumberGetValue(CFNumberRef number, CFNumberType theType, void *valuePt
 
 typedef const struct __CTFontDescriptor *CTFontDescriptorRef;
 typedef const struct __CTFontCollection *CTFontCollectionRef;
+typedef const struct __CTFont *CTFontRef;
 
 extern const CFStringRef kCTFontURLAttribute;
 extern const CFStringRef kCTFontNameAttribute;
@@ -80,5 +88,15 @@ CFTypeRef CTFontDescriptorCopyAttribute(CTFontDescriptorRef descriptor, CFString
 
 CTFontCollectionRef CTFontCollectionCreateWithFontDescriptors(CFArrayRef queryDescriptors, CFDictionaryRef options);
 CFArrayRef CTFontCollectionCreateMatchingFontDescriptors(CTFontCollectionRef collection);
+
+CFArrayRef CTFontManagerCopyAvailableFontFamilyNames(void);
+
+CTFontRef CTFontCreateWithFontDescriptor(CTFontDescriptorRef descriptor, double size, const void *matrix);
+CTFontRef CTFontCreateWithName(CFStringRef name, double size, const void *matrix);
+CTFontRef CTFontCreateForString(CTFontRef currentFont, CFStringRef string, CFRange range);
+CTFontDescriptorRef CTFontCopyFontDescriptor(CTFontRef font);
+
+typedef uint32_t CTFontTableOptions;
+CFArrayRef CTFontCopyAvailableTables(CTFontRef font, CTFontTableOptions options);
 
 #endif

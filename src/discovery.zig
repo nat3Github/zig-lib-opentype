@@ -8,6 +8,7 @@ pub const fontconfig = if (build_options.fontconfig) @import("discovery/fontconf
 pub const core_text = if (build_options.core_text) @import("discovery/core_text.zig") else struct {};
 pub const directwrite = if (build_options.directwrite) @import("discovery/directwrite.zig") else struct {};
 pub const android = if (build_options.android) @import("discovery/android.zig") else struct {};
+pub const manifest = if (build_options.manifest) @import("discovery/manifest.zig") else struct {};
 
 // NOTE: ported from vendor/font-kit (src/properties.rs, src/handle.rs,
 // src/family_name.rs, src/matching.rs) — see CLAUDE.md vendor list.
@@ -60,11 +61,52 @@ pub const FamilyName = union(enum) {
     monospace,
     cursive,
     fantasy,
+
+    /// The five CSS generic-family keywords, in CSS's own spelling — a UI
+    /// offering "pick a font" wants these listed alongside the concrete
+    /// families from `availableFamilies`.
+    pub const generic_keywords = [_][]const u8{ "serif", "sans-serif", "monospace", "cursive", "fantasy" };
+
+    /// Parses a `font-family` string: a generic keyword becomes its tag
+    /// (so a backend's `generic_family_names` alias table gets a chance to
+    /// run), anything else is a literal family title.
+    pub fn fromString(name: []const u8) FamilyName {
+        inline for (generic_keywords, 0..) |keyword, i| {
+            if (std.mem.eql(u8, name, keyword)) return switch (i) {
+                0 => .serif,
+                1 => .sans_serif,
+                2 => .monospace,
+                3 => .cursive,
+                else => .fantasy,
+            };
+        }
+        return .{ .title = name };
+    }
+
+    pub fn toString(self: FamilyName) []const u8 {
+        return switch (self) {
+            .title => |title| title,
+            .serif => generic_keywords[0],
+            .sans_serif => generic_keywords[1],
+            .monospace => generic_keywords[2],
+            .cursive => generic_keywords[3],
+            .fantasy => generic_keywords[4],
+        };
+    }
+
+    pub fn isGeneric(name: []const u8) bool {
+        return std.meta.activeTag(fromString(name)) != .title;
+    }
 };
 
 pub const Handle = union(enum) {
     path: struct { path: []const u8, font_index: u32 = 0 },
     memory: struct { bytes: []const u8, font_index: u32 = 0 },
+    /// A font resolved to a location, not yet fetched — for backends (e.g.
+    /// `discovery/manifest.zig`) whose source data isn't retrievable
+    /// synchronously. The caller is responsible for turning this into a
+    /// `memory` handle (fetch `url`, hand the bytes back) before parsing.
+    url: struct { url: []const u8, font_index: u32 = 0 },
 };
 
 pub const SelectionError = error{NotFound};
@@ -208,6 +250,37 @@ fn findPreferredStyle(candidates: []const Properties, set: []const usize, query:
 pub const FamilyHandle = struct {
     fonts: []const Handle,
     properties: []const Properties,
+};
+
+/// Family-name listing built in caller-owned buffers, the same no-alloc
+/// shape as `selectFamilyByName`'s `handle_buf`/`path_storage`. Backends'
+/// `availableFamilies(names_buf, name_storage, scratch...) []const []const u8`
+/// fill one of these: the OS lists a family once per face (fontconfig) or
+/// with localized duplicates (CoreText), so appends dedupe, and both buffers
+/// are hard caps — a machine with more fonts installed than fit just yields
+/// a truncated list.
+pub const FamilyList = struct {
+    names: [][]const u8,
+    storage: []u8,
+    count: usize = 0,
+    used: usize = 0,
+
+    pub fn append(self: *FamilyList, name: []const u8) void {
+        if (name.len == 0) return;
+        if (self.count >= self.names.len or self.used + name.len > self.storage.len) return;
+        for (self.names[0..self.count]) |existing| {
+            if (std.mem.eql(u8, existing, name)) return;
+        }
+        const owned = self.storage[self.used..][0..name.len];
+        @memcpy(owned, name);
+        self.used += name.len;
+        self.names[self.count] = owned;
+        self.count += 1;
+    }
+
+    pub fn slice(self: *const FamilyList) []const []const u8 {
+        return self.names[0..self.count];
+    }
 };
 
 /// Default generic->real family name mapping, ported from font-kit's

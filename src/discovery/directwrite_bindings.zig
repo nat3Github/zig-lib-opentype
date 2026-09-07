@@ -15,10 +15,10 @@
 // QueryInterface or calls the wrong function silently. Cross-checked a
 // second time against zigwin32 (github.com/marlersoft/zigwin32,
 // win32metadata-generated, vendor/zigwin32/win32/graphics/direct_write.zig)
-// — all 8 GUIDs and every vtable slot order declared here match exactly.
+// — the GUIDs and vtable slot orders declared here match exactly.
 //
-// UNVERIFIED: never compiled or run (no Windows machine available this
-// session). Only the methods this backend's `selectFamilyByName` calls are
+// UNVERIFIED: cross-compiles for x86_64-windows but has never been run (no
+// Windows machine available). Only the methods this backend calls are
 // declared; interface methods that come *before* a needed one in the real
 // vtable are kept as opaque placeholder fields (never called, but required
 // to preserve the offsets of the methods after them) — methods declared
@@ -83,14 +83,15 @@ pub const IDWriteFactoryVtbl = extern struct {
 };
 pub const IDWriteFactory = extern struct { vtable: *const IDWriteFactoryVtbl };
 
-/// Slots 0..2 (IUnknown), 3 `GetFontFamilyCount` (placeholder, unused —
-/// `FindFamilyName` gives the index directly), 4 `GetFontFamily`, 5
-/// `FindFamilyName`. `GetFontFromFontFace` (slot 6) omitted.
+/// Slots 0..2 (IUnknown), 3 `GetFontFamilyCount` (used by
+/// `availableFamilies`; `FindFamilyName` gives the index directly for
+/// lookups by name), 4 `GetFontFamily`, 5 `FindFamilyName`.
+/// `GetFontFromFontFace` (slot 6) omitted.
 pub const IDWriteFontCollectionVtbl = extern struct {
     QueryInterface: *const fn (*IDWriteFontCollection, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
     AddRef: *const fn (*IDWriteFontCollection) callconv(.winapi) u32,
     Release: *const fn (*IDWriteFontCollection) callconv(.winapi) u32,
-    GetFontFamilyCount: *const anyopaque,
+    GetFontFamilyCount: *const fn (*IDWriteFontCollection) callconv(.winapi) UINT32,
     GetFontFamily: *const fn (*IDWriteFontCollection, index: UINT32, *?*IDWriteFontFamily) callconv(.winapi) HRESULT,
     FindFamilyName: *const fn (*IDWriteFontCollection, familyName: [*:0]const WCHAR, index: *UINT32, exists: *BOOL) callconv(.winapi) HRESULT,
 };
@@ -98,10 +99,8 @@ pub const IDWriteFontCollection = extern struct { vtable: *const IDWriteFontColl
 
 /// `IDWriteFontFamily` inherits `IDWriteFontList`'s vtable prefix (slots
 /// 0..2 IUnknown, 3 `GetFontCollection` placeholder, 4 `GetFontCount`, 5
-/// `GetFont`) and only adds family-specific methods after it
-/// (`GetFamilyNames`, `GetFirstMatchingFont`, `GetMatchingFonts`) — none of
-/// which this backend needs, so the shared `IDWriteFontList` prefix is all
-/// that's declared.
+/// `GetFont`) then adds 6 `GetFamilyNames`. `GetFirstMatchingFont` (7) and
+/// `GetMatchingFonts` (8) are omitted.
 pub const IDWriteFontFamilyVtbl = extern struct {
     QueryInterface: *const fn (*IDWriteFontFamily, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
     AddRef: *const fn (*IDWriteFontFamily) callconv(.winapi) u32,
@@ -109,8 +108,25 @@ pub const IDWriteFontFamilyVtbl = extern struct {
     GetFontCollection: *const anyopaque,
     GetFontCount: *const fn (*IDWriteFontFamily) callconv(.winapi) UINT32,
     GetFont: *const fn (*IDWriteFontFamily, index: UINT32, *?*IDWriteFont) callconv(.winapi) HRESULT,
+    GetFamilyNames: *const fn (*IDWriteFontFamily, *?*IDWriteLocalizedStrings) callconv(.winapi) HRESULT,
 };
 pub const IDWriteFontFamily = extern struct { vtable: *const IDWriteFontFamilyVtbl };
+
+/// Slots 0..2 IUnknown, 3 `GetCount`, 4 `FindLocaleName` (placeholder), 5
+/// `GetLocaleNameLength` (placeholder), 6 `GetLocaleName` (placeholder), 7
+/// `GetStringLength`, 8 `GetString`.
+pub const IDWriteLocalizedStringsVtbl = extern struct {
+    QueryInterface: *const fn (*IDWriteLocalizedStrings, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
+    AddRef: *const fn (*IDWriteLocalizedStrings) callconv(.winapi) u32,
+    Release: *const fn (*IDWriteLocalizedStrings) callconv(.winapi) u32,
+    GetCount: *const fn (*IDWriteLocalizedStrings) callconv(.winapi) UINT32,
+    FindLocaleName: *const anyopaque,
+    GetLocaleNameLength: *const anyopaque,
+    GetLocaleName: *const anyopaque,
+    GetStringLength: *const fn (*IDWriteLocalizedStrings, index: UINT32, length: *UINT32) callconv(.winapi) HRESULT,
+    GetString: *const fn (*IDWriteLocalizedStrings, index: UINT32, stringBuffer: [*]WCHAR, size: UINT32) callconv(.winapi) HRESULT,
+};
+pub const IDWriteLocalizedStrings = extern struct { vtable: *const IDWriteLocalizedStringsVtbl };
 
 /// Slots 0..2 IUnknown, 3 `GetFontFamily` (placeholder), 4 `GetWeight`, 5
 /// `GetStretch`, 6 `GetStyle`, 7 `IsSymbolFont` (placeholder), 8
@@ -183,3 +199,181 @@ pub const IDWriteLocalFontFileLoaderVtbl = extern struct {
     GetFilePathFromKey: *const fn (*IDWriteLocalFontFileLoader, key: ?*const anyopaque, keySize: UINT32, filePath: [*]WCHAR, filePathSize: UINT32) callconv(.winapi) HRESULT,
 };
 pub const IDWriteLocalFontFileLoader = extern struct { vtable: *const IDWriteLocalFontFileLoaderVtbl };
+
+pub const FLOAT = f32;
+
+pub const IID_IDWriteFactory2 = GUID{ .data1 = 0x0439fc60, .data2 = 0xca44, .data3 = 0x4994, .data4 = .{ 0x8d, 0xee, 0x3a, 0x9a, 0xf7, 0xb7, 0x32, 0xec } };
+pub const IID_IDWriteFontFallback = GUID{ .data1 = 0xefa008f9, .data2 = 0xf7a1, .data3 = 0x48bf, .data4 = .{ 0xb0, 0x5c, 0xf2, 0x24, 0x71, 0x3c, 0xc0, 0xff } };
+
+pub const DWRITE_FONT_WEIGHT_NORMAL: DWRITE_FONT_WEIGHT = 400;
+pub const DWRITE_FONT_STRETCH_NORMAL: DWRITE_FONT_STRETCH = 5;
+
+// DWRITE_READING_DIRECTION: LeftToRight = 0.
+pub const DWRITE_READING_DIRECTION = u32;
+pub const DWRITE_READING_DIRECTION_LEFT_TO_RIGHT: DWRITE_READING_DIRECTION = 0;
+
+/// `IDWriteFactory2` reached by `QueryInterface` on `IDWriteFactory` (same
+/// object, DirectWrite 1.2 / Windows 8.1+). Its vtable is `IDWriteFactory`'s
+/// 24 slots plus `IDWriteFactory1`'s 2, then `GetSystemFontFallback` at
+/// slot 26 — everything before it is an unused placeholder that only exists
+/// to keep that offset right.
+pub const IDWriteFactory2Vtbl = extern struct {
+    QueryInterface: *const fn (*IDWriteFactory2, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
+    AddRef: *const fn (*IDWriteFactory2) callconv(.winapi) u32,
+    Release: *const fn (*IDWriteFactory2) callconv(.winapi) u32,
+    GetSystemFontCollection: *const anyopaque,
+    CreateCustomFontCollection: *const anyopaque,
+    RegisterFontCollectionLoader: *const anyopaque,
+    UnregisterFontCollectionLoader: *const anyopaque,
+    CreateFontFileReference: *const anyopaque,
+    CreateCustomFontFileReference: *const anyopaque,
+    CreateFontFace: *const anyopaque,
+    CreateRenderingParams: *const anyopaque,
+    CreateMonitorRenderingParams: *const anyopaque,
+    CreateCustomRenderingParams: *const anyopaque,
+    RegisterFontFileLoader: *const anyopaque,
+    UnregisterFontFileLoader: *const anyopaque,
+    CreateTextFormat: *const anyopaque,
+    CreateTypography: *const anyopaque,
+    GetGdiInterop: *const anyopaque,
+    CreateTextLayout: *const anyopaque,
+    CreateGdiCompatibleTextLayout: *const anyopaque,
+    CreateEllipsisTrimmingSign: *const anyopaque,
+    CreateTextAnalyzer: *const anyopaque,
+    CreateNumberSubstitution: *const anyopaque,
+    CreateGlyphRunAnalysis: *const anyopaque,
+    GetEudcFontCollection: *const anyopaque,
+    CreateCustomRenderingParams1: *const anyopaque,
+    GetSystemFontFallback: *const fn (*IDWriteFactory2, *?*IDWriteFontFallback) callconv(.winapi) HRESULT,
+};
+pub const IDWriteFactory2 = extern struct { vtable: *const IDWriteFactory2Vtbl };
+
+/// Slots 0..2 IUnknown, 3 `MapCharacters` — the whole interface.
+pub const IDWriteFontFallbackVtbl = extern struct {
+    QueryInterface: *const fn (*IDWriteFontFallback, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
+    AddRef: *const fn (*IDWriteFontFallback) callconv(.winapi) u32,
+    Release: *const fn (*IDWriteFontFallback) callconv(.winapi) u32,
+    MapCharacters: *const fn (
+        *IDWriteFontFallback,
+        analysisSource: *IDWriteTextAnalysisSource,
+        textPosition: UINT32,
+        textLength: UINT32,
+        baseFontCollection: ?*IDWriteFontCollection,
+        baseFamilyName: ?[*:0]const WCHAR,
+        baseWeight: DWRITE_FONT_WEIGHT,
+        baseStyle: DWRITE_FONT_STYLE,
+        baseStretch: DWRITE_FONT_STRETCH,
+        mappedLength: *UINT32,
+        mappedFont: *?*IDWriteFont,
+        scale: *FLOAT,
+    ) callconv(.winapi) HRESULT,
+};
+pub const IDWriteFontFallback = extern struct { vtable: *const IDWriteFontFallbackVtbl };
+
+/// `IDWriteTextAnalysisSource` is the one COM interface here *this* code
+/// implements rather than calls: `MapCharacters` reads its text through it.
+/// `TextAnalysisSource` below is a stack-allocated instance with a static
+/// vtable — DirectWrite only borrows it for the duration of the call, so
+/// AddRef/Release are no-ops rather than real refcounting.
+pub const IDWriteTextAnalysisSourceVtbl = extern struct {
+    QueryInterface: *const fn (*IDWriteTextAnalysisSource, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
+    AddRef: *const fn (*IDWriteTextAnalysisSource) callconv(.winapi) u32,
+    Release: *const fn (*IDWriteTextAnalysisSource) callconv(.winapi) u32,
+    GetTextAtPosition: *const fn (*IDWriteTextAnalysisSource, textPosition: UINT32, textString: *?[*]const WCHAR, textLength: *UINT32) callconv(.winapi) HRESULT,
+    GetTextBeforePosition: *const fn (*IDWriteTextAnalysisSource, textPosition: UINT32, textString: *?[*]const WCHAR, textLength: *UINT32) callconv(.winapi) HRESULT,
+    GetParagraphReadingDirection: *const fn (*IDWriteTextAnalysisSource) callconv(.winapi) DWRITE_READING_DIRECTION,
+    GetLocaleName: *const fn (*IDWriteTextAnalysisSource, textPosition: UINT32, textLength: *UINT32, localeName: *?[*:0]const WCHAR) callconv(.winapi) HRESULT,
+    GetNumberSubstitution: *const fn (*IDWriteTextAnalysisSource, textPosition: UINT32, textLength: *UINT32, numberSubstitution: *?*anyopaque) callconv(.winapi) HRESULT,
+};
+pub const IDWriteTextAnalysisSource = extern struct { vtable: *const IDWriteTextAnalysisSourceVtbl };
+
+/// Minimal `IDWriteTextAnalysisSource` over a single in-memory UTF-16 run.
+/// Layout must start with the vtable pointer so a `*TextAnalysisSource` is
+/// a valid `*IDWriteTextAnalysisSource`.
+pub const TextAnalysisSource = extern struct {
+    vtable: *const IDWriteTextAnalysisSourceVtbl = &vtable_impl,
+    text: [*]const WCHAR,
+    len: UINT32,
+
+    pub fn init(text: []const WCHAR) TextAnalysisSource {
+        return .{ .text = text.ptr, .len = @intCast(text.len) };
+    }
+
+    pub fn asSource(self: *TextAnalysisSource) *IDWriteTextAnalysisSource {
+        return @ptrCast(self);
+    }
+
+    const vtable_impl: IDWriteTextAnalysisSourceVtbl = .{
+        .QueryInterface = queryInterface,
+        .AddRef = addRef,
+        .Release = release,
+        .GetTextAtPosition = getTextAtPosition,
+        .GetTextBeforePosition = getTextBeforePosition,
+        .GetParagraphReadingDirection = getParagraphReadingDirection,
+        .GetLocaleName = getLocaleName,
+        .GetNumberSubstitution = getNumberSubstitution,
+    };
+
+    fn queryInterface(this: *IDWriteTextAnalysisSource, iid: *const GUID, out: *?*anyopaque) callconv(.winapi) HRESULT {
+        _ = iid;
+        out.* = this;
+        return S_OK;
+    }
+
+    fn addRef(this: *IDWriteTextAnalysisSource) callconv(.winapi) u32 {
+        _ = this;
+        return 1;
+    }
+
+    fn release(this: *IDWriteTextAnalysisSource) callconv(.winapi) u32 {
+        _ = this;
+        return 1;
+    }
+
+    fn getTextAtPosition(this: *IDWriteTextAnalysisSource, position: UINT32, string: *?[*]const WCHAR, length: *UINT32) callconv(.winapi) HRESULT {
+        const self: *TextAnalysisSource = @ptrCast(this);
+        if (position >= self.len) {
+            string.* = null;
+            length.* = 0;
+        } else {
+            string.* = self.text + position;
+            length.* = self.len - position;
+        }
+        return S_OK;
+    }
+
+    fn getTextBeforePosition(this: *IDWriteTextAnalysisSource, position: UINT32, string: *?[*]const WCHAR, length: *UINT32) callconv(.winapi) HRESULT {
+        const self: *TextAnalysisSource = @ptrCast(this);
+        if (position == 0 or position > self.len) {
+            string.* = null;
+            length.* = 0;
+        } else {
+            string.* = self.text;
+            length.* = position;
+        }
+        return S_OK;
+    }
+
+    fn getParagraphReadingDirection(this: *IDWriteTextAnalysisSource) callconv(.winapi) DWRITE_READING_DIRECTION {
+        _ = this;
+        return DWRITE_READING_DIRECTION_LEFT_TO_RIGHT;
+    }
+
+    fn getLocaleName(this: *IDWriteTextAnalysisSource, position: UINT32, length: *UINT32, locale: *?[*:0]const WCHAR) callconv(.winapi) HRESULT {
+        const self: *TextAnalysisSource = @ptrCast(this);
+        _ = position;
+        // No locale: the codepoint alone decides the fallback font, and a
+        // wrong locale would bias Han unification the wrong way.
+        locale.* = null;
+        length.* = self.len;
+        return S_OK;
+    }
+
+    fn getNumberSubstitution(this: *IDWriteTextAnalysisSource, position: UINT32, length: *UINT32, substitution: *?*anyopaque) callconv(.winapi) HRESULT {
+        const self: *TextAnalysisSource = @ptrCast(this);
+        _ = position;
+        substitution.* = null;
+        length.* = self.len;
+        return S_OK;
+    }
+};

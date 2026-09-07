@@ -114,13 +114,29 @@ fn unwrapExtension(reader: parsing.Table.Layout.SubtableReader, extension_tag: u
     return .{ .lookup_type = lookup_type, .sub_off = reader.offset + rel_off };
 }
 
-fn glyphClass(gdef: ?parsing.Table.Layout.ClassDef, glyph: u32) u16 {
+/// The GDEF pieces the lookup-flag skip predicate needs, resolved once per
+/// shaping run rather than re-walked per glyph.
+pub const Gdef = struct {
+    classes: ?parsing.Table.Layout.ClassDef = null,
+    mark_attach: ?parsing.Table.Layout.ClassDef = null,
+    mark_sets: ?parsing.Table.Gdef.MarkGlyphSets = null,
+};
+
+fn glyphClass(gdef: Gdef, glyph: u32) u16 {
     if (glyph > std.math.maxInt(u16)) return 0;
-    const cd = gdef orelse return 0;
+    const cd = gdef.classes orelse return 0;
     return cd.getClass(@intCast(glyph)) catch 0;
 }
 
-fn shouldSkipClass(class: u16, lookup_flags: u16) bool {
+/// hb's `lookup_props`: the raw lookupFlag with the markFilteringSet index
+/// packed above bit 16, so the skip predicate needs only one parameter.
+fn lookupProps(lk: parsing.Table.Layout.Lookup) parsing.Font.ParseError!u32 {
+    const flags = try lk.lookupFlags();
+    const set = (try lk.markFilteringSet()) orelse return flags;
+    return @as(u32, flags) | (@as(u32, set) << 16);
+}
+
+fn shouldSkipClass(class: u16, lookup_flags: u32) bool {
     return switch (class) {
         1 => lookup_flags & 0x0002 != 0, // Base: ignoreBaseGlyphs
         2 => lookup_flags & 0x0004 != 0, // Ligature: ignoreLigatures
@@ -135,9 +151,24 @@ fn shouldSkipClass(class: u16, lookup_flags: u16) bool {
 /// complex shapers (phase-1 scope, see shaping.zig's top doc comment), so
 /// those flags are always true - joiners are unconditionally skippable
 /// during lookup matching, independent of `lookup_flags`.
-fn shouldSkipGlyph(info: GlyphInfo, gdef: ?parsing.Table.Layout.ClassDef, lookup_flags: u16) bool {
+fn shouldSkipGlyph(info: GlyphInfo, gdef: Gdef, lookup_flags: u32) bool {
     if (info.is_zwj or info.is_zwnj) return true;
-    return shouldSkipClass(glyphClass(gdef, info.codepoint), lookup_flags);
+    const class = glyphClass(gdef, info.codepoint);
+    if (shouldSkipClass(class, lookup_flags)) return true;
+    if (class != 3 or info.codepoint > std.math.maxInt(u16)) return false;
+    const glyph: u16 = @intCast(info.codepoint);
+    // Mark-only filters, hb's `match_properties_mark`: useMarkFilteringSet
+    // wins over markAttachmentType when both bits are set.
+    if (lookup_flags & 0x0010 != 0) {
+        const sets = gdef.mark_sets orelse return false;
+        return !(sets.covers(@truncate(lookup_flags >> 16), glyph) catch false);
+    }
+    if (lookup_flags & 0xFF00 != 0) {
+        const cd = gdef.mark_attach orelse return true;
+        const attach = cd.getClass(glyph) catch 0;
+        return (lookup_flags & 0xFF00) != (@as(u32, attach) << 8);
+    }
+    return false;
 }
 
 /// Searches forward from `start` (inclusive) in `infos` for the first glyph
@@ -145,7 +176,7 @@ fn shouldSkipGlyph(info: GlyphInfo, gdef: ?parsing.Table.Layout.ClassDef, lookup
 /// Context/ChainContext matching (src/shaping.zig's `applyContextCore`) can
 /// reuse it against either `buffer.info` (GSUB "input"/"lookahead", GPOS
 /// everything) without duplicating the skip logic.
-fn nextUnskippedIn(infos: []const GlyphInfo, gdef: ?parsing.Table.Layout.ClassDef, lookup_flags: u16, start: usize) ?usize {
+fn nextUnskippedIn(infos: []const GlyphInfo, gdef: Gdef, lookup_flags: u32, start: usize) ?usize {
     var i = start;
     while (i < infos.len) : (i += 1) {
         if (!shouldSkipGlyph(infos[i], gdef, lookup_flags)) return i;
@@ -155,7 +186,7 @@ fn nextUnskippedIn(infos: []const GlyphInfo, gdef: ?parsing.Table.Layout.ClassDe
 
 /// Searches backward from `start - 1` down to 0 in `infos` for the first
 /// glyph not filtered by `lookup_flags`. See `nextUnskippedIn`.
-fn prevUnskippedIn(infos: []const GlyphInfo, gdef: ?parsing.Table.Layout.ClassDef, lookup_flags: u16, start: usize) ?usize {
+fn prevUnskippedIn(infos: []const GlyphInfo, gdef: Gdef, lookup_flags: u32, start: usize) ?usize {
     var i = start;
     while (i > 0) {
         i -= 1;
@@ -164,7 +195,7 @@ fn prevUnskippedIn(infos: []const GlyphInfo, gdef: ?parsing.Table.Layout.ClassDe
     return null;
 }
 
-fn nextUnskipped(buffer: *const Buffer, gdef: ?parsing.Table.Layout.ClassDef, lookup_flags: u16, start: usize) ?usize {
+fn nextUnskipped(buffer: *const Buffer, gdef: Gdef, lookup_flags: u32, start: usize) ?usize {
     return nextUnskippedIn(buffer.info.items, gdef, lookup_flags, start);
 }
 
@@ -175,13 +206,13 @@ fn nextUnskipped(buffer: *const Buffer, gdef: ?parsing.Table.Layout.ClassDef, lo
 /// GPOS Context/ChainContext backtrack matching (which, unlike GSUB, has no
 /// out_info side - GPOS never replaces glyphs, so `buffer.info` before `idx`
 /// is still the real left context).
-fn prevUnskipped(buffer: *const Buffer, gdef: ?parsing.Table.Layout.ClassDef, lookup_flags: u16, start: usize) ?usize {
+fn prevUnskipped(buffer: *const Buffer, gdef: Gdef, lookup_flags: u32, start: usize) ?usize {
     return prevUnskippedIn(buffer.info.items, gdef, lookup_flags, start);
 }
 
-const lookup_flag_ignore_marks: u16 = 0x0008;
+const lookup_flag_ignore_marks: u32 = 0x0008;
 
-fn isMarkGlyph(gdef: ?parsing.Table.Layout.ClassDef, glyph: u32) bool {
+fn isMarkGlyph(gdef: Gdef, glyph: u32) bool {
     return glyphClass(gdef, glyph) == 3;
 }
 
@@ -286,7 +317,7 @@ fn applyMarkAttach(
 fn applyGposMarkToBase(
     reader: parsing.Table.Layout.SubtableReader,
     gid: u16,
-    gdef: ?parsing.Table.Layout.ClassDef,
+    gdef: Gdef,
     buffer: *Buffer,
     direction: Direction,
 ) (parsing.Font.ParseError || error{OutOfMemory})!bool {
@@ -321,7 +352,7 @@ fn applyGposMarkToBase(
 fn applyGposMarkToLigature(
     reader: parsing.Table.Layout.SubtableReader,
     gid: u16,
-    gdef: ?parsing.Table.Layout.ClassDef,
+    gdef: Gdef,
     buffer: *Buffer,
     direction: Direction,
 ) (parsing.Font.ParseError || error{OutOfMemory})!bool {
@@ -360,7 +391,7 @@ fn applyGposMarkToLigature(
 fn applyGposMarkToMark(
     reader: parsing.Table.Layout.SubtableReader,
     gid: u16,
-    gdef: ?parsing.Table.Layout.ClassDef,
+    gdef: Gdef,
     buffer: *Buffer,
     direction: Direction,
 ) (parsing.Font.ParseError || error{OutOfMemory})!bool {
@@ -430,8 +461,8 @@ fn reverseCursiveMinorOffset(buffer: *Buffer, start: usize, direction: Direction
 fn applyGposCursive(
     reader: parsing.Table.Layout.SubtableReader,
     gid: u16,
-    gdef: ?parsing.Table.Layout.ClassDef,
-    lookup_flags: u16,
+    gdef: Gdef,
+    lookup_flags: u32,
     buffer: *Buffer,
     direction: Direction,
 ) (parsing.Font.ParseError || error{OutOfMemory})!bool {
@@ -744,7 +775,7 @@ fn readChainRuleOffsets(
 fn applyLookupOnce(
     layout: parsing.Table.Layout,
     lookup_index: u16,
-    gdef: ?parsing.Table.Layout.ClassDef,
+    gdef: Gdef,
     buffer: *Buffer,
     table_index: u1,
     direction: Direction,
@@ -760,7 +791,7 @@ fn applyLookupOnce(
 
     const lk = try layout.lookupAt(lookup_index);
     const lookup_type = try lk.lookupType();
-    const lookup_flags = try lk.lookupFlags();
+    const lookup_flags = try lookupProps(lk);
     const sub_count = try lk.subtableCount();
     var si: u16 = 0;
     while (si < sub_count) : (si += 1) {
@@ -802,8 +833,8 @@ fn applyContextCore(
     layout: parsing.Table.Layout,
     reader: parsing.Table.Layout.SubtableReader,
     offs: ContextOffsets,
-    lookup_flags: u16,
-    gdef: ?parsing.Table.Layout.ClassDef,
+    lookup_flags: u32,
+    gdef: Gdef,
     buffer: *Buffer,
     table_index: u1,
     direction: Direction,
@@ -963,8 +994,8 @@ fn applyContextCore(
 fn applyRuleBasedContext(
     layout: parsing.Table.Layout,
     reader: parsing.Table.Layout.SubtableReader,
-    lookup_flags: u16,
-    gdef: ?parsing.Table.Layout.ClassDef,
+    lookup_flags: u32,
+    gdef: Gdef,
     buffer: *Buffer,
     table_index: u1,
     direction: Direction,
@@ -1039,8 +1070,8 @@ fn applyRuleBasedContext(
 fn applyReverseChainSingleSubst(
     reader: parsing.Table.Layout.SubtableReader,
     gid: u16,
-    lookup_flags: u16,
-    gdef: ?parsing.Table.Layout.ClassDef,
+    lookup_flags: u32,
+    gdef: Gdef,
     buffer: *Buffer,
 ) parsing.Font.ParseError!bool {
     const cov = try reader.coverageAt(2);
@@ -1098,8 +1129,8 @@ fn applyGsubSubtable(
     sub_off: usize,
     lookup_mask: u32,
     buffer: *Buffer,
-    gdef: ?parsing.Table.Layout.ClassDef,
-    lookup_flags: u16,
+    gdef: Gdef,
+    lookup_flags: u32,
     depth: u8,
 ) (parsing.Font.ParseError || error{OutOfMemory})!bool {
     const reader = parsing.Table.Layout.SubtableReader{ .data = layout.data, .offset = sub_off };
@@ -1237,8 +1268,8 @@ fn applyGposSubtable(
     layout: parsing.Table.Layout,
     lookup_type: u16,
     sub_off: usize,
-    gdef: ?parsing.Table.Layout.ClassDef,
-    lookup_flags: u16,
+    gdef: Gdef,
+    lookup_flags: u32,
     buffer: *Buffer,
     direction: Direction,
     depth: u8,
@@ -1394,14 +1425,14 @@ fn isReverseLookup(layout: parsing.Table.Layout, lk: parsing.Table.Layout.Lookup
 fn applyLookup(
     layout: parsing.Table.Layout,
     entry: LookupMapEntry,
-    gdef: ?parsing.Table.Layout.ClassDef,
+    gdef: Gdef,
     buffer: *Buffer,
     table_index: u1,
     direction: Direction,
 ) (parsing.Font.ParseError || error{OutOfMemory})!void {
     const lk = try layout.lookupAt(entry.index);
     const lookup_type = try lk.lookupType();
-    const lookup_flags = try lk.lookupFlags();
+    const lookup_flags = try lookupProps(lk);
     const sub_count = try lk.subtableCount();
 
     if (table_index == 0 and try isReverseLookup(layout, lk, lookup_type)) {
@@ -1446,7 +1477,7 @@ pub fn applyTable(
     font: parsing.Font,
     map: Map,
     table_index: u1,
-    gdef: ?parsing.Table.Layout.ClassDef,
+    gdef: Gdef,
     buffer: *Buffer,
     direction: Direction,
 ) (parsing.Font.ParseError || error{OutOfMemory})!void {
@@ -1529,7 +1560,7 @@ pub fn applyDefaultHorizontalAdvances(font: parsing.Font, buffer: *Buffer, norma
 /// fallback mark-positioning system) - so this covers the common
 /// font-has-GPOS case exactly and degrades gracefully (mark advances still
 /// zeroed, offsets just not backfilled) in the rare no-GPOS one.
-pub fn zeroMarkWidthsByGdef(buffer: *Buffer, gdef: ?parsing.Table.Layout.ClassDef) void {
+pub fn zeroMarkWidthsByGdef(buffer: *Buffer, gdef: Gdef) void {
     for (buffer.info.items, buffer.pos.items) |glyph_info, *pos| {
         if (isMarkGlyph(gdef, glyph_info.codepoint)) {
             pos.x_advance = 0;

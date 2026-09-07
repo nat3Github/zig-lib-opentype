@@ -35,11 +35,30 @@ pub fn build(b: *std.Build) void {
         "Enable the Android font-discovery backend (parses /system/etc/fonts.xml, no system library)",
     ) orelse (target.result.abi == .android);
 
+    const enable_manifest = b.option(
+        bool,
+        "manifest",
+        "Enable the manifest font-discovery backend (matches a caller-supplied, already-fetched family->URL manifest; no system library, no fetch of its own, works on any target)",
+    ) orelse true;
+
+    // WOFF2 decoding needs a ported Brotli decoder plus its static
+    // transform/dictionary tables, which are a meaningful binary-size cost
+    // (the dictionary alone is on the order of 100 KiB before compression).
+    // Off by default so consumers who never see woff2 fonts don't pay for
+    // it; parseFont() falls back to error.Woff2NotSupported when disabled.
+    const enable_woff2 = b.option(
+        bool,
+        "woff2",
+        "Enable WOFF2 font decoding (ports a Brotli decoder + FreeType's woff2 transform tables; adds dictionary/prefix table size to the binary)",
+    ) orelse false;
+
     const discovery_options = b.addOptions();
     discovery_options.addOption(bool, "fontconfig", enable_fontconfig);
     discovery_options.addOption(bool, "core_text", enable_core_text);
     discovery_options.addOption(bool, "directwrite", enable_directwrite);
     discovery_options.addOption(bool, "android", enable_android);
+    discovery_options.addOption(bool, "manifest", enable_manifest);
+    discovery_options.addOption(bool, "woff2", enable_woff2);
 
     const mod = b.addModule("opentype", .{
         .root_source_file = b.path("src/root.zig"),
@@ -67,7 +86,10 @@ pub fn build(b: *std.Build) void {
     // Fontconfig dlopens libfontconfig at runtime (src/discovery/fontconfig.zig)
     // and Android just parses a file on disk — neither has a build-time link
     // dependency, so `enable_fontconfig`/`enable_android` only gate whether
-    // discovery.zig compiles their source in at all.
+    // discovery.zig compiles their source in at all. The manifest backend
+    // (src/discovery/manifest.zig) is the same, minus even the OS-specific
+    // data source: it only matches a manifest the caller already fetched, so
+    // it works identically on every target and defaults to on everywhere.
 
     // White-box unit tests (of private state) live alongside the
     // implementation in src/**. Black-box tests of the public API live in

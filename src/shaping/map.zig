@@ -309,7 +309,7 @@ pub const MapBuilder = struct {
     }
 
     fn sortMergeLookups(list: *std.ArrayList(LookupMapEntry)) void {
-        std.mem.sort(LookupMapEntry, list.items, {}, lookupLessThan);
+        common.insertionSort(LookupMapEntry, list.items, {}, lookupLessThan);
         if (list.items.len == 0) return;
         var j: usize = 0;
         for (list.items[1..]) |entry| {
@@ -352,7 +352,7 @@ pub const MapBuilder = struct {
 
         // Sort feature_infos by tag (seq as tiebreak) and merge duplicates,
         // matching hb_ot_map_builder_t::compile's dedup pass.
-        std.mem.sort(FeatureInfo, self.feature_infos.items, {}, featureInfoLessThan);
+        common.insertionSort(FeatureInfo, self.feature_infos.items, {}, featureInfoLessThan);
         const infos = self.feature_infos.items;
         if (infos.len > 0) {
             var j: usize = 0;

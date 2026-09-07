@@ -45,6 +45,12 @@ pub extern fn CFRelease(cf: CFTypeRef) void;
 
 pub extern fn CFStringCreateWithBytes(alloc: CFAllocatorRef, bytes: [*c]const UInt8, numBytes: CFIndex, encoding: CFStringEncoding, isExternalRepresentation: Boolean) CFStringRef;
 pub extern fn CFStringGetCString(theString: CFStringRef, buffer: [*c]u8, bufferSize: CFIndex, encoding: CFStringEncoding) Boolean;
+pub extern fn CFStringGetLength(theString: CFStringRef) CFIndex;
+
+pub const CFRange = extern struct {
+    location: CFIndex,
+    length: CFIndex,
+};
 
 pub extern fn CFURLGetFileSystemRepresentation(url: CFURLRef, resolveAgainstBase: Boolean, buffer: [*c]UInt8, maxBufLen: CFIndex) Boolean;
 
@@ -67,6 +73,8 @@ pub const CTFontDescriptor = opaque {};
 pub const CTFontDescriptorRef = ?*const CTFontDescriptor;
 pub const CTFontCollection = opaque {};
 pub const CTFontCollectionRef = ?*const CTFontCollection;
+pub const CTFont = opaque {};
+pub const CTFontRef = ?*const CTFont;
 
 pub extern const kCTFontURLAttribute: CFStringRef;
 pub extern const kCTFontNameAttribute: CFStringRef;
@@ -83,6 +91,23 @@ pub extern fn CTFontDescriptorCopyAttribute(descriptor: CTFontDescriptorRef, att
 
 pub extern fn CTFontCollectionCreateWithFontDescriptors(queryDescriptors: CFArrayRef, options: CFDictionaryRef) CTFontCollectionRef;
 pub extern fn CTFontCollectionCreateMatchingFontDescriptors(collection: CTFontCollectionRef) CFArrayRef;
+
+// Used by `availableFamilies` — the system's own "every installed family"
+// list, the same one Font Book and every Cocoa font picker shows.
+pub extern fn CTFontManagerCopyAvailableFontFamilyNames() CFArrayRef;
+
+// Used by `selectFallbackForCodepoint`'s CoreText cascade-list lookup, not
+// the family-listing path above.
+pub extern fn CTFontCreateWithFontDescriptor(descriptor: CTFontDescriptorRef, size: f64, matrix: ?*const anyopaque) CTFontRef;
+pub extern fn CTFontCreateWithName(name: CFStringRef, size: f64, matrix: ?*const anyopaque) CTFontRef;
+pub extern fn CTFontCreateForString(currentFont: CTFontRef, string: CFStringRef, range: CFRange) CTFontRef;
+pub extern fn CTFontCopyFontDescriptor(font: CTFontRef) CTFontDescriptorRef;
+
+// CTFontTableOptions is `uint32_t`, not CFOptionFlags (`c_ulong`, 8 bytes on
+// arm64/x86_64) -- binding it as the wrong width breaks the ABI on Apple
+// Silicon.
+pub const CTFontTableOptions = u32;
+pub extern fn CTFontCopyAvailableTables(font: CTFontRef, options: CTFontTableOptions) CFArrayRef;
 
 // CTFontSymbolicTraits bit (CTFontTraits.h) — enum constant, no extern
 // symbol to bind, so declared directly rather than round-tripped through

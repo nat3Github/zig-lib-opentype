@@ -15,6 +15,22 @@ pub const glyph_flag_unsafe_to_concat: u32 = 0x2;
 pub const glyph_flag_safe_to_insert_tatweel: u32 = 0x4;
 pub const glyph_flag_defined: u32 = 0x7;
 
+// `std.mem.sort` (WikiSort) monomorphizes to ~15KiB per (T, lessThan) pair
+// and is tuned for large arrays; every call site using this sorts a
+// short-lived list of a few dozen entries at most, where insertion sort is
+// both smaller and measurably faster.
+pub fn insertionSort(comptime T: type, items: []T, context: anytype, comptime lessThan: fn (@TypeOf(context), T, T) bool) void {
+    var i: usize = 1;
+    while (i < items.len) : (i += 1) {
+        const key = items[i];
+        var j: usize = i;
+        while (j > 0 and lessThan(context, key, items[j - 1])) : (j -= 1) {
+            items[j] = items[j - 1];
+        }
+        items[j] = key;
+    }
+}
+
 pub const GlyphInfo = struct {
     /// Unicode codepoint before shaping, glyph index after shaping.
     codepoint: u32 = 0,
@@ -563,7 +579,11 @@ pub const Buffer = struct {
                 try starts.append(gpa, info.cluster);
             }
         }
-        std.mem.sort(u32, starts.items, {}, std.sort.asc(u32));
+        insertionSort(u32, starts.items, {}, struct {
+            fn lessThan(_: void, a: u32, b: u32) bool {
+                return a < b;
+            }
+        }.lessThan);
 
         const ends = try gpa.alloc(u32, starts.items.len);
         errdefer gpa.free(ends);

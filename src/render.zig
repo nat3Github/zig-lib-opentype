@@ -127,6 +127,10 @@ pub const Renderer = struct {
     /// returns, so `renderGlyph` only has to run each glyph's own program.
     glyf_interp: ?hinting.Interpreter,
     max_twilight_points: u16,
+    /// From `maxp` -- guards `renderGlyph` against a glyph id from a
+    /// mismatched font (stale cache entry, wrong fallback pairing upstream)
+    /// that would otherwise read past `loca`/a charstring offset array.
+    num_glyphs: u16,
 
     pub fn init(
         state_allocator: std.mem.Allocator,
@@ -137,6 +141,9 @@ pub const Renderer = struct {
     ) (InitError || hinting.Error)!Renderer {
         const head_data = font.tableData(.{ 'h', 'e', 'a', 'd' }) orelse return error.InvalidTableFormat;
         const head = try parsing.Table.head.parse(head_data);
+
+        const maxp_data = font.tableData(.{ 'm', 'a', 'x', 'p' }) orelse return error.InvalidTableFormat;
+        const num_glyphs = (try parsing.Table.maxp.parse(maxp_data)).num_glyphs;
 
         const normalized = try normalizedCoords(state_allocator, scratch_allocator, font, options.user_coords, ppem);
         errdefer if (normalized.len != 0) state_allocator.free(normalized);
@@ -195,6 +202,7 @@ pub const Renderer = struct {
             .font = font,
             .head = head,
             .ppem = ppem,
+            .num_glyphs = num_glyphs,
             .normalized = normalized,
             .gvar_header = gvar_header,
             .gvar_data = gvar_data,
@@ -355,6 +363,15 @@ pub const Renderer = struct {
         scratch_allocator: std.mem.Allocator,
         output_allocator: std.mem.Allocator,
     ) RenderError!RenderedGlyph {
+        // A glyph id past this font's own glyph count can't belong to it --
+        // treat the same as .notdef rather than let it read garbage out of
+        // `loca`/a charstring offset array. Callers can end up here handing
+        // over a glyph id shaped against a *different* font (fallback/cache
+        // mismatch upstream); the graceful fallback matches FreeType's own
+        // out-of-range handling instead of surfacing a parse error for what
+        // is really a caller bug elsewhere.
+        if (glyph_id >= self.num_glyphs) return .{ .bitmap = .empty, .is_color = false };
+
         const ppem_u16: u16 = @intFromFloat(@round(self.ppem));
 
         if (self.font.tableData(.{ 'C', 'O', 'L', 'R' })) |colr_table| {

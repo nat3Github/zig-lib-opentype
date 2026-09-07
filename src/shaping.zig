@@ -267,14 +267,25 @@ fn shapeImpl(
     mapGlyphsFast(&buffer);
 
     const gdef_data = font.tableData(table_tag_gdef);
-    const gdef_classdef = if (gdef_data) |d| (parsing.Table.Gdef.glyphClassDef(d) catch null) else null;
+    const gdef_classdef: apply_mod.Gdef = if (gdef_data) |d| .{
+        .classes = parsing.Table.Gdef.glyphClassDef(d) catch null,
+        .mark_attach = parsing.Table.Gdef.markAttachClassDef(d) catch null,
+        .mark_sets = parsing.Table.Gdef.markGlyphSets(d) catch null,
+    } else .{};
 
     try applyTable(font, map, 0, gdef_classdef, &buffer, direction);
     hideDefaultIgnorables(&buffer, cmap_data);
     try buffer.clearPositions();
     applyDefaultHorizontalAdvances(font, &buffer, normalized_coords);
+    // hb-ot-shape.cc's `zero_width_marks` shaper property: the Indic,
+    // Khmer and Hangul shapers never zero mark advances (their fonts carry
+    // real advances on marks that GPOS 'dist'/abvm/blwm then positions),
+    // USE and Myanmar zero them *before* GPOS, everything else after.
+    const zero_marks_early = is_use or is_myanmar;
+    const zero_marks_late = !(zero_marks_early or is_hangul or is_khmer or indic_config != null);
+    if (zero_marks_early) zeroMarkWidthsByGdef(&buffer, gdef_classdef);
     try applyTable(font, map, 1, gdef_classdef, &buffer, direction);
-    zeroMarkWidthsByGdef(&buffer, gdef_classdef);
+    if (zero_marks_late) zeroMarkWidthsByGdef(&buffer, gdef_classdef);
     finishGposOffsets(&buffer, direction);
     zeroDefaultIgnorableAdvances(&buffer, direction);
 
@@ -433,7 +444,13 @@ fn shapeBidiParagraphImpl(
                 // different W1-shifted level, to keep GPOS mark-to-base
                 // intact.
                 if (levels[j] != levels[i] and (strong or classes[j] != .nsm)) break;
-                if (font_of[j] != font_of[i] and strong) break;
+                // Same exception as the level check above: only an actual
+                // combining mark rides along on a font it isn't covered by
+                // (needed for GPOS mark-to-base) - other weak-script
+                // codepoints (space, punctuation, emoji) must still break so
+                // they don't inherit a neighboring run's unrelated font and
+                // render .notdef.
+                if (font_of[j] != font_of[i] and (strong or classes[j] != .nsm)) break;
                 j += 1;
             }
             try runs.append(allocator, .{

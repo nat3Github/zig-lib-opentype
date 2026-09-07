@@ -1,7 +1,29 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const build_options = @import("build_options");
 pub const png = @import("png.zig");
 pub const PngDecodeError = png.DecodeError;
+const woff2 = if (build_options.woff2) @import("woff2/woff2.zig") else struct {};
+
+test {
+    if (build_options.woff2) _ = woff2;
+}
+
+// `std.mem.sort` (WikiSort) monomorphizes to ~15KiB per (T, lessThan) pair
+// and is tuned for large arrays; the call site below sorts a short-lived
+// list of coverage breakpoints, where insertion sort is both smaller and
+// measurably faster.
+fn insertionSort(comptime T: type, items: []T, context: anytype, comptime lessThan: fn (@TypeOf(context), T, T) bool) void {
+    var i: usize = 1;
+    while (i < items.len) : (i += 1) {
+        const key = items[i];
+        var j: usize = i;
+        while (j > 0 and lessThan(context, key, items[j - 1])) : (j -= 1) {
+            items[j] = items[j - 1];
+        }
+        items[j] = key;
+    }
+}
 
 pub const Font = struct {
     data: []const u8,
@@ -12,6 +34,7 @@ pub const Font = struct {
         InvalidSfntVersion,
         InvalidTableDirectory,
         InvalidWoff,
+        InvalidWoff2,
         InvalidCollection,
         TableNotFound,
         UnexpectedEndOfData,
@@ -31,7 +54,10 @@ pub const Font = struct {
     pub fn parse(alloc: Allocator, bytes: []const u8) (ParseError || error{OutOfMemory})!Font {
         if (bytes.len < 4) return error.InvalidSfntVersion;
         if (std.mem.eql(u8, bytes[0..4], "wOFF")) return parseWoff(alloc, bytes);
-        if (std.mem.eql(u8, bytes[0..4], "wOF2")) return error.Woff2NotSupported;
+        if (std.mem.eql(u8, bytes[0..4], "wOF2")) {
+            if (!build_options.woff2) return error.Woff2NotSupported;
+            return parseWoff2(alloc, bytes);
+        }
         return parseSfntAt(alloc, bytes, 0);
     }
 
@@ -199,6 +225,20 @@ fn parseWoff(alloc: Allocator, bytes: []const u8) (Font.ParseError || error{OutO
     return .{ .data = data, .table_records = table_records, .owned_data = true };
 }
 
+fn parseWoff2(alloc: Allocator, bytes: []const u8) (Font.ParseError || error{OutOfMemory})!Font {
+    const result = woff2.reconstruct.parse(alloc, bytes) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Corrupt => return error.InvalidWoff2,
+    };
+    errdefer alloc.free(result.data);
+    defer alloc.free(result.tables);
+
+    const table_records = try alloc.alloc(Font.TableRecord, result.tables.len);
+    for (table_records, result.tables) |*rec, t| rec.* = .{ .tag = t.tag, .offset = t.offset, .length = t.length };
+
+    return .{ .data = result.data, .table_records = table_records, .owned_data = true };
+}
+
 pub const Table = struct {
     pub const head = struct {
         units_per_em: u16,
@@ -273,6 +313,13 @@ pub const Table = struct {
     pub const name = struct {
         pub fn postscriptName(data: []const u8, buf: []u8) ?[]const u8 {
             return findImpl(data, 6, buf) catch null;
+        }
+
+        /// Human-readable family name (nameID 16 "typographic family" if
+        /// present, else nameID 1) -- for UI display only, e.g. showing which
+        /// system font a dynamic fallback resolved to.
+        pub fn familyName(data: []const u8, buf: []u8) ?[]const u8 {
+            return (findImpl(data, 16, buf) catch null) orelse (findImpl(data, 1, buf) catch null);
         }
 
         fn findImpl(data: []const u8, name_id: u16, buf: []u8) !?[]const u8 {
@@ -430,7 +477,11 @@ pub const Table = struct {
                     }
                 }
                 if (breakpoints.items.len == 0) return .{};
-                std.mem.sort(u32, breakpoints.items, {}, std.sort.asc(u32));
+                insertionSort(u32, breakpoints.items, {}, struct {
+                    fn lessThan(_: void, a: u32, b: u32) bool {
+                        return a < b;
+                    }
+                }.lessThan);
 
                 var uniq: std.ArrayList(u32) = .empty;
                 defer uniq.deinit(alloc);
@@ -3133,7 +3184,7 @@ pub const Table = struct {
                 const flags = try self.lookupFlags();
                 if (flags & 0x0010 == 0) return null;
                 const count = try self.subtableCount();
-                return self.u16At(self.offset + 6 + @as(usize, count) * 2);
+                return try self.u16At(self.offset + 6 + @as(usize, count) * 2);
             }
         };
 
@@ -3195,15 +3246,49 @@ pub const Table = struct {
         };
     };
 
-    /// GDEF glyph-class table (OT spec 'GDEF'), read only as far as the
-    /// glyph class definition (Base/Ligature/Mark/Component) that drives
-    /// GSUB/GPOS lookup-flag glyph skipping. AttachList/LigCaretList/
-    /// MarkGlyphSetsDef/ItemVarStore are not needed by any lookup type this
-    /// port applies yet (mark-attachment/cursive GPOS are deferred - see
-    /// shaping.zig) and are left unread.
+    /// GDEF glyph-class table (OT spec 'GDEF'), read as far as the three
+    /// parts that drive GSUB/GPOS lookup-flag glyph skipping: the glyph
+    /// class definition (Base/Ligature/Mark/Component), the mark
+    /// attachment class definition (lookupFlag markAttachmentType) and
+    /// MarkGlyphSetsDef (lookupFlag useMarkFilteringSet). AttachList/
+    /// LigCaretList/ItemVarStore are not needed by any lookup type this
+    /// port applies yet and are left unread.
     pub const Gdef = struct {
         pub fn glyphClassDef(data: []const u8) Font.ParseError!?Layout.ClassDef {
             var c = Cursor{ .data = data, .pos = 4 };
+            const off = try c.readU16();
+            if (off == 0) return null;
+            return .{ .data = data, .offset = off };
+        }
+
+        pub fn markAttachClassDef(data: []const u8) Font.ParseError!?Layout.ClassDef {
+            var c = Cursor{ .data = data, .pos = 10 };
+            const off = try c.readU16();
+            if (off == 0) return null;
+            return .{ .data = data, .offset = off };
+        }
+
+        pub const MarkGlyphSets = struct {
+            data: []const u8,
+            offset: usize,
+
+            pub fn covers(self: MarkGlyphSets, set_index: u16, glyph: u16) Font.ParseError!bool {
+                var c = Cursor{ .data = self.data, .pos = self.offset + 2 };
+                const count = try c.readU16();
+                if (set_index >= count) return false;
+                c.pos = self.offset + 4 + @as(usize, set_index) * 4;
+                const rel = try c.readU32();
+                const cov_off = std.math.add(usize, self.offset, rel) catch return error.InvalidTableFormat;
+                const cov = Layout.Coverage{ .data = self.data, .offset = cov_off };
+                return (try cov.get(glyph)) != null;
+            }
+        };
+
+        pub fn markGlyphSets(data: []const u8) Font.ParseError!?MarkGlyphSets {
+            var c = Cursor{ .data = data, .pos = 2 };
+            const minor = try c.readU16();
+            if (minor < 2) return null;
+            c.pos = 12;
             const off = try c.readU16();
             if (off == 0) return null;
             return .{ .data = data, .offset = off };

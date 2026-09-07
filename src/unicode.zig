@@ -1,6 +1,22 @@
 const std = @import("std");
 const tables = @import("unicode/tables.zig");
 
+// `std.mem.sort` (WikiSort) monomorphizes to ~15KiB per (T, lessThan) pair
+// and is tuned for large arrays; every call site here sorts short-lived
+// lists (bracket pairs, a few dozen entries), where insertion sort is both
+// smaller and measurably faster.
+fn insertionSort(comptime T: type, items: []T, context: anytype, comptime lessThan: fn (@TypeOf(context), T, T) bool) void {
+    var i: usize = 1;
+    while (i < items.len) : (i += 1) {
+        const key = items[i];
+        var j: usize = i;
+        while (j > 0 and lessThan(context, key, items[j - 1])) : (j -= 1) {
+            items[j] = items[j - 1];
+        }
+        items[j] = key;
+    }
+}
+
 // NOTE: property tables are pre-generated (not comptime-parsed) by
 // test/fixtures/unicode/gen/gen_tables.py from the pinned UCD data; see
 // src/unicode/tables.zig. Re-run that script after bumping the pinned
@@ -295,7 +311,7 @@ fn resolveIsolatingRunSequence(
             }
         }
 
-        std.mem.sort(Pair, pairs.items, {}, struct {
+        insertionSort(Pair, pairs.items, {}, struct {
             fn lessThan(_: void, a: Pair, b: Pair) bool {
                 return a.open < b.open;
             }
