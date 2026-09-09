@@ -173,6 +173,40 @@ pub const IScaledCffSegment = union(enum) {
 pub fn scaleCffPoint(p: parsing.Table.cff.Point, scale: i32, phase: SubpixelOffset) IPoint {
     return .{ .x = ftMulFix(p.x, scale) + phase.x, .y = ftMulFix(p.y, scale) + phase.y };
 }
+
+/// FreeType's raster caps glyphs at 16384px per side; past that a bitmap is
+/// certainly the product of a corrupt outline (or of hinting bytecode driving
+/// a point near maxInt(i32)), not something anyone wants drawn.
+const max_bitmap_dimension: i64 = 1 << 14;
+/// Plus an area cap, so 16384x16384 can't ask the allocator for 256 MiB.
+const max_bitmap_pixels: i64 = 1 << 26;
+
+/// Grid-fits a control box to pixel bounds in i64 — post-hinting F26Dot6
+/// coords can sit near maxInt(i32), where `+ 63` overflows.
+const GridFit = struct {
+    x_min_px: i32,
+    y_max_px: i32,
+    width: i32,
+    height: i32,
+
+    fn compute(min_x: i32, min_y: i32, max_x: i32, max_y: i32) GridFit {
+        const x_min_px = @as(i64, min_x) >> 6;
+        const y_min_px = @as(i64, min_y) >> 6;
+        const x_max_px = (@as(i64, max_x) + 63) >> 6;
+        const y_max_px = (@as(i64, max_y) + 63) >> 6;
+        const width = x_max_px - x_min_px;
+        const height = y_max_px - y_min_px;
+        const too_big = width > max_bitmap_dimension or height > max_bitmap_dimension or
+            width * height > max_bitmap_pixels;
+        return .{
+            .x_min_px = @intCast(x_min_px),
+            .y_max_px = @intCast(y_max_px),
+            .width = if (too_big) 0 else @intCast(width),
+            .height = if (too_big) 0 else @intCast(height),
+        };
+    }
+};
+
 /// Grid-fits the control box of already-scaled (F26Dot6) `points` and
 /// sweeps them into an AA coverage bitmap — the common tail of
 /// `rasterizeGlyf`/`rasterizeGlyfAffine`/`rasterizeGlyfHinted` once each has
@@ -193,13 +227,12 @@ pub fn renderScaledPoints(
         cbox_max_y = @max(cbox_max_y, sp.p.y);
     }
 
-    const x_min_px = cbox_min_x >> 6;
+    const fit = GridFit.compute(cbox_min_x, cbox_min_y, cbox_max_x, cbox_max_y);
+    const x_min_px = fit.x_min_px;
     const y_min_px = cbox_min_y >> 6;
-    const x_max_px = (cbox_max_x + 63) >> 6;
-    const y_max_px = (cbox_max_y + 63) >> 6;
-
-    const width = x_max_px - x_min_px;
-    const height = y_max_px - y_min_px;
+    const y_max_px = fit.y_max_px;
+    const width = fit.width;
+    const height = fit.height;
     if (width <= 0 or height <= 0) {
         return .{ .width = 0, .rows = 0, .left = x_min_px, .top = y_max_px, .pixels_row_major = try allocator.alloc(u8, 0) };
     }
@@ -212,10 +245,8 @@ pub fn renderScaledPoints(
     var raster = try Rasterizer.init(allocator, width, height);
     defer raster.deinit();
 
-    // end_points_of_contours isn't validated at parse time (parsing.zig only
-    // checks the last entry against points.len); a malformed glyf table can
-    // ship non-monotonic or out-of-range entries here, so skip rather than
-    // slice-panic on those instead of trusting the index math.
+    // parsing.zig rejects non-monotonic end points, but composite glyphs
+    // assemble their own list here, so skip rather than slice-panic.
     var contour_start: usize = 0;
     for (end_points_of_contours) |end_index| {
         defer contour_start = @as(usize, end_index) + 1;
@@ -258,13 +289,12 @@ pub fn renderScaledCffSegments(allocator: std.mem.Allocator, segments: []IScaled
         }
     }
 
-    const x_min_px = cbox_min_x >> 6;
+    const fit = GridFit.compute(cbox_min_x, cbox_min_y, cbox_max_x, cbox_max_y);
+    const x_min_px = fit.x_min_px;
     const y_min_px = cbox_min_y >> 6;
-    const x_max_px = (cbox_max_x + 63) >> 6;
-    const y_max_px = (cbox_max_y + 63) >> 6;
-
-    const width = x_max_px - x_min_px;
-    const height = y_max_px - y_min_px;
+    const y_max_px = fit.y_max_px;
+    const width = fit.width;
+    const height = fit.height;
     if (width <= 0 or height <= 0) {
         return .{ .width = 0, .rows = 0, .left = x_min_px, .top = y_max_px, .pixels_row_major = try allocator.alloc(u8, 0) };
     }

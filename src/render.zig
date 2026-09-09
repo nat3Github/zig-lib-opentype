@@ -105,6 +105,22 @@ const glyf_hinting_ppem_threshold: f32 = 20;
 pub const Renderer = struct {
     font: parsing.Font,
     head: parsing.Table.head,
+    /// Outline/color table blobs resolved once in `init` -- `tableData` is a
+    /// linear scan of the table directory, and `renderGlyph` would otherwise
+    /// repeat it per glyph.
+    glyf_data: ?[]const u8,
+    loca_data: ?[]const u8,
+    cff_data: ?[]const u8,
+    /// Heap-allocated rather than inline: `Renderer` is copied by value by
+    /// consumers (dvui's `Font.Entry.toPixels`), and the context's cached
+    /// Private DICT hints are several hundred bytes.
+    cff_context: ?*parsing.Table.cff.Context,
+    cff2_data: ?[]const u8,
+    colr_data: ?[]const u8,
+    cpal_data: ?[]const u8,
+    sbix_data: ?[]const u8,
+    cblc_data: ?[]const u8,
+    cbdt_data: ?[]const u8,
     ppem: f32,
     normalized: []const f32,
     gvar_header: ?parsing.Table.gvar.Header,
@@ -174,6 +190,15 @@ pub const Renderer = struct {
             }
         }
 
+        var cff_context: ?*parsing.Table.cff.Context = null;
+        if (font.tableData(.{ 'C', 'F', 'F', ' ' })) |cff_table| {
+            if (parsing.Table.cff.Context.init(cff_table) catch null) |ctx| {
+                cff_context = try state_allocator.create(parsing.Table.cff.Context);
+                cff_context.?.* = ctx;
+            }
+        }
+        errdefer if (cff_context) |ctx| state_allocator.destroy(ctx);
+
         const vary = gvar_header != null and anyNonDefault(normalized);
         const glyf_table = font.tableData(.{ 'g', 'l', 'y', 'f' });
         var max_twilight_points: u16 = 0;
@@ -201,6 +226,16 @@ pub const Renderer = struct {
         return .{
             .font = font,
             .head = head,
+            .glyf_data = glyf_table,
+            .loca_data = font.tableData(.{ 'l', 'o', 'c', 'a' }),
+            .cff_data = font.tableData(.{ 'C', 'F', 'F', ' ' }),
+            .cff_context = cff_context,
+            .cff2_data = font.tableData(.{ 'C', 'F', 'F', '2' }),
+            .colr_data = font.tableData(.{ 'C', 'O', 'L', 'R' }),
+            .cpal_data = font.tableData(.{ 'C', 'P', 'A', 'L' }),
+            .sbix_data = font.tableData(.{ 's', 'b', 'i', 'x' }),
+            .cblc_data = font.tableData(.{ 'C', 'B', 'L', 'C' }),
+            .cbdt_data = font.tableData(.{ 'C', 'B', 'D', 'T' }),
             .ppem = ppem,
             .num_glyphs = num_glyphs,
             .normalized = normalized,
@@ -221,7 +256,7 @@ pub const Renderer = struct {
     /// `renderBuffer`/rasterization use internally, so callers computing
     /// their own text metrics stay pixel-consistent with what actually
     /// gets rasterized.
-    pub fn unitsToPixels(self: Renderer, font_units: i32) f32 {
+    pub fn unitsToPixels(self: *const Renderer, font_units: i32) f32 {
         const scale = rasterization.ftDivFix(@as(i32, @intFromFloat(@round(self.ppem))) * 64, self.head.units_per_em);
         return @as(f32, @floatFromInt(rasterization.ftMulFix(font_units, scale))) / 64.0;
     }
@@ -234,6 +269,7 @@ pub const Renderer = struct {
             if (h.shared_tuples.len != 0) state_allocator.free(h.shared_tuples);
         }
         if (self.glyf_interp) |*interp| interp.deinit();
+        if (self.cff_context) |ctx| state_allocator.destroy(ctx);
     }
 
     fn anyNonDefault(coords: []const f32) bool {
@@ -259,15 +295,15 @@ pub const Renderer = struct {
     }
 
     fn colrOutlineSource(self: Renderer) ?rasterization.OutlineSource {
-        if (self.font.tableData(.{ 'g', 'l', 'y', 'f' })) |glyf_table| {
-            const loca_table = self.font.tableData(.{ 'l', 'o', 'c', 'a' }) orelse return null;
+        if (self.glyf_data) |glyf_table| {
+            const loca_table = self.loca_data orelse return null;
             return .{ .glyf = .{
                 .glyf_data = glyf_table,
                 .loca_data = loca_table,
                 .index_to_loc_format = self.head.index_to_loc_format,
             } };
         }
-        if (self.font.tableData(.{ 'C', 'F', 'F', ' ' })) |cff_table| {
+        if (self.cff_data) |cff_table| {
             return .{ .cff = .{ .cff_data = cff_table } };
         }
         return null;
@@ -283,8 +319,8 @@ pub const Renderer = struct {
         const units_per_em = self.head.units_per_em;
         const vary = self.vary;
 
-        if (self.font.tableData(.{ 'g', 'l', 'y', 'f' })) |glyf_table| {
-            const loca_table = self.font.tableData(.{ 'l', 'o', 'c', 'a' }).?;
+        if (self.glyf_data) |glyf_table| {
+            const loca_table = self.loca_data.?;
             if (self.glyf_interp) |*interp| {
                 const mask = try rasterization.rasterizeGlyfHinted(
                     scratch_allocator,
@@ -328,18 +364,18 @@ pub const Renderer = struct {
             const mask = try rasterization.rasterizeTrueTypeGlyfOutline(scratch_allocator, outline, units_per_em, self.ppem, phase);
             defer mask.deinit(scratch_allocator);
             return self.coverageToRgba(mask, output_allocator);
-        } else if (self.font.tableData(.{ 'C', 'F', 'F', ' ' })) |cff_table| {
+        } else if (self.cff_context) |ctx| {
             if (self.ppem < cff_hinting_ppem_threshold) {
-                const mask = try rasterization.rasterizeCffOutlineHinted(scratch_allocator, cff_table, glyph_id, units_per_em, self.ppem, phase, true);
+                const mask = try rasterization.rasterizeCffOutlineHintedWithContext(scratch_allocator, ctx, glyph_id, units_per_em, self.ppem, phase, true);
                 defer mask.deinit(scratch_allocator);
                 return self.coverageToRgba(mask, output_allocator);
             }
-            const outline = try parsing.Table.cff.outline(scratch_allocator, cff_table, glyph_id);
+            const outline = try ctx.outline(scratch_allocator, glyph_id);
             defer scratch_allocator.free(outline.segments);
             const mask = try rasterization.rasterizeCffOutline(scratch_allocator, outline, units_per_em, self.ppem, phase);
             defer mask.deinit(scratch_allocator);
             return self.coverageToRgba(mask, output_allocator);
-        } else if (self.font.tableData(.{ 'C', 'F', 'F', '2' })) |cff2_table| {
+        } else if (self.cff2_data) |cff2_table| {
             const outline = try parsing.Table.cff2.outline(scratch_allocator, cff2_table, glyph_id);
             defer scratch_allocator.free(outline.segments);
             const mask = try rasterization.rasterizeCffOutline(scratch_allocator, outline, units_per_em, self.ppem, phase);
@@ -374,8 +410,8 @@ pub const Renderer = struct {
 
         const ppem_u16: u16 = @intFromFloat(@round(self.ppem));
 
-        if (self.font.tableData(.{ 'C', 'O', 'L', 'R' })) |colr_table| {
-            if (self.font.tableData(.{ 'C', 'P', 'A', 'L' })) |cpal_table| {
+        if (self.colr_data) |colr_table| {
+            if (self.cpal_data) |cpal_table| {
                 if (self.colrOutlineSource()) |source| {
                     if (try rasterization.rasterizeColr(
                         output_allocator,
@@ -391,10 +427,10 @@ pub const Renderer = struct {
             }
         }
 
-        if (self.font.tableData(.{ 's', 'b', 'i', 'x' })) |sbix_table| {
+        if (self.sbix_data) |sbix_table| {
             var fallback: ?rasterization.SbixFallbackOutline = null;
-            if (self.font.tableData(.{ 'g', 'l', 'y', 'f' })) |glyf_table| {
-                if (self.font.tableData(.{ 'l', 'o', 'c', 'a' })) |loca_table| {
+            if (self.glyf_data) |glyf_table| {
+                if (self.loca_data) |loca_table| {
                     fallback = .{
                         .glyf_data = glyf_table,
                         .loca_data = loca_table,
@@ -410,8 +446,8 @@ pub const Renderer = struct {
             }
         }
 
-        if (self.font.tableData(.{ 'C', 'B', 'L', 'C' })) |cblc_table| {
-            if (self.font.tableData(.{ 'C', 'B', 'D', 'T' })) |cbdt_table| {
+        if (self.cblc_data) |cblc_table| {
+            if (self.cbdt_data) |cbdt_table| {
                 if (try rasterization.rasterizeCbdt(scratch_allocator, output_allocator, cblc_table, cbdt_table, ppem_u16, glyph_id)) |bitmap| {
                     return .{ .bitmap = bitmap, .is_color = true };
                 }

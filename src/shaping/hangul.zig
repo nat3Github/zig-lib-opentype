@@ -4,6 +4,7 @@ const common = @import("common.zig");
 const map_mod = @import("map.zig");
 const apply_mod = @import("apply.zig");
 const Buffer = common.Buffer;
+const Cmap = common.Cmap;
 const Tag = common.Tag;
 const containsTag = common.containsTag;
 const MapBuilder = map_mod.MapBuilder;
@@ -82,15 +83,15 @@ fn isHangulTone(u: u32) bool {
     return u >= 0x302E and u <= 0x302F;
 }
 
-fn hangulHasGlyph(cmap_data: ?[]const u8, cp: u32) bool {
-    const data = cmap_data orelse return false;
-    if (parsing.Table.cmap.lookup(data, @intCast(cp))) |g| return g != 0;
+fn hangulHasGlyph(cmap: ?Cmap, cp: u32) bool {
+    const resolved = cmap orelse return false;
+    if (resolved.lookup(@intCast(cp))) |g| return g != 0;
     return false;
 }
 
-fn hangulIsZeroWidthChar(cmap_data: ?[]const u8, hhea: ?parsing.Table.hhea, hmtx_data: ?[]const u8, cp: u32) bool {
-    const data = cmap_data orelse return false;
-    const glyph = parsing.Table.cmap.lookup(data, @intCast(cp)) orelse return false;
+fn hangulIsZeroWidthChar(cmap: ?Cmap, hhea: ?parsing.Table.hhea, hmtx_data: ?[]const u8, cp: u32) bool {
+    const resolved = cmap orelse return false;
+    const glyph = resolved.lookup(@intCast(cp)) orelse return false;
     const hh = hhea orelse return false;
     const hd = hmtx_data orelse return false;
     return parsing.Table.hmtx.metricForGlyph(hd, glyph, hh.number_of_h_metrics).advance_width == 0;
@@ -119,7 +120,7 @@ pub fn overrideFeaturesHangul(map_builder: *MapBuilder) !void {
 /// single syllable when the font has that glyph, decomposes precomposed
 /// syllables the font lacks, and reorders a following Hangul tone mark
 /// (U+302E/F) to precede its base syllable.
-pub fn preprocessHangul(font: parsing.Font, buffer: *Buffer, cmap_data: ?[]const u8) !void {
+pub fn preprocessHangul(font: parsing.Font, buffer: *Buffer, cmap: ?Cmap) !void {
     const hhea_data = font.tableData(table_tag_hhea);
     const hmtx_data = font.tableData(table_tag_hmtx);
     const hhea = if (hhea_data) |d| (parsing.Table.hhea.parse(d) catch null) else null;
@@ -137,7 +138,7 @@ pub fn preprocessHangul(font: parsing.Font, buffer: *Buffer, cmap_data: ?[]const
             if (start < end and end == buffer.outLen()) {
                 buffer.unsafeToBreakFromOutBuffer(start, buffer.idx);
                 try buffer.nextGlyph();
-                if (!hangulIsZeroWidthChar(cmap_data, hhea, hmtx_data, u)) {
+                if (!hangulIsZeroWidthChar(cmap, hhea, hmtx_data, u)) {
                     buffer.mergeOutClusters(start, end + 1);
                     const info = buffer.out_info.items;
                     const tone = info[end];
@@ -146,9 +147,9 @@ pub fn preprocessHangul(font: parsing.Font, buffer: *Buffer, cmap_data: ?[]const
                     info[start] = tone;
                 }
             } else {
-                if (hangulHasGlyph(cmap_data, 0x25CC)) {
+                if (hangulHasGlyph(cmap, 0x25CC)) {
                     var chars: [2]u32 = undefined;
-                    if (!hangulIsZeroWidthChar(cmap_data, hhea, hmtx_data, u)) {
+                    if (!hangulIsZeroWidthChar(cmap, hhea, hmtx_data, u)) {
                         chars = .{ u, 0x25CC };
                     } else {
                         chars = .{ 0x25CC, u };
@@ -182,7 +183,7 @@ pub fn preprocessHangul(font: parsing.Font, buffer: *Buffer, cmap_data: ?[]const
 
                 if (isCombiningL(l) and isCombiningV(v) and (t == 0 or isCombiningT(t))) {
                     const s = hangul_s_base + (l - hangul_l_base) * hangul_n_count + (v - hangul_v_base) * hangul_t_count + tindex;
-                    if (hangulHasGlyph(cmap_data, s)) {
+                    if (hangulHasGlyph(cmap, s)) {
                         try buffer.replaceGlyphs(if (t != 0) 3 else 2, &.{s});
                         end = start + 1;
                         continue;
@@ -206,7 +207,7 @@ pub fn preprocessHangul(font: parsing.Font, buffer: *Buffer, cmap_data: ?[]const
             }
         } else if (isCombinedS(u)) {
             const s = u;
-            const has_glyph = hangulHasGlyph(cmap_data, s);
+            const has_glyph = hangulHasGlyph(cmap, s);
             const lindex = (s - hangul_s_base) / hangul_n_count;
             const nindex = (s - hangul_s_base) % hangul_n_count;
             const vindex = nindex / hangul_t_count;
@@ -215,7 +216,7 @@ pub fn preprocessHangul(font: parsing.Font, buffer: *Buffer, cmap_data: ?[]const
             if (tindex == 0 and buffer.idx + 1 < count and isCombiningT(buffer.cur(1).codepoint)) {
                 const new_tindex: u32 = buffer.cur(1).codepoint - hangul_t_base;
                 const new_s = s + new_tindex;
-                if (hangulHasGlyph(cmap_data, new_s)) {
+                if (hangulHasGlyph(cmap, new_s)) {
                     try buffer.replaceGlyphs(2, &.{new_s});
                     end = start + 1;
                     continue;
@@ -226,7 +227,7 @@ pub fn preprocessHangul(font: parsing.Font, buffer: *Buffer, cmap_data: ?[]const
 
             if (!has_glyph or (tindex == 0 and buffer.idx + 1 < count and isHangulT(buffer.cur(1).codepoint))) {
                 const decomposed = [3]u32{ hangul_l_base + lindex, hangul_v_base + vindex, hangul_t_base + tindex };
-                if (hangulHasGlyph(cmap_data, decomposed[0]) and hangulHasGlyph(cmap_data, decomposed[1]) and (tindex == 0 or hangulHasGlyph(cmap_data, decomposed[2]))) {
+                if (hangulHasGlyph(cmap, decomposed[0]) and hangulHasGlyph(cmap, decomposed[1]) and (tindex == 0 or hangulHasGlyph(cmap, decomposed[2]))) {
                     var s_len: usize = if (tindex != 0) 3 else 2;
                     try buffer.replaceGlyphs(1, decomposed[0..s_len]);
 

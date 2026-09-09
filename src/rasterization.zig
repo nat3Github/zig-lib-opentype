@@ -135,10 +135,25 @@ pub fn rasterizeCffOutlineHinted(
     phase: SubpixelOffset,
     darken: bool,
 ) CffHintError!Bitmap8bit {
+    var ctx = try parsing.Table.cff.Context.init(cff_data);
+    return rasterizeCffOutlineHintedWithContext(alloc, &ctx, glyph_id, units_per_em, ppem, phase, darken);
+}
+
+/// Like `rasterizeCffOutlineHinted`, but reuses a caller-owned per-font CFF
+/// context instead of re-parsing the font's INDEXes/DICTs for every glyph.
+pub fn rasterizeCffOutlineHintedWithContext(
+    alloc: Allocator,
+    ctx: *parsing.Table.cff.Context,
+    glyph_id: u16,
+    units_per_em: u16,
+    ppem: f32,
+    phase: SubpixelOffset,
+    darken: bool,
+) CffHintError!Bitmap8bit {
     const empty: Bitmap8bit = .empty;
 
-    const charstring_data = try parsing.Table.cff.charstringAndSubrsForGlyph(cff_data, glyph_id);
-    const private_hints = try parsing.cffPrivateHintsForGlyph(cff_data, glyph_id);
+    const charstring_data = try ctx.charstringAndSubrs(glyph_id);
+    const private_hints = try ctx.privateHints(glyph_id);
 
     const cf2_ppem = cff_hint.intToFixed(@intFromFloat(@round(ppem)));
     const scale = cff_hint.divFix(cf2_ppem, cff_hint.intToFixed(@as(i32, units_per_em)));

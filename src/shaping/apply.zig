@@ -3,6 +3,7 @@ const parsing = @import("../parsing.zig");
 const common = @import("common.zig");
 const map_mod = @import("map.zig");
 const Buffer = common.Buffer;
+const Cmap = common.Cmap;
 const GlyphInfo = common.GlyphInfo;
 const GlyphPosition = common.GlyphPosition;
 const Direction = common.Direction;
@@ -90,6 +91,10 @@ const gpos_tag_mark_to_mark = 6;
 const gpos_tag_context = 7;
 const gpos_tag_chain_context = 8;
 const gpos_tag_extension = 9;
+
+/// hb's `HB_MAX_CONTEXT_LENGTH`, the cap its `match_input` puts on a
+/// LigatureSubst's componentCount.
+const max_ligature_components = 64;
 
 /// Nested-lookup recursion cap for Contextual/Chaining Context lookups
 /// (`applyLookupOnce`), mirroring hb's `HB_MAX_NESTING_LEVEL`.
@@ -1168,11 +1173,22 @@ fn applyGsubSubtable(
             if (idx >= seq_count) return false;
             const seq = try reader.subReaderAt(6 + @as(usize, idx) * 2);
             const gcount = try seq.u16At(0);
-            if (gcount > 64) return false;
-            var out: [64]u32 = undefined;
+            // An empty Sequence is a no-op in hb, not a glyph deletion —
+            // `replaceGlyphs(1, &.{})` would consume the glyph and emit
+            // nothing.
+            if (gcount == 0) return false;
+            // Sequence length is a u16 with no spec cap; the stack path
+            // covers every real font, the heap path keeps a long one correct
+            // instead of silently dropping the substitution.
+            var stack_out: [64]u32 = undefined;
+            const out = if (gcount <= stack_out.len)
+                stack_out[0..gcount]
+            else
+                try buffer.allocator.alloc(u32, gcount);
+            defer if (gcount > stack_out.len) buffer.allocator.free(out);
             var gi: usize = 0;
             while (gi < gcount) : (gi += 1) out[gi] = try seq.u16At(2 + gi * 2);
-            try buffer.replaceGlyphs(1, out[0..gcount]);
+            try buffer.replaceGlyphs(1, out);
             return true;
         },
         gsub_tag_alternate => {
@@ -1200,6 +1216,10 @@ fn applyGsubSubtable(
             if (idx >= set_count) return false;
             const ligset = try reader.subReaderAt(6 + @as(usize, idx) * 2);
             const lig_count = try ligset.u16At(0);
+            // hb's skippy iterator is syllable-scoped whenever it starts at
+            // the current glyph, which is exactly the ligature-input case:
+            // components have to come from the same syllable.
+            const syllable = buffer.info.items[buffer.idx].indic_syllable;
             var li: usize = 0;
             while (li < lig_count) : (li += 1) {
                 const lig = try ligset.subReaderAt(2 + li * 2);
@@ -1208,20 +1228,50 @@ fn applyGsubSubtable(
                 // Coverage; the on-disk component array (trailing glyphs to
                 // match) has componentCount-1 entries.
                 const component_count = try lig.u16At(2);
-                if (component_count == 0 or component_count > 64) continue;
+                // 64 is hb's own `HB_MAX_CONTEXT_LENGTH` cap on `match_input`.
+                if (component_count == 0 or component_count > max_ligature_components) continue;
                 const comp_count_m1 = component_count - 1;
-                if (buffer.idx + comp_count_m1 >= buffer.len()) continue;
+
+                // Components are matched across `lookup_flags`-skipped
+                // glyphs (an Arabic `rlig` with IgnoreMarks has to see
+                // lam+alef through an intervening shadda), so the matched
+                // positions aren't contiguous.
+                var match_positions: [max_ligature_components]usize = undefined;
+                match_positions[0] = buffer.idx;
                 var matched = true;
                 var ci: usize = 0;
                 while (ci < comp_count_m1) : (ci += 1) {
+                    const next = nextUnskipped(buffer, gdef, lookup_flags, match_positions[ci] + 1) orelse {
+                        matched = false;
+                        break;
+                    };
                     const comp_glyph = try lig.u16At(4 + ci * 2);
-                    if (buffer.info.items[buffer.idx + 1 + ci].codepoint != comp_glyph) {
+                    // hb's `may_match`: a component outside this lookup's
+                    // mask, or outside the starting glyph's syllable, is a
+                    // hard non-match — not another glyph to skip over.
+                    const cand = buffer.info.items[next];
+                    if (cand.mask & lookup_mask == 0 or
+                        (syllable != 0 and cand.indic_syllable != syllable) or
+                        cand.codepoint != comp_glyph)
+                    {
                         matched = false;
                         break;
                     }
+                    match_positions[ci + 1] = next;
                 }
                 if (!matched) continue;
-                try buffer.replaceGlyphs(comp_count_m1 + 1, &.{lig_glyph});
+
+                // hb's `ligate_input`: the ligature replaces the first
+                // component, skipped glyphs in between are kept (they end up
+                // after it), and the remaining components are deleted.
+                const end = match_positions[comp_count_m1] + 1;
+                buffer.mergeClusters(buffer.idx, end);
+                try buffer.replaceGlyph(lig_glyph);
+                var k: usize = 1;
+                while (k < component_count) : (k += 1) {
+                    while (buffer.idx < match_positions[k]) try buffer.nextGlyph();
+                    buffer.skipGlyph();
+                }
                 return true;
             }
             return false;
@@ -1503,9 +1553,9 @@ pub fn applyTable(
 /// path) - that needs buffer-splice machinery this port doesn't have
 /// elsewhere, and virtually every font maps space, so a missing space glyph
 /// just leaves the original (rare, font-specific) glyph in place instead.
-pub fn hideDefaultIgnorables(buffer: *Buffer, cmap_data: ?[]const u8) void {
-    const data = cmap_data orelse return;
-    const space_glyph = parsing.Table.cmap.lookup(data, ' ') orelse return;
+pub fn hideDefaultIgnorables(buffer: *Buffer, cmap: ?Cmap) void {
+    const resolved = cmap orelse return;
+    const space_glyph = resolved.lookup(' ') orelse return;
     for (buffer.info.items) |*info| {
         if (info.is_default_ignorable) info.codepoint = space_glyph;
     }

@@ -86,7 +86,7 @@ fn isIsolateInitiator(c: BidiClass) bool {
 
 // BD8/P2: first strong directional type (L, R, or AL) in `classes`,
 // skipping the contents of any nested isolates.
-fn firstStrongDirection(classes: []const BidiClass) ?BidiClass {
+pub fn firstStrongDirection(classes: []const BidiClass) ?BidiClass {
     var isolate_depth: usize = 0;
     for (classes) |c| {
         if (isIsolateInitiator(c)) {

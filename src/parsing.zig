@@ -9,22 +9,6 @@ test {
     if (build_options.woff2) _ = woff2;
 }
 
-// `std.mem.sort` (WikiSort) monomorphizes to ~15KiB per (T, lessThan) pair
-// and is tuned for large arrays; the call site below sorts a short-lived
-// list of coverage breakpoints, where insertion sort is both smaller and
-// measurably faster.
-fn insertionSort(comptime T: type, items: []T, context: anytype, comptime lessThan: fn (@TypeOf(context), T, T) bool) void {
-    var i: usize = 1;
-    while (i < items.len) : (i += 1) {
-        const key = items[i];
-        var j: usize = i;
-        while (j > 0 and lessThan(context, key, items[j - 1])) : (j -= 1) {
-            items[j] = items[j - 1];
-        }
-        items[j] = key;
-    }
-}
-
 pub const Font = struct {
     data: []const u8,
     table_records: []const TableRecord,
@@ -157,6 +141,15 @@ const Cursor = struct {
     }
 };
 
+/// Narrows a 64-bit-accumulated table offset to a `usize` index, or null when
+/// `[offset, offset + need)` falls outside `data`. The wide accumulator is the
+/// point: `base + fontProvidedU32` wraps in u32 before any range check can see
+/// it.
+fn offsetWithin(data: []const u8, offset: u64, need: u64) ?usize {
+    if (offset + need > data.len) return null;
+    return @intCast(offset);
+}
+
 fn sliceChecked(data: []const u8, offset: u32, len: u32) Font.ParseError![]const u8 {
     const end = @as(u64, offset) + len;
     if (end > data.len) return error.UnexpectedEndOfData;
@@ -185,6 +178,10 @@ fn parseSfntAt(alloc: Allocator, data: []const u8, directory_start: usize) (Font
     return .{ .data = data, .table_records = table_records };
 }
 
+/// Matches woff2/reconstruct.zig's cap: bounds decompressed output by
+/// something other than the attacker-supplied length field.
+const max_woff_table_size: u32 = 1 << 26;
+
 fn parseWoff(alloc: Allocator, bytes: []const u8) (Font.ParseError || error{OutOfMemory})!Font {
     if (bytes.len < 44) return error.InvalidWoff;
     const num_tables = std.mem.readInt(u16, bytes[12..][0..2], .big);
@@ -205,18 +202,20 @@ fn parseWoff(alloc: Allocator, bytes: []const u8) (Font.ParseError || error{OutO
         if (@as(u64, table_offset) + comp_length > bytes.len) return error.InvalidWoff;
         const compressed = bytes[table_offset..][0..comp_length];
 
+        if (combined.items.len + orig_length > max_woff_table_size) return error.InvalidWoff;
         const start_in_combined: u32 = @intCast(combined.items.len);
         if (comp_length == orig_length) {
             combined.appendSlice(alloc, compressed) catch return error.OutOfMemory;
         } else {
+            // Decompress into an exactly-sized slice: a zlib bomb hits WriteFailed
+            // instead of expanding until the allocator gives out.
+            const out = combined.addManyAsSlice(alloc, orig_length) catch return error.OutOfMemory;
             var in_reader: std.Io.Reader = .fixed(compressed);
             var decompress_buffer: [std.compress.flate.max_window_len]u8 = undefined;
             var decompress: std.compress.flate.Decompress = .init(&in_reader, .zlib, &decompress_buffer);
-            var out_writer: std.Io.Writer.Allocating = .init(alloc);
-            defer out_writer.deinit();
-            _ = decompress.reader.streamRemaining(&out_writer.writer) catch return error.InvalidWoff;
-            if (out_writer.written().len != orig_length) return error.InvalidWoff;
-            combined.appendSlice(alloc, out_writer.written()) catch return error.OutOfMemory;
+            var out_writer: std.Io.Writer = .fixed(out);
+            const written = decompress.reader.streamRemaining(&out_writer) catch return error.InvalidWoff;
+            if (written != orig_length) return error.InvalidWoff;
         }
         rec.* = .{ .tag = tag.*, .offset = start_in_combined, .length = orig_length };
     }
@@ -366,7 +365,30 @@ pub const Table = struct {
 
     pub const cmap = struct {
         pub fn lookup(data: []const u8, codepoint: u21) ?u16 {
-            return lookupImpl(data, codepoint) catch null;
+            const sel = resolve(data) orelse return null;
+            return sel.lookup(codepoint);
+        }
+
+        /// The subtable `lookup` would pick, resolved once so a caller
+        /// looking up many codepoints doesn't re-scan and re-score the
+        /// subtable directory per codepoint.
+        pub const Resolved = struct {
+            sub: []const u8,
+            format: u16,
+
+            pub fn lookup(self: Resolved, codepoint: u21) ?u16 {
+                return switch (self.format) {
+                    0 => lookupFormat0(self.sub, codepoint),
+                    4 => lookupFormat4(self.sub, codepoint),
+                    12 => lookupFormat12(self.sub, codepoint),
+                    else => null,
+                };
+            }
+        };
+
+        pub fn resolve(data: []const u8) ?Resolved {
+            const sel = selectSubtable(data) orelse return null;
+            return .{ .sub = data[sel.offset..], .format = sel.format };
         }
 
         const Subtable = struct { offset: u32, format: u16 };
@@ -407,17 +429,6 @@ pub const Table = struct {
             if (subtable_offset + 2 > data.len) return null;
             const format = std.mem.readInt(u16, data[subtable_offset..][0..2], .big);
             return .{ .offset = subtable_offset, .format = format };
-        }
-
-        fn lookupImpl(data: []const u8, codepoint: u21) !?u16 {
-            const sel = selectSubtable(data) orelse return null;
-            const sub = data[sel.offset..];
-            return switch (sel.format) {
-                0 => lookupFormat0(sub, codepoint),
-                4 => lookupFormat4(sub, codepoint),
-                12 => lookupFormat12(sub, codepoint),
-                else => null,
-            };
         }
 
         /// An inclusive codepoint range with a non-.notdef glyph somewhere
@@ -463,10 +474,8 @@ pub const Table = struct {
             /// sorted table, earlier entries (lower index) winning any
             /// overlap. Breakpoints are the union of every range's
             /// start/end+1 across all entries, so the interval between
-            /// consecutive breakpoints has a single winner -- cheap since a
-            /// font-stack's per-font range count tops out in the low
-            /// thousands even for CJK-heavy fonts, and this only needs to
-            /// run once per distinct stack.
+            /// consecutive breakpoints has a single winner. Runs once per
+            /// distinct stack.
             pub fn build(alloc: Allocator, per_entry_ranges: []const []const Range) Allocator.Error!FallbackStack {
                 var breakpoints: std.ArrayList(u32) = .empty;
                 defer breakpoints.deinit(alloc);
@@ -477,11 +486,9 @@ pub const Table = struct {
                     }
                 }
                 if (breakpoints.items.len == 0) return .{};
-                insertionSort(u32, breakpoints.items, {}, struct {
-                    fn lessThan(_: void, a: u32, b: u32) bool {
-                        return a < b;
-                    }
-                }.lessThan);
+                // A CJK face alone contributes ~20k format-12 groups (40k
+                // breakpoints), so this needs to be n log n, not insertion sort.
+                std.mem.sortUnstable(u32, breakpoints.items, {}, std.sort.asc(u32));
 
                 var uniq: std.ArrayList(u32) = .empty;
                 defer uniq.deinit(alloc);
@@ -619,24 +626,31 @@ pub const Table = struct {
             const id_range_offset_start = id_delta_start + seg_count_x2;
             if (id_range_offset_start + @as(usize, seg_count_x2) > sub.len) return null;
 
-            var i: usize = 0;
-            while (i < seg_count) : (i += 1) {
-                const end_code = std.mem.readInt(u16, sub[end_codes_start + i * 2 ..][0..2], .big);
-                if (codepoint > end_code) continue;
-                const start_code = std.mem.readInt(u16, sub[start_codes_start + i * 2 ..][0..2], .big);
-                if (codepoint < start_code) return null;
-                const id_delta: i16 = std.mem.readInt(i16, sub[id_delta_start + i * 2 ..][0..2], .big);
-                const id_range_offset = std.mem.readInt(u16, sub[id_range_offset_start + i * 2 ..][0..2], .big);
-                if (id_range_offset == 0) {
-                    return @truncate(@as(u32, @bitCast(@as(i32, codepoint) + id_delta)));
-                }
-                const glyph_pos = id_range_offset_start + i * 2 + id_range_offset + (@as(usize, codepoint) - start_code) * 2;
-                if (glyph_pos + 2 > sub.len) return null;
-                const glyph = std.mem.readInt(u16, sub[glyph_pos..][0..2], .big);
-                if (glyph == 0) return null;
-                return @truncate(@as(u32, @bitCast(@as(i32, glyph) + id_delta)));
+            // endCode[] is spec-required sorted, so binary search for the
+            // first segment ending at or after the codepoint, same as
+            // format 12 — format 4 is the more common subtable.
+            var lo: usize = 0;
+            var hi: usize = seg_count;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                const end_code = std.mem.readInt(u16, sub[end_codes_start + mid * 2 ..][0..2], .big);
+                if (end_code < codepoint) lo = mid + 1 else hi = mid;
             }
-            return null;
+            const i = lo;
+            if (i >= seg_count) return null;
+
+            const start_code = std.mem.readInt(u16, sub[start_codes_start + i * 2 ..][0..2], .big);
+            if (codepoint < start_code) return null;
+            const id_delta: i16 = std.mem.readInt(i16, sub[id_delta_start + i * 2 ..][0..2], .big);
+            const id_range_offset = std.mem.readInt(u16, sub[id_range_offset_start + i * 2 ..][0..2], .big);
+            if (id_range_offset == 0) {
+                return @truncate(@as(u32, @bitCast(@as(i32, codepoint) + id_delta)));
+            }
+            const glyph_pos = id_range_offset_start + i * 2 + id_range_offset + (@as(usize, codepoint) - start_code) * 2;
+            if (glyph_pos + 2 > sub.len) return null;
+            const glyph = std.mem.readInt(u16, sub[glyph_pos..][0..2], .big);
+            if (glyph == 0) return null;
+            return @truncate(@as(u32, @bitCast(@as(i32, glyph) + id_delta)));
         }
 
         fn lookupFormat12(sub: []const u8, codepoint: u21) ?u16 {
@@ -787,22 +801,23 @@ pub const Table = struct {
         fn itemDelta(data: []const u8, store_offset: u32, outer: u16, inner: u16, normalized_coords: []const f32) f32 {
             const store = store_offset;
             if (@as(u64, store) + 8 > data.len) return 0;
-            const region_list_offset = store + std.mem.readInt(u32, data[store + 2 ..][0..4], .big);
+            const region_list_offset = offsetWithin(data, @as(u64, store) + std.mem.readInt(u32, data[store + 2 ..][0..4], .big), 4) orelse return 0;
             const data_count = std.mem.readInt(u16, data[store + 6 ..][0..2], .big);
             if (outer >= data_count) return 0;
 
-            if (@as(u64, region_list_offset) + 4 > data.len) return 0;
             const axis_count = std.mem.readInt(u16, data[region_list_offset..][0..2], .big);
             const region_record_size = @as(usize, axis_count) * 6;
             const region_count = std.mem.readInt(u16, data[region_list_offset + 2 ..][0..2], .big);
 
             const data_offset_pos = @as(u64, store) + 8 + @as(u64, outer) * 4;
             if (data_offset_pos + 4 > data.len) return 0;
-            const item_data_base = store + std.mem.readInt(u32, data[@intCast(data_offset_pos)..][0..4], .big);
+            const item_data_base = offsetWithin(data, @as(u64, store) + std.mem.readInt(u32, data[@intCast(data_offset_pos)..][0..4], .big), 6) orelse return 0;
 
-            if (@as(u64, item_data_base) + 6 > data.len) return 0;
             const short_count = std.mem.readInt(u16, data[item_data_base + 2 ..][0..2], .big);
             const region_index_count = std.mem.readInt(u16, data[item_data_base + 4 ..][0..2], .big);
+            // Spec requires wordDeltaCount <= regionIndexCount; a font that
+            // violates it would underflow the row-stride math below.
+            if (short_count > region_index_count) return 0;
 
             const region_index_base = item_data_base + 6;
             const elem_len = (@as(usize, region_index_count) - short_count) + @as(usize, short_count) * 2;
@@ -879,10 +894,22 @@ pub const Table = struct {
             index_to_loc_format: i16,
             glyph_id: u16,
         ) (Font.ParseError || error{OutOfMemory})!Outline {
-            return outlineRecursive(alloc, glyf_data, loca_data, index_to_loc_format, glyph_id, 0);
+            var loads: u32 = 0;
+            return outlineRecursive(alloc, glyf_data, loca_data, index_to_loc_format, glyph_id, 0, &loads);
         }
 
         const empty: Outline = .{ .number_of_contours = 0, .end_points_of_contours = &.{}, .points = &.{} };
+
+        /// Composite components fan out as well as nest, so the depth cap
+        /// alone leaves the work exponential in depth (64 components eight
+        /// levels deep is 64^8 decodes). Budget total glyph decodes too;
+        /// real composites use single-digit components, two or three deep.
+        const max_glyph_loads: u32 = 1024;
+
+        fn spendLoad(loads: *u32) Font.ParseError!void {
+            if (loads.* >= max_glyph_loads) return error.RecursionLimitExceeded;
+            loads.* += 1;
+        }
 
         fn locaBounds(loca_data: []const u8, index_to_loc_format: i16, glyph_id: u16) Font.ParseError!struct { start: u32, end: u32 } {
             if (index_to_loc_format == 0) {
@@ -932,8 +959,10 @@ pub const Table = struct {
             index_to_loc_format: i16,
             glyph_id: u16,
             depth: u32,
+            loads: *u32,
         ) (Font.ParseError || error{OutOfMemory})!Outline {
             if (depth > 8) return error.RecursionLimitExceeded;
+            try spendLoad(loads);
             const bounds = try locaBounds(loca_data, index_to_loc_format, glyph_id);
             if (bounds.start > bounds.end or bounds.end > glyf_data.len) return error.InvalidTableFormat;
             if (bounds.start == bounds.end) return empty;
@@ -942,14 +971,20 @@ pub const Table = struct {
             const number_of_contours = try cursor.readI16();
             try cursor.skip(8);
             if (number_of_contours >= 0) return decodeSimpleGlyph(alloc, &cursor, number_of_contours);
-            return decodeCompositeGlyph(alloc, glyf_data, loca_data, index_to_loc_format, &cursor, depth);
+            return decodeCompositeGlyph(alloc, glyf_data, loca_data, index_to_loc_format, &cursor, depth, loads);
         }
 
         fn decodeSimpleGlyph(alloc: Allocator, cursor: *Cursor, number_of_contours: i16) (Font.ParseError || error{OutOfMemory})!Outline {
             const nc: usize = @intCast(number_of_contours);
             const end_pts = try alloc.alloc(u16, nc);
             errdefer alloc.free(end_pts);
-            for (end_pts) |*e| e.* = try cursor.readU16();
+            // Spec requires strictly-increasing end points (every contour has at
+            // least one point); consumers index contour ranges off these without
+            // re-checking, so reject non-monotonic entries here.
+            for (end_pts, 0..) |*e, i| {
+                e.* = try cursor.readU16();
+                if (i > 0 and e.* <= end_pts[i - 1]) return error.InvalidTableFormat;
+            }
             const num_points: usize = if (nc == 0) 0 else @as(usize, end_pts[nc - 1]) + 1;
 
             const instruction_length = try cursor.readU16();
@@ -1014,6 +1049,7 @@ pub const Table = struct {
             index_to_loc_format: i16,
             cursor: *Cursor,
             depth: u32,
+            loads: *u32,
         ) (Font.ParseError || error{OutOfMemory})!Outline {
             var points_list: std.ArrayList(Point) = .empty;
             defer points_list.deinit(alloc);
@@ -1070,7 +1106,7 @@ pub const Table = struct {
                 const dx: f64 = if (args_are_xy) arg1 else 0;
                 const dy: f64 = if (args_are_xy) arg2 else 0;
 
-                const component = try outlineRecursive(alloc, glyf_data, loca_data, index_to_loc_format, glyph_index, depth + 1);
+                const component = try outlineRecursive(alloc, glyf_data, loca_data, index_to_loc_format, glyph_index, depth + 1, loads);
                 defer alloc.free(component.points);
                 defer alloc.free(component.end_points_of_contours);
 
@@ -1088,8 +1124,7 @@ pub const Table = struct {
                         .on_curve = p.on_curve,
                     }) catch return error.OutOfMemory;
                 }
-                for (component.end_points_of_contours) |e|
-                    ends_list.append(alloc, e + base_point_count) catch return error.OutOfMemory;
+                try appendShiftedEnds(alloc, &ends_list, component.end_points_of_contours, base_point_count);
 
                 more = (flags & 0x0020) != 0;
                 last_flags = flags;
@@ -1101,9 +1136,11 @@ pub const Table = struct {
                 instructions = try cursor.readBytes(instruction_length);
             }
 
+            const ends = ends_list.toOwnedSlice(alloc) catch return error.OutOfMemory;
+            errdefer alloc.free(ends);
             return .{
                 .number_of_contours = -1,
-                .end_points_of_contours = ends_list.toOwnedSlice(alloc) catch return error.OutOfMemory,
+                .end_points_of_contours = ends,
                 .points = points_list.toOwnedSlice(alloc) catch return error.OutOfMemory,
                 .instructions = instructions,
             };
@@ -1111,6 +1148,22 @@ pub const Table = struct {
 
         fn clampToI16(v: i32) i16 {
             return @intCast(std.math.clamp(v, std.math.minInt(i16), std.math.maxInt(i16)));
+        }
+
+        /// Rebases a component's contour ends onto the flattened point list.
+        /// `e` is raw font data, so the sum can leave u16 even though the
+        /// flattened point count itself is capped.
+        fn appendShiftedEnds(
+            alloc: Allocator,
+            list: *std.ArrayList(u16),
+            ends: []const u16,
+            base: u16,
+        ) (Font.ParseError || error{OutOfMemory})!void {
+            for (ends) |e| {
+                const shifted = @as(u32, e) + base;
+                if (shifted > std.math.maxInt(u16)) return error.InvalidTableFormat;
+                list.append(alloc, @intCast(shifted)) catch return error.OutOfMemory;
+            }
         }
 
         fn f2dot14(v: i16) f64 {
@@ -1284,6 +1337,7 @@ pub const Table = struct {
             glyph_id: u16,
             normalized_coords: []const f32,
         ) (Font.ParseError || error{OutOfMemory})!Outline {
+            var loads: u32 = 0;
             return outlineVariedRecursive(
                 alloc,
                 glyf_data,
@@ -1296,6 +1350,7 @@ pub const Table = struct {
                 glyph_id,
                 normalized_coords,
                 0,
+                &loads,
             );
         }
 
@@ -1311,8 +1366,10 @@ pub const Table = struct {
             glyph_id: u16,
             normalized_coords: []const f32,
             depth: u32,
+            loads: *u32,
         ) (Font.ParseError || error{OutOfMemory})!Outline {
             if (depth > 8) return error.RecursionLimitExceeded;
+            try spendLoad(loads);
             const bounds = try locaBounds(loca_data, index_to_loc_format, glyph_id);
             if (bounds.start > bounds.end or bounds.end > glyf_data.len) return error.InvalidTableFormat;
             if (bounds.start == bounds.end) return empty;
@@ -1378,6 +1435,7 @@ pub const Table = struct {
                 variation_data,
                 normalized_coords,
                 depth,
+                loads,
             );
         }
 
@@ -1396,6 +1454,7 @@ pub const Table = struct {
             variation_data: []const u8,
             normalized_coords: []const f32,
             depth: u32,
+            loads: *u32,
         ) (Font.ParseError || error{OutOfMemory})!Outline {
             var headers: std.ArrayList(ComponentHeader) = .empty;
             defer headers.deinit(alloc);
@@ -1449,6 +1508,7 @@ pub const Table = struct {
                     h.glyph_index,
                     normalized_coords,
                     depth + 1,
+                    loads,
                 );
                 defer alloc.free(component.points);
                 defer alloc.free(component.end_points_of_contours);
@@ -1467,13 +1527,14 @@ pub const Table = struct {
                         .on_curve = p.on_curve,
                     }) catch return error.OutOfMemory;
                 }
-                for (component.end_points_of_contours) |e|
-                    ends_list.append(alloc, e + base_point_count) catch return error.OutOfMemory;
+                try appendShiftedEnds(alloc, &ends_list, component.end_points_of_contours, base_point_count);
             }
 
+            const ends = ends_list.toOwnedSlice(alloc) catch return error.OutOfMemory;
+            errdefer alloc.free(ends);
             return .{
                 .number_of_contours = -1,
-                .end_points_of_contours = ends_list.toOwnedSlice(alloc) catch return error.OutOfMemory,
+                .end_points_of_contours = ends,
                 .points = points_list.toOwnedSlice(alloc) catch return error.OutOfMemory,
             };
         }
@@ -1739,9 +1800,14 @@ pub const Table = struct {
         // an empty slice (composite pseudo-points) makes this a no-op, which
         // is correct — composite component offsets get no IUP inference.
         fn interpolateDeltas(contour_ends: []const u16, points_out: []Point2, points_org: []const Point2, has_delta: []const bool) void {
+            if (has_delta.len == 0) return;
             var point: usize = 0;
             for (contour_ends) |end_u16| {
-                const end: usize = end_u16;
+                // Only the *last* contour end is checked against the point
+                // count at parse time, so an earlier entry can point past the
+                // buffer; clamp the same way the hinting IUP does.
+                var end: usize = end_u16;
+                if (end >= has_delta.len) end = has_delta.len - 1;
                 const first_point = point;
 
                 while (point <= end and !has_delta[point]) point += 1;
@@ -1947,39 +2013,106 @@ pub const Table = struct {
         }
 
         fn charstringAndSubrs(cff_data: []const u8, glyph_id: u16) (Font.ParseError || error{OutOfMemory})!CharstringAndSubrs {
-            if (cff_data.len < 4) return error.InvalidTableFormat;
-            const header_size = cff_data[2];
-            var pos: usize = header_size;
+            var ctx = try Context.init(cff_data);
+            return ctx.charstringAndSubrs(glyph_id);
+        }
 
-            const name_index = try readCffIndex(cff_data, pos, false);
-            pos = name_index.end_pos;
-            const top_dict_index = try readCffIndex(cff_data, pos, false);
-            pos = top_dict_index.end_pos;
-            const string_index = try readCffIndex(cff_data, pos, false);
-            pos = string_index.end_pos;
-            const global_subrs = (try readCffIndex(cff_data, pos, false)).index;
+        /// Per-font CFF state — INDEX headers, top DICT, and the Private
+        /// DICT-derived local subrs/hints — parsed once. Resolving them per
+        /// glyph instead means re-walking Name/TopDict/String/GSubr INDEXes,
+        /// the top DICT, FDSelect and the Private DICT for every outline.
+        /// CID fonts still consult FDSelect per glyph but memoize the last
+        /// FD's subrs/hints, since consecutive glyphs almost always share one.
+        pub const Context = struct {
+            data: []const u8,
+            global_subrs: CffIndex,
+            charstrings: CffIndex,
+            fdarray: ?CffIndex,
+            fdselect_offset: u32,
+            cached_fd: ?u8,
+            local_subrs: CffIndex,
+            private_hints: CffPrivateHints,
 
-            if (top_dict_index.index.count == 0) return error.InvalidTableFormat;
-            const top = try parseCffDict(try top_dict_index.index.get(0));
-            const charstrings_offset = top.charstrings_offset orelse return error.InvalidTableFormat;
-            const charstrings = (try readCffIndex(cff_data, charstrings_offset, false)).index;
-            const charstring = try charstrings.get(glyph_id);
+            pub fn init(cff_data: []const u8) Font.ParseError!Context {
+                if (cff_data.len < 4) return error.InvalidTableFormat;
+                const header_size = cff_data[2];
+                var pos: usize = header_size;
 
-            var local_subrs = CffIndex.empty(cff_data);
-            if (top.is_cid) {
-                if (top.fdarray_offset) |fda_off| {
-                    const fdselect_off = top.fdselect_offset orelse return error.InvalidTableFormat;
-                    const fd = try fdForGlyph(cff_data, fdselect_off, glyph_id);
-                    const fdarray = (try readCffIndex(cff_data, fda_off, false)).index;
-                    const fd_dict = try parseCffDict(try fdarray.get(fd));
-                    local_subrs = try localSubrsFromPrivate(cff_data, fd_dict, false);
+                const name_index = try readCffIndex(cff_data, pos, false);
+                pos = name_index.end_pos;
+                const top_dict_index = try readCffIndex(cff_data, pos, false);
+                pos = top_dict_index.end_pos;
+                const string_index = try readCffIndex(cff_data, pos, false);
+                pos = string_index.end_pos;
+                const global_subrs = (try readCffIndex(cff_data, pos, false)).index;
+
+                if (top_dict_index.index.count == 0) return error.InvalidTableFormat;
+                const top = try parseCffDict(try top_dict_index.index.get(0));
+                const charstrings_offset = top.charstrings_offset orelse return error.InvalidTableFormat;
+
+                var self = Context{
+                    .data = cff_data,
+                    .global_subrs = global_subrs,
+                    .charstrings = (try readCffIndex(cff_data, charstrings_offset, false)).index,
+                    .fdarray = null,
+                    .fdselect_offset = 0,
+                    .cached_fd = null,
+                    .local_subrs = CffIndex.empty(cff_data),
+                    .private_hints = .{},
+                };
+
+                if (top.is_cid) {
+                    if (top.fdarray_offset) |fda_off| {
+                        self.fdselect_offset = top.fdselect_offset orelse return error.InvalidTableFormat;
+                        self.fdarray = (try readCffIndex(cff_data, fda_off, false)).index;
+                    } else {
+                        // No FDArray to select from: hints come off the top
+                        // DICT, but its Subrs stay out of reach (a CID font's
+                        // local subrs live in the per-FD Private DICTs).
+                        self.private_hints = try privateHintsFromDict(cff_data, top);
+                    }
+                } else {
+                    self.local_subrs = try localSubrsFromPrivate(cff_data, top, false);
+                    self.private_hints = try privateHintsFromDict(cff_data, top);
                 }
-            } else {
-                local_subrs = try localSubrsFromPrivate(cff_data, top, false);
+                return self;
             }
 
-            return .{ .charstring = charstring, .global_subrs = global_subrs, .local_subrs = local_subrs };
-        }
+            fn selectFd(self: *Context, glyph_id: u16) Font.ParseError!void {
+                const fdarray = self.fdarray orelse return;
+                const fd = try fdForGlyph(self.data, self.fdselect_offset, glyph_id);
+                if (self.cached_fd) |cached| if (cached == fd) return;
+                const fd_dict = try parseCffDict(try fdarray.get(fd));
+                self.local_subrs = try localSubrsFromPrivate(self.data, fd_dict, false);
+                self.private_hints = try privateHintsFromDict(self.data, fd_dict);
+                self.cached_fd = fd;
+            }
+
+            pub fn charstringAndSubrs(self: *Context, glyph_id: u16) Font.ParseError!CharstringAndSubrs {
+                try self.selectFd(glyph_id);
+                return .{
+                    .charstring = try self.charstrings.get(glyph_id),
+                    .global_subrs = self.global_subrs,
+                    .local_subrs = self.local_subrs,
+                };
+            }
+
+            pub fn privateHints(self: *Context, glyph_id: u16) Font.ParseError!CffPrivateHints {
+                try self.selectFd(glyph_id);
+                return self.private_hints;
+            }
+
+            /// Decodes a glyph's charstring into path segments; see `outline`.
+            pub fn outline(self: *Context, alloc: Allocator, glyph_id: u16) (Font.ParseError || error{OutOfMemory})!Outline {
+                const parts = try self.charstringAndSubrs(glyph_id);
+                var interp = CharstringInterp.init(parts.global_subrs, parts.local_subrs, false, .{ .data = self.data, .vstore_offset = null });
+                interp.emit_segments = std.ArrayListUnmanaged(Segment).empty;
+                errdefer interp.emit_segments.?.deinit(alloc);
+                interp.emit_alloc = alloc;
+                try interp.run(parts.charstring);
+                return .{ .segments = try interp.emit_segments.?.toOwnedSlice(alloc) };
+            }
+        };
 
         pub fn glyphBounds(alloc: Allocator, cff_data: []const u8, glyph_id: u16) (Font.ParseError || error{OutOfMemory})!Bounds {
             _ = alloc;
@@ -1993,13 +2126,8 @@ pub const Table = struct {
         /// units, unscaled) for rasterization. Caller owns the returned
         /// slice (`alloc.free(outline.segments)`).
         pub fn outline(alloc: Allocator, cff_data: []const u8, glyph_id: u16) (Font.ParseError || error{OutOfMemory})!Outline {
-            const parts = try charstringAndSubrs(cff_data, glyph_id);
-            var interp = CharstringInterp.init(parts.global_subrs, parts.local_subrs, false, .{ .data = cff_data, .vstore_offset = null });
-            interp.emit_segments = std.ArrayListUnmanaged(Segment).empty;
-            errdefer interp.emit_segments.?.deinit(alloc);
-            interp.emit_alloc = alloc;
-            try interp.run(parts.charstring);
-            return .{ .segments = try interp.emit_segments.?.toOwnedSlice(alloc) };
+            var ctx = try Context.init(cff_data);
+            return ctx.outline(alloc, glyph_id);
         }
     };
 
@@ -2155,6 +2283,8 @@ pub const Table = struct {
 
             const result = try alloc.alloc([]const AxisValueMap, axis_count);
             errdefer alloc.free(result);
+            var filled: usize = 0;
+            errdefer for (result[0..filled]) |segment| alloc.free(segment);
             var pos: usize = 8;
             for (result) |*segment| {
                 if (pos + 2 > data.len) return error.InvalidTableFormat;
@@ -2171,6 +2301,7 @@ pub const Table = struct {
                     pos += 4;
                 }
                 segment.* = maps;
+                filled += 1;
             }
             return result;
         }
@@ -3091,7 +3222,9 @@ pub const Table = struct {
                                 continue;
                             }
                             const start_cov = try self.u16At(rec_pos + 4);
-                            return start_cov + (glyph - start);
+                            const index = @as(u32, start_cov) + (glyph - start);
+                            if (index > std.math.maxInt(u16)) return error.InvalidTableFormat;
+                            return @intCast(index);
                         }
                         return null;
                     },
@@ -3596,31 +3729,13 @@ fn numToU32Signed(v: f64) i32 {
 /// CID-keyed CFF font get the right per-glyph-range blue zones/darkening
 /// widths, not just the top-level (non-CID) Private dict.
 pub fn cffPrivateHintsForGlyph(cff_data: []const u8, glyph_id: u16) Font.ParseError!CffPrivateHints {
-    if (cff_data.len < 4) return error.InvalidTableFormat;
-    const header_size = cff_data[2];
-    var pos: usize = header_size;
+    var ctx = try Table.cff.Context.init(cff_data);
+    return ctx.privateHints(glyph_id);
+}
 
-    const name_index = try readCffIndex(cff_data, pos, false);
-    pos = name_index.end_pos;
-    const top_dict_index = try readCffIndex(cff_data, pos, false);
-    pos = top_dict_index.end_pos;
-
-    if (top_dict_index.index.count == 0) return error.InvalidTableFormat;
-    const top = try parseCffDict(try top_dict_index.index.get(0));
-
-    var dict = top;
-    if (top.is_cid) {
-        if (top.fdarray_offset) |fda_off| {
-            const fdselect_off = top.fdselect_offset orelse return error.InvalidTableFormat;
-            const fd = try fdForGlyph(cff_data, fdselect_off, glyph_id);
-            const fdarray = (try readCffIndex(cff_data, fda_off, false)).index;
-            dict = try parseCffDict(try fdarray.get(fd));
-        }
-    }
-
+fn privateHintsFromDict(data: []const u8, dict: CffDict) Font.ParseError!CffPrivateHints {
     if (dict.private_size == 0) return .{};
-    const private_data = try sliceChecked(cff_data, dict.private_offset, dict.private_size);
-    return parseCffPrivateDict(private_data);
+    return parseCffPrivateDict(try sliceChecked(data, dict.private_offset, dict.private_size));
 }
 
 const VstoreContext = struct {
@@ -3687,6 +3802,11 @@ fn parseCharstringNumber(cursor: *Cursor, b0: u8) Font.ParseError!f64 {
     return @floatFromInt(-(@as(i32, b0) - 251) * 256 - @as(i32, b1) - 108);
 }
 
+/// Total charstring operators (across every subr call) one glyph may execute.
+/// Matches HarfBuzz's `HB_MAX_OPS`; the largest real glyphs land three orders
+/// of magnitude below it.
+const max_charstring_ops: u32 = 0x40000;
+
 // NOTE: Type2 charstring interpreter that tracks only the glyph's bounding
 // box (per plan.md, path extraction belongs to rasterization); shared
 // between CFF and CFF2, gated on `is_cff2` since CFF2 charstrings never
@@ -3697,14 +3817,24 @@ const CharstringInterp = struct {
     is_cff2: bool,
     vstore: VstoreContext,
     vsindex: u32 = 0,
+    /// Region count for `vsindex`, parsed on first `blend` and reused until
+    /// a `vsindex` operator changes it — re-reading the ItemVariationStore
+    /// header per blend is pure overhead on blend-heavy CFF2 charstrings.
+    region_count: ?u16 = null,
 
-    stack: [48]f64 = undefined,
+    /// CFF2's operand stack is 513 deep (CFF1's is 48); `blend` on a font
+    /// with many masters overflows the CFF1 limit, and `push` drops silently
+    /// past the end, so sizing to the smaller limit truncates real fonts.
+    stack: [513]f64 = undefined,
     sp: usize = 0,
     x: f64 = 0,
     y: f64 = 0,
     have_width: bool = false,
     n_stems: u32 = 0,
     depth: u32 = 0,
+    /// Depth alone doesn't bound a subr graph that branches: budget the
+    /// total operators executed, the way the hinting VM budgets instructions.
+    ops: u32 = 0,
 
     min_x: f64 = std.math.inf(f64),
     min_y: f64 = std.math.inf(f64),
@@ -3720,8 +3850,18 @@ const CharstringInterp = struct {
         return .{ .global_subrs = global_subrs, .local_subrs = local_subrs, .is_cff2 = is_cff2, .vstore = vstore };
     }
 
+    /// Charstring coordinates accumulate unbounded deltas, so a hostile
+    /// glyph can run them past i32 long before the interpreter's op budget
+    /// stops it — and an out-of-range `@intFromFloat` is illegal behavior,
+    /// not a wrap.
+    fn roundToI32(v: f64) i32 {
+        if (v >= @as(f64, std.math.maxInt(i32))) return std.math.maxInt(i32);
+        if (v <= @as(f64, std.math.minInt(i32))) return std.math.minInt(i32);
+        return @intFromFloat(@round(v));
+    }
+
     fn roundPoint(x: f64, y: f64) Table.cff.Point {
-        return .{ .x = @intFromFloat(@round(x)), .y = @intFromFloat(@round(y)) };
+        return .{ .x = roundToI32(x), .y = roundToI32(y) };
     }
 
     fn emit(self: *CharstringInterp, segment: Table.cff.Segment) error{OutOfMemory}!void {
@@ -3734,10 +3874,10 @@ const CharstringInterp = struct {
     fn finalBounds(self: CharstringInterp) Table.cff.Bounds {
         if (self.min_x > self.max_x) return .{ .x_min = 0, .y_min = 0, .x_max = 0, .y_max = 0 };
         return .{
-            .x_min = @intFromFloat(@round(self.min_x)),
-            .y_min = @intFromFloat(@round(self.min_y)),
-            .x_max = @intFromFloat(@round(self.max_x)),
-            .y_max = @intFromFloat(@round(self.max_y)),
+            .x_min = roundToI32(self.min_x),
+            .y_min = roundToI32(self.min_y),
+            .x_max = roundToI32(self.max_x),
+            .y_max = roundToI32(self.max_y),
         };
     }
 
@@ -3815,7 +3955,11 @@ const CharstringInterp = struct {
         const k_f = self.stack[self.sp];
         if (k_f < 0) return error.InvalidTableFormat;
         const k: usize = @intFromFloat(k_f);
-        const region_count = try regionCountForVsIndex(self.vstore, self.vsindex);
+        const region_count = self.region_count orelse blk: {
+            const n = try regionCountForVsIndex(self.vstore, self.vsindex);
+            self.region_count = n;
+            break :blk n;
+        };
         const total = k * (1 + @as(usize, region_count));
         if (total > self.sp) return error.InvalidTableFormat;
         self.sp = self.sp - total + k;
@@ -3823,28 +3967,28 @@ const CharstringInterp = struct {
 
     fn hflex(self: *CharstringInterp) (Font.ParseError || error{OutOfMemory})!void {
         if (self.sp < 7) return error.InvalidTableFormat;
-        const s = self.stack;
+        const s = &self.stack;
         try self.curveTo(s[0], 0, s[1], s[2], s[3], 0);
         try self.curveTo(s[4], 0, s[5], -s[2], s[6], 0);
     }
 
     fn flex(self: *CharstringInterp) (Font.ParseError || error{OutOfMemory})!void {
         if (self.sp < 12) return error.InvalidTableFormat;
-        const s = self.stack;
+        const s = &self.stack;
         try self.curveTo(s[0], s[1], s[2], s[3], s[4], s[5]);
         try self.curveTo(s[6], s[7], s[8], s[9], s[10], s[11]);
     }
 
     fn hflex1(self: *CharstringInterp) (Font.ParseError || error{OutOfMemory})!void {
         if (self.sp < 9) return error.InvalidTableFormat;
-        const s = self.stack;
+        const s = &self.stack;
         try self.curveTo(s[0], s[1], s[2], s[3], s[4], 0);
         try self.curveTo(s[5], 0, s[6], s[7], s[8], -(s[1] + s[3] + s[7]));
     }
 
     fn flex1(self: *CharstringInterp) (Font.ParseError || error{OutOfMemory})!void {
         if (self.sp < 11) return error.InvalidTableFormat;
-        const s = self.stack;
+        const s = &self.stack;
         const dx_sum = s[0] + s[2] + s[4] + s[6] + s[8];
         const dy_sum = s[1] + s[3] + s[5] + s[7] + s[9];
         try self.curveTo(s[0], s[1], s[2], s[3], s[4], s[5]);
@@ -3862,6 +4006,8 @@ const CharstringInterp = struct {
 
         var cursor = Cursor{ .data = charstring };
         while (!cursor.atEnd()) {
+            self.ops += 1;
+            if (self.ops > max_charstring_ops) return error.RecursionLimitExceeded;
             const b0 = try cursor.readU8();
             if (b0 >= 32 or b0 == 28) {
                 self.push(try parseCharstringNumber(&cursor, b0));
@@ -3993,7 +4139,10 @@ const CharstringInterp = struct {
                     return;
                 },
                 15 => {
-                    if (self.sp >= 1) self.vsindex = @intFromFloat(@max(self.stack[0], 0));
+                    if (self.sp >= 1) {
+                        self.vsindex = @intFromFloat(@max(self.stack[0], 0));
+                        self.region_count = null;
+                    }
                     self.clearStack();
                 },
                 16 => try self.doBlend(),

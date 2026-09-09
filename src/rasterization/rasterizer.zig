@@ -46,8 +46,24 @@ pub const Rasterizer = struct {
         const row_index: usize = @intCast(ey);
         const row = &self.rows[row_index];
 
-        var i: usize = 0;
-        while (i < row.items.len and row.items[i].x < ex) : (i += 1) {}
+        // Consecutive calls almost always land on the same cell, or append to
+        // the right end of the row; both skip the search entirely.
+        if (self.current) |cur| {
+            if (cur.row == row_index and row.items[cur.index].x == ex) return;
+        }
+        if (row.items.len > 0 and row.items[row.items.len - 1].x < ex) {
+            try row.append(self.allocator, .{ .x = ex });
+            self.current = .{ .row = row_index, .index = row.items.len - 1 };
+            return;
+        }
+
+        var lo: usize = 0;
+        var hi: usize = row.items.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (row.items[mid].x < ex) lo = mid + 1 else hi = mid;
+        }
+        const i = lo;
 
         if (i < row.items.len and row.items[i].x == ex) {
             self.current = .{ .row = row_index, .index = i };

@@ -5,6 +5,7 @@ const map_mod = @import("map.zig");
 const arabic_mod = @import("arabic.zig");
 const Buffer = common.Buffer;
 const GlyphInfo = common.GlyphInfo;
+const Cmap = common.Cmap;
 const Tag = common.Tag;
 const MapBuilder = map_mod.MapBuilder;
 const Map = map_mod.Map;
@@ -772,12 +773,12 @@ fn setupTopographicalMasksUse(buffer: *Buffer, map: Map) void {
 /// fallback above (mutually exclusive, same as hb's early return in
 /// `setup_topographical_masks`). The state machine reads raw codepoints, so
 /// it must run before `codepoint` is overwritten with glyph ids.
-pub fn setupMasksUse(buffer: *Buffer, map: Map, cmap_data: ?[]const u8, is_arabic_joining: bool) !void {
+pub fn setupMasksUse(buffer: *Buffer, map: Map, cmap: ?Cmap, is_arabic_joining: bool) !void {
     if (is_arabic_joining) arabic_mod.setupMasksArabic(buffer, map);
 
     for (buffer.info.items) |*info| info.indic_category = unicode.useCategory(@intCast(info.codepoint));
     findSyllablesUse(buffer);
-    _ = try common.insertDottedCircles(buffer, cmap_data, use_broken_cluster, B, R, null);
+    _ = try common.insertDottedCircles(buffer, cmap, use_broken_cluster, B, R, null);
     if (!is_arabic_joining) setupTopographicalMasksUse(buffer, map);
 
     const rphf_mask = map.get1Mask(tag_rphf);

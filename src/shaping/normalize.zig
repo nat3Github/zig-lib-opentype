@@ -2,16 +2,16 @@ const parsing = @import("../parsing.zig");
 const unicode = @import("../unicode.zig");
 const common = @import("common.zig");
 const Buffer = common.Buffer;
+const Cmap = common.Cmap;
 const GlyphInfo = common.GlyphInfo;
 const combiningClassOf = common.combiningClassOf;
 
 const NormalizeContext = struct {
-    cmap_data: ?[]const u8,
+    cmap: ?Cmap,
 
     fn nominalGlyph(self: NormalizeContext, codepoint: u21) ?u32 {
-        const data = self.cmap_data orelse return null;
-        const glyph = parsing.Table.cmap.lookup(data, codepoint) orelse return null;
-        return glyph;
+        const resolved = self.cmap orelse return null;
+        return resolved.lookup(codepoint) orelse null;
     }
 };
 
@@ -214,9 +214,9 @@ fn normalizeRecomposeRound(ctx: NormalizeContext, buffer: *Buffer, block_mark_re
 /// classify as a broken syllable). The one indic-specific hardcoded
 /// exception (`0x09AF+0x09BC -> 0x09DF`) hb recomposes anyway isn't ported -
 /// narrow enough to defer.
-pub fn normalize(buffer: *Buffer, cmap_data: ?[]const u8, might_short_circuit: bool, block_mark_recompose: bool) !void {
+pub fn normalize(buffer: *Buffer, cmap: ?Cmap, might_short_circuit: bool, block_mark_recompose: bool) !void {
     if (buffer.info.items.len == 0) return;
-    const ctx = NormalizeContext{ .cmap_data = cmap_data };
+    const ctx = NormalizeContext{ .cmap = cmap };
 
     var all_simple = true;
     buffer.clearOutput();

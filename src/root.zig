@@ -22,10 +22,11 @@ pub const PositionedGlyph = render.PositionedGlyph;
 pub const EndMetric = shaping.EndMetric;
 pub const Buffer = shaping.Buffer;
 pub const BidiFallbackResult = shaping.BidiFallbackResult;
+pub const Item = shaping.Item;
 
+pub const shapeWithContext = shaping.shapeWithContext;
 pub const shapeBidiParagraphWithFallback = shaping.shapeBidiParagraphWithFallback;
 pub const measureGlyphRange = shaping.measureGlyphRange;
-pub const glyphsForWidth = shaping.glyphsForWidth;
 
 pub const discovery_fontconfig = discovery.fontconfig;
 pub const discovery_core_text = discovery.core_text;

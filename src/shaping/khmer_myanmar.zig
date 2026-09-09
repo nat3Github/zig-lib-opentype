@@ -4,6 +4,7 @@ const indic_mod = @import("indic.zig");
 const arabic_mod = @import("arabic.zig");
 const Buffer = common.Buffer;
 const GlyphInfo = common.GlyphInfo;
+const Cmap = common.Cmap;
 const Tag = common.Tag;
 const MapBuilder = map_mod.MapBuilder;
 const Map = map_mod.Map;
@@ -308,10 +309,10 @@ fn reorderKhmerSyllable(buffer: *Buffer, map: Map, start: usize, end: usize) voi
 /// `reorder_khmer`/`reorder_syllable_khmer`, collapsed into one pre-GSUB
 /// pass at the same call site as `setupMasksIndic` (see that function's
 /// doc comment for why).
-pub fn setupMasksKhmer(buffer: *Buffer, map: Map, cmap_data: ?[]const u8) !void {
+pub fn setupMasksKhmer(buffer: *Buffer, map: Map, cmap: ?Cmap) !void {
     for (buffer.info.items) |*info| info.indic_category = @intCast(indicGetCategories(info.codepoint) & 0xFF);
     findSyllablesKhmer(buffer);
-    _ = try common.insertDottedCircles(buffer, cmap_data, khmer_syllable_broken, ic_dottedcircle, null, null);
+    _ = try common.insertDottedCircles(buffer, cmap, khmer_syllable_broken, ic_dottedcircle, null, null);
 
     var start: usize = 0;
     while (start < buffer.info.items.len) {
@@ -624,10 +625,10 @@ fn reorderMyanmarSyllable(buffer: *Buffer, start: usize, end: usize) void {
 /// pre-GSUB pass same as Khmer/Indic above. No `Map` parameter needed -
 /// unlike Khmer/Indic, hb's real Myanmar shaper does no per-glyph feature
 /// masking here (see `collectFeaturesMyanmar`'s doc comment).
-pub fn setupMasksMyanmar(buffer: *Buffer, cmap_data: ?[]const u8) !void {
+pub fn setupMasksMyanmar(buffer: *Buffer, cmap: ?Cmap) !void {
     for (buffer.info.items) |*info| info.indic_category = @intCast(indicGetCategories(info.codepoint) & 0xFF);
     findSyllablesMyanmar(buffer);
-    _ = try common.insertDottedCircles(buffer, cmap_data, myanmar_syllable_broken, ic_dottedcircle, null, null);
+    _ = try common.insertDottedCircles(buffer, cmap, myanmar_syllable_broken, ic_dottedcircle, null, null);
 
     var start: usize = 0;
     while (start < buffer.info.items.len) {

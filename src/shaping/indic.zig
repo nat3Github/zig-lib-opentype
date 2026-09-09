@@ -3,6 +3,7 @@ const common = @import("common.zig");
 const map_mod = @import("map.zig");
 const Buffer = common.Buffer;
 const GlyphInfo = common.GlyphInfo;
+const Cmap = common.Cmap;
 const Tag = common.Tag;
 const MapBuilder = map_mod.MapBuilder;
 const Map = map_mod.Map;
@@ -913,10 +914,10 @@ fn reorderIndicSyllable(buffer: *Buffer, map: Map, config: IndicScriptConfig, is
 /// no GSUB-pause machinery to run these as separate stages). Must run
 /// before `mapGlyphsFast` overwrites `codepoint` with a glyph id -
 /// `setIndicProperties` needs the original Unicode codepoint.
-pub fn setupMasksIndic(buffer: *Buffer, map: Map, config: IndicScriptConfig, cmap_data: ?[]const u8) !void {
+pub fn setupMasksIndic(buffer: *Buffer, map: Map, config: IndicScriptConfig, cmap: ?Cmap) !void {
     for (buffer.info.items) |*info| setIndicProperties(info);
     findSyllablesIndic(buffer);
-    _ = try common.insertDottedCircles(buffer, cmap_data, indic_syllable_broken, ic_dottedcircle, ic_repha, ip_end);
+    _ = try common.insertDottedCircles(buffer, cmap, indic_syllable_broken, ic_dottedcircle, ic_repha, ip_end);
 
     const is_old_spec = indicIsOldSpec(map);
     var start: usize = 0;

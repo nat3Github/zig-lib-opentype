@@ -616,11 +616,9 @@ pub const Buffer = struct {
     /// order, so the byte offset it yields mid-RTL-run is a *visual*
     /// prefix, not a logical one. Callers that must be bidi-correct
     /// therefore do not slice a reordered shape through this: selection
-    /// highlight uses `clusterByteRange` (order-independent), and
-    /// line-wrap trim/measure/render reshape each final line's own
-    /// byte-range. Remaining visual-order caller: mouse/touch hit-testing
-    /// inside an RTL run, where the byte this maps a click to can still be
-    /// off by a cluster.
+    /// highlight uses `clusterByteRange` (order-independent), measurement
+    /// and hit-testing use `logicalPrefixGlyphs`, and line-wrap trim/render
+    /// reshape each final line's own byte-range.
     pub fn byteOffsetForGlyph(self: *const Buffer, byte_offsets: []const u32, glyph_count: usize) usize {
         if (glyph_count == 0) return 0;
         if (glyph_count >= self.info.items.len) return byte_offsets[byte_offsets.len - 1];
@@ -633,12 +631,47 @@ pub const Buffer = struct {
     /// slice an already-shaped line at a byte boundary found some other
     /// way (a UAX #14 break search, a cursor byte offset) without
     /// reshaping. Same visual-vs-logical-order caveat as
-    /// `byteOffsetForGlyph`.
+    /// `byteOffsetForGlyph`: a logical prefix is `logicalPrefixGlyphs`.
     pub fn glyphLimitForByteOffset(self: *const Buffer, byte_offsets: []const u32, byte_offset: usize) usize {
         for (self.info.items, 0..) |info, idx| {
             if (byte_offsets[info.cluster] >= byte_offset) return idx;
         }
         return self.info.items.len;
+    }
+
+    pub const GlyphRange = struct { start: usize, end: usize };
+
+    /// Glyphs covering the *logical* byte prefix `[0, byte_offset)`, picked
+    /// by cluster rather than by buffer position. In an RTL run that prefix
+    /// is the buffer's *trailing* glyphs, which is exactly where
+    /// `glyphLimitForByteOffset`, counting from the buffer's start, answers
+    /// for the wrong end of the run. Contiguous within one level run; a
+    /// buffer holding both directions gets the enclosing range.
+    pub fn logicalPrefixGlyphs(self: *const Buffer, byte_offsets: []const u32, byte_offset: usize) GlyphRange {
+        var start: usize = self.info.items.len;
+        var end: usize = 0;
+        for (self.info.items, 0..) |info, idx| {
+            if (byte_offsets[info.cluster] >= byte_offset) continue;
+            start = @min(start, idx);
+            end = idx + 1;
+        }
+        if (end == 0) return .{ .start = 0, .end = 0 };
+        return .{ .start = start, .end = end };
+    }
+
+    /// Glyphs run right to left: a later glyph belongs to an earlier cluster.
+    /// Answers for one level run, which is what a fragment holds; a buffer
+    /// mixing directions reports the direction of its first turn.
+    pub fn isRtl(self: *const Buffer) bool {
+        var prev: ?u32 = null;
+        for (self.info.items) |info| {
+            if (prev) |p| {
+                if (info.cluster < p) return true;
+                if (info.cluster > p) return false;
+            }
+            prev = info.cluster;
+        }
+        return false;
     }
 };
 
@@ -652,9 +685,11 @@ pub const Buffer = struct {
 /// (this port has no pause machinery - see [[project_use_shaper_pipeline_gap]]),
 /// so unlike hb this never sees a repha/pref glyph already reclassified by a
 /// prior substitution pass; it only ever skips a *pre-substitution* repha.
+pub const Cmap = parsing.Table.cmap.Resolved;
+
 pub fn insertDottedCircles(
     buffer: *Buffer,
-    cmap_data: ?[]const u8,
+    cmap: ?Cmap,
     broken_syllable_type: u8,
     dottedcircle_category: u8,
     repha_category: ?u8,
@@ -669,8 +704,8 @@ pub fn insertDottedCircles(
     }
     if (!has_broken) return false;
 
-    const data = cmap_data orelse return false;
-    const dottedcircle_glyph = parsing.Table.cmap.lookup(data, 0x25CC) orelse return false;
+    const resolved = cmap orelse return false;
+    const dottedcircle_glyph = resolved.lookup(0x25CC) orelse return false;
 
     var dottedcircle = GlyphInfo{};
     // Runs pre-mapGlyphsFast (codepoint still holds Unicode values here, see

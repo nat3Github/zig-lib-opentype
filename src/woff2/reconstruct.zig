@@ -712,6 +712,10 @@ fn reconstructGlyf(
             std.mem.writeInt(u32, &tmp, @intCast(v), .big);
             try combined.appendSlice(alloc, &tmp);
         } else {
+            // Short loca stores offset/2 in a u16, so it can only describe a
+            // glyf up to 128KiB — a font declaring indexFormat 0 with more
+            // than that is corrupt, not a reason to trap in @intCast.
+            if (v >> 1 > std.math.maxInt(u16)) return error.Corrupt;
             var tmp: [2]u8 = undefined;
             std.mem.writeInt(u16, &tmp, @intCast(v >> 1), .big);
             try combined.appendSlice(alloc, &tmp);

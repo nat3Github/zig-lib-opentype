@@ -28,7 +28,6 @@ pub const Tag = common.Tag;
 pub const EndMetric = metrics_mod.EndMetric;
 pub const GlyphMetrics = metrics_mod.GlyphMetrics;
 pub const measureGlyphRange = metrics_mod.measureGlyphRange;
-pub const glyphsForWidth = metrics_mod.glyphsForWidth;
 
 pub const Map = map_mod.Map;
 pub const MapBuilder = map_mod.MapBuilder;
@@ -130,7 +129,7 @@ pub fn shape(
     language_tags: []const Tag,
     extra_features: []const Tag,
 ) (parsing.Font.ParseError || error{OutOfMemory})!Buffer {
-    return shapeImpl(allocator, font, codepoints, direction, script_tags, language_tags, extra_features, &.{});
+    return shapeImpl(allocator, font, codepoints, direction, script_tags, language_tags, extra_features, &.{}, null);
 }
 
 /// Same as `shape`, but `normalized_coords` (per-axis values in [-1, 1],
@@ -148,7 +147,37 @@ pub fn shapeVaried(
     extra_features: []const Tag,
     normalized_coords: []const f32,
 ) (parsing.Font.ParseError || error{OutOfMemory})!Buffer {
-    return shapeImpl(allocator, font, codepoints, direction, script_tags, language_tags, extra_features, normalized_coords);
+    return shapeImpl(allocator, font, codepoints, direction, script_tags, language_tags, extra_features, normalized_coords, null);
+}
+
+/// Sub-range of a `shape*` call's `codepoints` to actually emit glyphs for.
+/// Codepoints outside it are still shaped -- they supply the surrounding
+/// context that ligation, Arabic joining, and mark attachment depend on --
+/// but their glyphs are dropped from the result. Mirrors HarfBuzz's
+/// `hb_buffer_add_utf8` `item_offset`/`item_length`.
+pub const Item = struct {
+    start: usize,
+    end: usize,
+};
+
+/// Same as `shape`, but only emits glyphs whose cluster falls inside `item`;
+/// `codepoints` outside it act as pre/post shaping context. Use when the
+/// caller holds more text than it wants glyphs for: a styled run inside a
+/// larger paragraph (so a ligature or joining form spanning the style
+/// boundary still resolves against its real neighbours), or a truncated
+/// measurement window whose tail would otherwise be shaped as if the text
+/// ended there.
+pub fn shapeWithContext(
+    allocator: std.mem.Allocator,
+    font: parsing.Font,
+    codepoints: []const u21,
+    item: Item,
+    direction: Direction,
+    script_tags: []const Tag,
+    language_tags: []const Tag,
+    extra_features: []const Tag,
+) (parsing.Font.ParseError || error{OutOfMemory})!Buffer {
+    return shapeImpl(allocator, font, codepoints, direction, script_tags, language_tags, extra_features, &.{}, item);
 }
 
 fn shapeImpl(
@@ -160,6 +189,7 @@ fn shapeImpl(
     language_tags: []const Tag,
     extra_features: []const Tag,
     normalized_coords: []const f32,
+    item: ?Item,
 ) (parsing.Font.ParseError || error{OutOfMemory})!Buffer {
     var buffer = Buffer.init(allocator);
     errdefer buffer.deinit();
@@ -169,7 +199,7 @@ fn shapeImpl(
     try buffer.info.ensureTotalCapacityPrecise(allocator, codepoints.len);
     try buffer.out_info.ensureTotalCapacityPrecise(allocator, codepoints.len);
 
-    const cmap_data = font.tableData(.{ 'c', 'm', 'a', 'p' });
+    const cmap: ?parsing.Table.cmap.Resolved = if (font.tableData(.{ 'c', 'm', 'a', 'p' })) |d| parsing.Table.cmap.resolve(d) else null;
     for (codepoints, 0..) |cp, i| try buffer.add(cp, @intCast(i));
 
     const is_hangul = containsTag(script_tags, hang_script_tag);
@@ -246,22 +276,22 @@ fn shapeImpl(
     // hb runs the shaper's preprocess_text (Hangul syllable decompose/
     // compose, Thai SARA AM reorder/PUA fallback - see those shapers'
     // sections above) before normalize.
-    if (is_hangul) try preprocessHangul(font, &buffer, cmap_data);
-    if (is_thai or is_lao) try preprocessTextThai(&buffer, cmap_data, is_thai, map.found_script[0]);
+    if (is_hangul) try preprocessHangul(font, &buffer, cmap);
+    if (is_thai or is_lao) try preprocessTextThai(&buffer, cmap, is_thai, map.found_script[0]);
 
     // COMPOSED_DIACRITICS_NO_SHORT_CIRCUIT in hb's terms - see normalize()'s
     // doc comment for why these four complex shapers need it.
     const might_short_circuit = !(indic_config != null or is_khmer or is_myanmar or is_use);
     const block_mark_recompose = indic_config != null or is_khmer or is_use;
-    try normalize(&buffer, cmap_data, might_short_circuit, block_mark_recompose);
+    try normalize(&buffer, cmap, might_short_circuit, block_mark_recompose);
 
     buffer.resetMasks(map.global_mask);
     if (is_hangul) setupMasksHangul(&buffer, map);
     if (is_arabic) setupMasksArabic(&buffer, map);
-    if (indic_config) |cfg| try setupMasksIndic(&buffer, map, cfg.*, cmap_data);
-    if (is_khmer) try setupMasksKhmer(&buffer, map, cmap_data);
-    if (is_myanmar) try setupMasksMyanmar(&buffer, cmap_data);
-    if (is_use) try setupMasksUse(&buffer, map, cmap_data, is_use_arabic_joining);
+    if (indic_config) |cfg| try setupMasksIndic(&buffer, map, cfg.*, cmap);
+    if (is_khmer) try setupMasksKhmer(&buffer, map, cmap);
+    if (is_myanmar) try setupMasksMyanmar(&buffer, cmap);
+    if (is_use) try setupMasksUse(&buffer, map, cmap, is_use_arabic_joining);
 
     setJoinerFlags(&buffer);
     mapGlyphsFast(&buffer);
@@ -274,7 +304,7 @@ fn shapeImpl(
     } else .{};
 
     try applyTable(font, map, 0, gdef_classdef, &buffer, direction);
-    hideDefaultIgnorables(&buffer, cmap_data);
+    hideDefaultIgnorables(&buffer, cmap);
     try buffer.clearPositions();
     applyDefaultHorizontalAdvances(font, &buffer, normalized_coords);
     // hb-ot-shape.cc's `zero_width_marks` shaper property: the Indic,
@@ -293,7 +323,25 @@ fn shapeImpl(
     // logical order and flipped to visual order as the final position step.
     if (direction == .right_to_left or direction == .bottom_to_top) buffer.reverse();
 
+    if (item) |it| retainItemGlyphs(&buffer, it);
+
     return buffer;
+}
+
+/// Drops glyphs whose cluster lies outside `item`, keeping `info`/`pos`
+/// parallel. Runs last, after positioning: context glyphs must survive every
+/// GSUB/GPOS pass to influence the ones we keep, and only then go away.
+fn retainItemGlyphs(buffer: *Buffer, item: Item) void {
+    var kept: usize = 0;
+    for (buffer.info.items, buffer.pos.items) |info, pos| {
+        if (info.cluster < item.start or info.cluster >= item.end) continue;
+        buffer.info.items[kept] = info;
+        buffer.pos.items[kept] = pos;
+        kept += 1;
+    }
+    buffer.info.shrinkRetainingCapacity(kept);
+    buffer.pos.shrinkRetainingCapacity(kept);
+    buffer.idx = @min(buffer.idx, kept);
 }
 
 /// Runs UAX #9 (via `unicode.Bidi`) over `codepoints`, itemizes into
@@ -330,7 +378,7 @@ pub fn shapeBidiParagraphVaried(
     extra_features: []const Tag,
     normalized_coords: []const f32,
 ) (parsing.Font.ParseError || unicode.Bidi.Error || error{OutOfMemory})!Buffer {
-    return shapeBidiParagraphImpl(allocator, &.{font}, codepoints, base_direction, script_tags, language_tags, extra_features, normalized_coords, null);
+    return shapeBidiParagraphImpl(allocator, &.{font}, codepoints, base_direction, script_tags, language_tags, extra_features, normalized_coords, null, null);
 }
 
 /// Result of `shapeBidiParagraphWithFallback`: `buffer` in visual order,
@@ -352,6 +400,11 @@ pub const BidiFallbackResult = struct {
 /// outer, bidi inner) cannot. A codepoint covered by no font attaches to
 /// the previous codepoint's font (falls back to `fonts[0]`/.notdef at the
 /// paragraph start).
+/// `item`, when non-null, restricts the emitted glyphs to that codepoint
+/// range the way `shapeWithContext` does: everything outside it still shapes
+/// (and so still joins, ligates and resolves bidi against its real
+/// neighbours), but its glyphs are dropped at the end. Cluster values stay
+/// indices into the whole `codepoints` slice.
 pub fn shapeBidiParagraphWithFallback(
     allocator: std.mem.Allocator,
     fonts: []const parsing.Font,
@@ -360,11 +413,12 @@ pub fn shapeBidiParagraphWithFallback(
     script_tags: []const Tag,
     language_tags: []const Tag,
     extra_features: []const Tag,
+    item: ?Item,
 ) (parsing.Font.ParseError || unicode.Bidi.Error || error{OutOfMemory})!BidiFallbackResult {
     var font_indices: std.ArrayList(usize) = .empty;
     errdefer font_indices.deinit(allocator);
     try font_indices.ensureTotalCapacityPrecise(allocator, codepoints.len);
-    const buffer = try shapeBidiParagraphImpl(allocator, fonts, codepoints, base_direction, script_tags, language_tags, extra_features, &.{}, &font_indices);
+    const buffer = try shapeBidiParagraphImpl(allocator, fonts, codepoints, base_direction, script_tags, language_tags, extra_features, &.{}, &font_indices, item);
     return .{ .buffer = buffer, .font_indices = try font_indices.toOwnedSlice(allocator) };
 }
 
@@ -384,6 +438,7 @@ fn shapeBidiParagraphImpl(
     extra_features: []const Tag,
     normalized_coords: []const f32,
     font_indices_out: ?*std.ArrayList(usize),
+    item: ?Item,
 ) (parsing.Font.ParseError || unicode.Bidi.Error || error{OutOfMemory})!Buffer {
     var result = Buffer.init(allocator);
     errdefer result.deinit();
@@ -400,9 +455,9 @@ fn shapeBidiParagraphImpl(
     defer allocator.free(resolved_scripts);
     unicode.resolveScripts(codepoints, resolved_scripts);
 
-    const cmap_datas = try allocator.alloc(?[]const u8, fonts.len);
-    defer allocator.free(cmap_datas);
-    for (fonts, cmap_datas) |font, *data| data.* = font.tableData(.{ 'c', 'm', 'a', 'p' });
+    const cmaps = try allocator.alloc(?parsing.Table.cmap.Resolved, fonts.len);
+    defer allocator.free(cmaps);
+    for (fonts, cmaps) |font, *out| out.* = if (font.tableData(.{ 'c', 'm', 'a', 'p' })) |d| parsing.Table.cmap.resolve(d) else null;
 
     // Per-codepoint fallback font (first font whose cmap covers it), an
     // uncovered codepoint inheriting the previous one's font like
@@ -412,7 +467,7 @@ fn shapeBidiParagraphImpl(
     {
         var prev: usize = 0;
         for (codepoints, 0..) |cp, i| {
-            const fi = coverageFontIndex(cmap_datas, cp) orelse prev;
+            const fi = coverageFontIndex(cmaps, cp) orelse prev;
             font_of[i] = fi;
             prev = fi;
         }
@@ -476,7 +531,7 @@ fn shapeBidiParagraphImpl(
         const run_direction: Direction = if (run.level % 2 == 1) .right_to_left else .left_to_right;
         var ot_tags_storage: [2]Tag = undefined;
         const run_script_tags: []const Tag = if (script_tags.len != 0) script_tags else unicode.openTypeScriptTags(run.script, &ot_tags_storage);
-        run_buffers[i] = try shapeImpl(allocator, fonts[run.font_index], codepoints[run.start..run.end], run_direction, run_script_tags, language_tags, extra_features, normalized_coords);
+        run_buffers[i] = try shapeImpl(allocator, fonts[run.font_index], codepoints[run.start..run.end], run_direction, run_script_tags, language_tags, extra_features, normalized_coords, null);
         run_buffers_made += 1;
         for (run_buffers[i].info.items) |*info| info.cluster += @intCast(run.start);
         run_levels[i] = run.level;
@@ -493,6 +548,21 @@ fn shapeBidiParagraphImpl(
     }
     result.have_positions = true;
 
+    // Last, after every run has shaped and been placed in visual order: the
+    // context has to survive GSUB/GPOS and reordering to do its job.
+    if (item) |it| {
+        if (font_indices_out) |out| {
+            var kept: usize = 0;
+            for (result.info.items, 0..) |info, g| {
+                if (info.cluster < it.start or info.cluster >= it.end) continue;
+                out.items[kept] = out.items[g];
+                kept += 1;
+            }
+            out.shrinkRetainingCapacity(kept);
+        }
+        retainItemGlyphs(&result, it);
+    }
+
     return result;
 }
 
@@ -504,10 +574,10 @@ pub const Span = struct {
     end: usize,
 };
 
-fn coverageFontIndex(cmap_datas: []const ?[]const u8, codepoint: u21) ?usize {
-    for (cmap_datas, 0..) |cmap_data, i| {
-        const data = cmap_data orelse continue;
-        if (parsing.Table.cmap.lookup(data, codepoint)) |glyph_id| {
+fn coverageFontIndex(cmaps: []const ?parsing.Table.cmap.Resolved, codepoint: u21) ?usize {
+    for (cmaps, 0..) |cmap, i| {
+        const resolved = cmap orelse continue;
+        if (resolved.lookup(codepoint)) |glyph_id| {
             if (glyph_id != 0) return i;
         }
     }
@@ -524,14 +594,14 @@ pub fn itemizeByFontCoverage(allocator: std.mem.Allocator, fonts: []const parsin
     errdefer spans.deinit(allocator);
     if (text.len == 0) return spans.toOwnedSlice(allocator);
 
-    const cmap_datas = try allocator.alloc(?[]const u8, fonts.len);
-    defer allocator.free(cmap_datas);
-    for (fonts, cmap_datas) |font, *data| data.* = font.tableData(.{ 'c', 'm', 'a', 'p' });
+    const cmaps = try allocator.alloc(?parsing.Table.cmap.Resolved, fonts.len);
+    defer allocator.free(cmaps);
+    for (fonts, cmaps) |font, *out| out.* = if (font.tableData(.{ 'c', 'm', 'a', 'p' })) |d| parsing.Table.cmap.resolve(d) else null;
 
-    var current_font = coverageFontIndex(cmap_datas, text[0]) orelse 0;
+    var current_font = coverageFontIndex(cmaps, text[0]) orelse 0;
     var start: usize = 0;
     for (text[1..], 1..) |codepoint, i| {
-        const font_index = coverageFontIndex(cmap_datas, codepoint) orelse current_font;
+        const font_index = coverageFontIndex(cmaps, codepoint) orelse current_font;
         if (font_index != current_font) {
             try spans.append(allocator, .{ .font_index = current_font, .start = start, .end = i });
             start = i;

@@ -1,6 +1,7 @@
 const parsing = @import("../parsing.zig");
 const common = @import("common.zig");
 const Buffer = common.Buffer;
+const Cmap = common.Cmap;
 const Tag = common.Tag;
 
 // Ported from vendor/harfbuzz/src/hb-ot-shaper-thai.cc (pinned 703e2d1441):
@@ -130,13 +131,13 @@ fn thaiPuaMappingsFor(action: ThaiAction) []const ThaiPuaMapping {
     };
 }
 
-fn thaiPuaShape(cmap_data: ?[]const u8, u: u32, action: ThaiAction) u32 {
+fn thaiPuaShape(cmap: ?Cmap, u: u32, action: ThaiAction) u32 {
     if (action == .nop or u > 0xFFFF) return u;
     for (thaiPuaMappingsFor(action)) |mapping| {
         if (mapping.u != u) continue;
-        if (cmap_data) |data| {
-            if (parsing.Table.cmap.lookup(data, mapping.win_pua)) |g| if (g != 0) return mapping.win_pua;
-            if (parsing.Table.cmap.lookup(data, mapping.mac_pua)) |g| if (g != 0) return mapping.mac_pua;
+        if (cmap) |resolved| {
+            if (resolved.lookup(mapping.win_pua)) |g| if (g != 0) return mapping.win_pua;
+            if (resolved.lookup(mapping.mac_pua)) |g| if (g != 0) return mapping.mac_pua;
         }
         break;
     }
@@ -146,7 +147,7 @@ fn thaiPuaShape(cmap_data: ?[]const u8, u: u32, action: ThaiAction) u32 {
 /// Ported from `do_thai_pua_shaping`: only called when the font has no
 /// Thai GSUB entry, so PUA glyphs stand in for the state-machine-selected
 /// mark form.
-fn doThaiPuaShaping(cmap_data: ?[]const u8, buffer: *Buffer) void {
+fn doThaiPuaShaping(cmap: ?Cmap, buffer: *Buffer) void {
     var above_state: ThaiAboveState = thai_above_start_state[@intFromEnum(ThaiConsonantType.not_consonant)];
     var below_state: ThaiBelowState = thai_below_start_state[@intFromEnum(ThaiConsonantType.not_consonant)];
     var base: usize = 0;
@@ -171,9 +172,9 @@ fn doThaiPuaShaping(cmap_data: ?[]const u8, buffer: *Buffer) void {
 
         buffer.unsafeToBreak(base, i);
         if (action == .rd) {
-            info[base].codepoint = thaiPuaShape(cmap_data, info[base].codepoint, action);
+            info[base].codepoint = thaiPuaShape(cmap, info[base].codepoint, action);
         } else {
-            info[i].codepoint = thaiPuaShape(cmap_data, glyph_info.codepoint, action);
+            info[i].codepoint = thaiPuaShape(cmap, glyph_info.codepoint, action);
         }
     }
 }
@@ -191,7 +192,7 @@ fn thaiIsAboveBaseMark(u: u32) bool {
 /// into `<consonant, NIKHAHIT, SARA AA>` and moves NIKHAHIT before any
 /// preceding above-base marks, then (Thai only, not Lao) runs
 /// `doThaiPuaShaping` if the font's GSUB has no `thai` script entry.
-pub fn preprocessTextThai(buffer: *Buffer, cmap_data: ?[]const u8, is_thai: bool, has_thai_gsub: bool) !void {
+pub fn preprocessTextThai(buffer: *Buffer, cmap: ?Cmap, is_thai: bool, has_thai_gsub: bool) !void {
     buffer.clearOutput();
     const count = buffer.info.items.len;
     buffer.idx = 0;
@@ -221,5 +222,5 @@ pub fn preprocessTextThai(buffer: *Buffer, cmap_data: ?[]const u8, is_thai: bool
     }
     try buffer.sync();
 
-    if (is_thai and !has_thai_gsub) doThaiPuaShaping(cmap_data, buffer);
+    if (is_thai and !has_thai_gsub) doThaiPuaShaping(cmap, buffer);
 }

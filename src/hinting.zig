@@ -1376,7 +1376,12 @@ pub const Interpreter = struct {
         const disp = self.computePointDisplacement(self.zp2.cur);
         if (!disp.ok) return;
         const start: u32 = if (contour == 0) 0 else @as(u32, self.zp2.contours[contour - 1]) + 1;
-        const limit: u32 = if (self.gs.gep2 == 0) self.zp2.n_points else @as(u32, self.zp2.contours[contour]) + 1;
+        // `contours` is raw glyf data (see `insIup`'s clamp): an entry past
+        // the point count would walk `moveZp2Point` off the end of the zone.
+        const limit: u32 = @min(
+            if (self.gs.gep2 == 0) self.zp2.n_points else @as(u32, self.zp2.contours[contour]) + 1,
+            self.zp2.n_points,
+        );
         var i = start;
         while (i < limit) : (i += 1) {
             if (disp.refp != null and disp.refp.? == i) continue;
@@ -1474,7 +1479,7 @@ pub const Interpreter = struct {
     }
 
     fn insIup(self: *Interpreter, op: u8) void {
-        if (self.pts.n_contours == 0) return;
+        if (self.pts.n_contours == 0 or self.pts.n_points == 0) return;
         const use_x = (op & 1) != 0;
 
         var contour: u32 = 0;
@@ -1843,6 +1848,7 @@ fn touchedFor(tag: u8, use_x: bool) bool {
 }
 
 fn iupShift(zone: *Zone, use_x: bool, p1: u32, p2: u32, p: u32) void {
+    if (p >= zone.n_points or p2 >= zone.n_points) return;
     const dx = componentDelta(zone, use_x, p);
     if (dx == 0) return;
     var i = p1;
@@ -1868,7 +1874,7 @@ fn setComponent(zone: *Zone, use_x: bool, i: u32, value: i32) void {
 }
 
 fn iupInterpolate(zone: *Zone, use_x: bool, p1: u32, p2: u32, ref1_in: u32, ref2_in: u32) void {
-    if (p1 > p2) return;
+    if (p1 > p2 or p2 >= zone.n_points) return;
     if (ref1_in >= zone.n_points or ref2_in >= zone.n_points) return;
 
     var ref1 = ref1_in;
