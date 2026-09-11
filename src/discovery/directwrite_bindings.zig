@@ -32,6 +32,7 @@ pub const UINT32 = u32;
 pub const HRESULT = i32;
 
 pub const S_OK: HRESULT = 0;
+pub const E_NOINTERFACE: HRESULT = @bitCast(@as(u32, 0x80004002));
 
 pub const GUID = extern struct {
     data1: u32,
@@ -202,6 +203,8 @@ pub const IDWriteLocalFontFileLoader = extern struct { vtable: *const IDWriteLoc
 
 pub const FLOAT = f32;
 
+pub const IID_IUnknown = GUID{ .data1 = 0x00000000, .data2 = 0x0000, .data3 = 0x0000, .data4 = .{ 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 } };
+pub const IID_IDWriteTextAnalysisSource = GUID{ .data1 = 0x688e1a58, .data2 = 0x5094, .data3 = 0x47c8, .data4 = .{ 0xad, 0xc8, 0xfb, 0xce, 0xa6, 0x0a, 0xe9, 0x2b } };
 pub const IID_IDWriteFactory2 = GUID{ .data1 = 0x0439fc60, .data2 = 0xca44, .data3 = 0x4994, .data4 = .{ 0x8d, 0xee, 0x3a, 0x9a, 0xf7, 0xb7, 0x32, 0xec } };
 pub const IID_IDWriteFontFallback = GUID{ .data1 = 0xefa008f9, .data2 = 0xf7a1, .data3 = 0x48bf, .data4 = .{ 0xb0, 0x5c, 0xf2, 0x24, 0x71, 0x3c, 0xc0, 0xff } };
 
@@ -314,10 +317,15 @@ pub const TextAnalysisSource = extern struct {
         .GetNumberSubstitution = getNumberSubstitution,
     };
 
+    // Must refuse unknown IIDs: DirectWrite probes for IDWriteTextAnalysisSource1,
+    // and claiming it makes DWrite call past the end of this 8-slot vtable.
     fn queryInterface(this: *IDWriteTextAnalysisSource, iid: *const GUID, out: *?*anyopaque) callconv(.winapi) HRESULT {
-        _ = iid;
-        out.* = this;
-        return S_OK;
+        if (std.meta.eql(iid.*, IID_IUnknown) or std.meta.eql(iid.*, IID_IDWriteTextAnalysisSource)) {
+            out.* = this;
+            return S_OK;
+        }
+        out.* = null;
+        return E_NOINTERFACE;
     }
 
     fn addRef(this: *IDWriteTextAnalysisSource) callconv(.winapi) u32 {
