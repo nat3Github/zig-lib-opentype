@@ -2695,7 +2695,7 @@ pub const Table = struct {
             const start = @as(u64, color_records_array_offset) + @as(u64, first_color_index) * 4;
             const end = start + @as(u64, num_palette_entries) * 4;
             if (end > data.len) return error.InvalidTableFormat;
-            const bytes = data[start..end];
+            const bytes = data[@intCast(start)..@intCast(end)];
             const colors: [*]const Color = @ptrCast(bytes.ptr);
             return colors[0..num_palette_entries];
         }
@@ -3603,7 +3603,7 @@ fn fdForGlyph(data: []const u8, fdselect_offset: u32, glyph_id: u16) Font.ParseE
         0 => {
             const pos = @as(u64, fdselect_offset) + 1 + glyph_id;
             if (pos >= data.len) return error.UnexpectedEndOfData;
-            return data[pos];
+            return data[@intCast(pos)];
         },
         3 => {
             const n_ranges = try cursor.readU16();
