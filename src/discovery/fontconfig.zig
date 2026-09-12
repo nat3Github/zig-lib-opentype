@@ -49,6 +49,11 @@ const FcMatchPattern: FcMatchKind = 0;
 
 const FC_FILE = "file";
 const FC_INDEX = "index";
+
+// FC_INDEX packs a variable font's named instance into the high 16 bits.
+fn faceIndex(fc_index: c_int) u32 {
+    return @as(u32, @bitCast(fc_index)) & 0xFFFF;
+}
 const FC_SLANT = "slant";
 const FC_WEIGHT = "weight";
 const FC_WIDTH = "width";
@@ -189,7 +194,7 @@ pub const Fontconfig = struct {
             const weight = self.getInteger(patt, FC_WEIGHT) orelse FC_WEIGHT_REGULAR;
             const width = self.getInteger(patt, FC_WIDTH) orelse FC_WIDTH_NORMAL;
 
-            handle_buf[count] = .{ .path = .{ .path = owned_path, .font_index = @intCast(index) } };
+            handle_buf[count] = .{ .path = .{ .path = owned_path, .font_index = faceIndex(index) } };
             properties_buf[count] = .{
                 .style = slantToStyle(slant),
                 .weight = .{ .value = @floatCast(self.lib.FcWeightToOpenTypeDouble(@floatFromInt(weight))) },
@@ -263,7 +268,7 @@ pub const Fontconfig = struct {
         @memcpy(owned_path, path);
 
         const index = self.getInteger(matched, FC_INDEX) orelse 0;
-        return .{ .path = .{ .path = owned_path, .font_index = @intCast(index) } };
+        return .{ .path = .{ .path = owned_path, .font_index = faceIndex(index) } };
     }
 
     fn selectGenericFontFamily(self: *const Fontconfig, name: []const u8, name_buf: []u8) discovery.SelectionError![]const u8 {
