@@ -23,19 +23,18 @@ pub const DirectWrite = struct {
     /// DirectWrite has no native CSS-generic-alias resolution (no family is
     /// literally named "sans-serif"), so override discovery.zig's default
     /// table with font-kit's Windows hardcoded picks (`source.rs`,
-    /// `cfg(target_family = "windows")` block). Fantasy differs from
-    /// CoreText's macOS pick ("Impact" vs. "Papyrus") — font-kit picks
-    /// per-platform here, not per-vendor.
+    /// `cfg(target_family = "windows")` block).
     pub const generic_family_names = struct {
         pub const serif = "Times New Roman";
         pub const sans_serif = "Arial";
         pub const monospace = "Courier New";
-        pub const cursive = "Comic Sans MS";
-        pub const fantasy = "Impact";
     };
 
     factory: *c.IDWriteFactory,
     collection: *c.IDWriteFontCollection,
+    /// BCP 47 tag steering `selectFallbackForCodepoint` (e.g. Japanese vs.
+    /// Chinese Han glyphs); `null` lets the codepoint alone decide.
+    language: ?[]const u8 = null,
 
     pub fn init() discovery.SelectionError!DirectWrite {
         var factory: ?*c.IDWriteFactory = null;
@@ -146,6 +145,16 @@ pub const DirectWrite = struct {
         base_name[base_len] = 0;
 
         var source = c.TextAnalysisSource.init(text[0..text_len]);
+        var locale_buf: [32]c.WCHAR = undefined;
+        if (self.language) |tag| {
+            const language = discovery.fallbackLanguage(tag);
+            if (language.len < locale_buf.len) {
+                if (std.unicode.utf8ToUtf16Le(&locale_buf, language)) |locale_len| {
+                    locale_buf[locale_len] = 0;
+                    source.locale = locale_buf[0..locale_len :0].ptr;
+                } else |_| {}
+            }
+        }
         var mapped_length: c.UINT32 = 0;
         var mapped_font: ?*c.IDWriteFont = null;
         var scale: c.FLOAT = 1.0;

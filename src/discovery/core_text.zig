@@ -44,11 +44,11 @@ pub const CoreText = struct {
         pub const serif = "Times New Roman";
         pub const sans_serif = "Arial";
         pub const monospace = "Courier New";
-        // Comic Sans MS is macOS-only; Snell Roundhand ships on both macOS
-        // and iOS, and CTFontCreateWithName substitutes silently on a miss.
-        pub const cursive = "Snell Roundhand";
-        pub const fantasy = "Papyrus";
     };
+
+    /// BCP 47 tag steering `selectFallbackForCodepoint` (e.g. Japanese vs.
+    /// Chinese Han glyphs); `null` leaves it to the user's system languages.
+    language: ?[]const u8 = null,
 
     pub fn init() discovery.SelectionError!CoreText {
         return .{};
@@ -171,13 +171,18 @@ pub const CoreText = struct {
         path_storage: []u8,
         allocator: std.mem.Allocator,
     ) discovery.SelectionError!discovery.Handle {
-        _ = self;
         var utf8_buf: [4]u8 = undefined;
         const utf8_len = std.unicode.utf8Encode(codepoint, &utf8_buf) catch return discovery.SelectionError.NotFound;
         const cfstr = c.CFStringCreateWithBytes(null, &utf8_buf, @intCast(utf8_len), c.kCFStringEncodingUTF8, 0) orelse
             return discovery.SelectionError.NotFound;
         defer c.CFRelease(cfstr);
         const range: c.CFRange = .{ .location = 0, .length = c.CFStringGetLength(cfstr) };
+
+        const language_cfstr: c.CFStringRef = if (self.language) |tag| blk: {
+            const language = discovery.fallbackLanguage(tag);
+            break :blk c.CFStringCreateWithBytes(null, language.ptr, @intCast(language.len), c.kCFStringEncodingUTF8, 0);
+        } else null;
+        defer if (language_cfstr) |language| c.CFRelease(language);
 
         const base_families = [_][]const u8{
             generic_family_names.serif,
@@ -191,7 +196,10 @@ pub const CoreText = struct {
             const base_font = c.CTFontCreateWithName(family_cfstr, 12.0, null) orelse continue;
             defer c.CFRelease(base_font);
 
-            const matched_font = c.CTFontCreateForString(base_font, cfstr, range) orelse continue;
+            const matched_font = (if (language_cfstr != null)
+                c.CTFontCreateForStringWithLanguage(base_font, cfstr, range, language_cfstr)
+            else
+                c.CTFontCreateForString(base_font, cfstr, range)) orelse continue;
             defer c.CFRelease(matched_font);
 
             const matched_descriptor = c.CTFontCopyFontDescriptor(matched_font) orelse continue;

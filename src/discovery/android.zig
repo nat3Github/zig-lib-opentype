@@ -1,6 +1,7 @@
 const std = @import("std");
 const discovery = @import("../discovery.zig");
 const parsing = @import("../parsing.zig");
+const unicode = @import("../unicode.zig");
 
 // NOTE: no vendor reference — font-kit has no Android source (see
 // [[project_font_discovery_branch]]: font-kit only ships CoreText/
@@ -22,18 +23,19 @@ const fonts_dir = "/system/fonts/";
 const font_size_limit = 64 * 1024 * 1024;
 
 pub const Android = struct {
-    /// Android's fonts.xml already defines "sans-serif"/"serif"/"monospace"/
-    /// "cursive" as real family names, so those resolve natively like
-    /// fontconfig's CSS aliases. "fantasy" has no Android family; fonts.xml
-    /// itself aliases it to "serif" (`<alias name="fantasy" to="serif"/>`),
-    /// so this override just short-circuits to the same result.
+    /// Android's fonts.xml already defines "sans-serif"/"serif"/"monospace"
+    /// as real family names, so those resolve natively like fontconfig's
+    /// CSS aliases.
     pub const generic_family_names = struct {
         pub const serif = "serif";
         pub const sans_serif = "sans-serif";
         pub const monospace = "monospace";
-        pub const cursive = "cursive";
-        pub const fantasy = "serif";
     };
+
+    /// BCP 47 tag picking among fonts.xml's per-language Han families
+    /// (`zh-Hans`/`zh-Hant`/`ja`/`ko`) in `selectFallbackForCodepoint`;
+    /// `null` takes the first covering family in document order.
+    language: ?[]const u8 = null,
 
     pub fn init() discovery.SelectionError!Android {
         return .{};
@@ -109,8 +111,6 @@ pub const Android = struct {
         path_storage: []u8,
         allocator: std.mem.Allocator,
     ) discovery.SelectionError!discovery.Handle {
-        _ = self;
-
         var threaded: std.Io.Threaded = .init(allocator, .{});
         defer threaded.deinit();
         const io = threaded.io();
@@ -119,7 +119,7 @@ pub const Android = struct {
             return discovery.SelectionError.NotFound;
         defer allocator.free(data);
 
-        return fallbackFromXml(data, codepoint, path_storage, FileCoverage{ .io = io, .allocator = allocator });
+        return fallbackFromXml(data, codepoint, self.language, path_storage, FileCoverage{ .io = io, .allocator = allocator });
     }
 };
 
@@ -156,14 +156,56 @@ const FileCoverage = struct {
 /// Core fallback walk, split out from `selectFallbackForCodepoint` the same
 /// way `selectFamilyFromXml` is: `coverage` is anything with a
 /// `covers(path, font_index, codepoint) bool` method.
+///
+/// Han codepoints first try only the families tagged with `language`
+/// (fonts.xml lists zh-Hans before ja/ko, so document order alone would give
+/// Japanese text Chinese glyph shapes). Other scripts ignore `language`:
+/// fonts.xml's per-script families are tagged `und-*`, not by language.
 fn fallbackFromXml(
     data: []const u8,
     codepoint: u21,
+    language: ?[]const u8,
     path_storage: []u8,
     coverage: anytype,
 ) discovery.SelectionError!discovery.Handle {
+    if (language) |tag| {
+        if (isHanUnified(codepoint)) {
+            if (walkFallbackFamilies(data, codepoint, discovery.fallbackLanguage(tag), path_storage, coverage)) |handle| return handle;
+        }
+    }
+    return walkFallbackFamilies(data, codepoint, null, path_storage, coverage) orelse discovery.SelectionError.NotFound;
+}
+
+fn isHanUnified(codepoint: u21) bool {
+    const script = unicode.scriptOf(codepoint);
+    for ([_]*const [4]u8{ "Hani", "Hira", "Kana", "Bopo" }) |han| {
+        if (std.mem.eql(u8, &script, han)) return true;
+    }
+    return false;
+}
+
+/// True if fonts.xml's comma-separated `lang` attribute names `language`
+/// (already collapsed by `discovery.fallbackLanguage`).
+fn langListHas(lang_list: []const u8, language: []const u8) bool {
+    var entries = std.mem.tokenizeAny(u8, lang_list, ", ");
+    while (entries.next()) |entry| {
+        if (std.ascii.eqlIgnoreCase(discovery.fallbackLanguage(entry), language)) return true;
+    }
+    return false;
+}
+
+fn walkFallbackFamilies(
+    data: []const u8,
+    codepoint: u21,
+    only_language: ?[]const u8,
+    path_storage: []u8,
+    coverage: anytype,
+) ?discovery.Handle {
     var family_pos: usize = 0;
     while (findTag(data, "family", &family_pos)) |family| {
+        if (only_language) |language| {
+            if (!langListHas(attrValue(family.attrs, "lang") orelse continue, language)) continue;
+        }
         var font_pos: usize = 0;
         while (findTag(family.body, "font", &font_pos)) |font| {
             const filename = fontFileName(font.body);
@@ -179,7 +221,7 @@ fn fallbackFromXml(
                 return .{ .path = .{ .path = path, .font_index = font_index } };
         }
     }
-    return discovery.SelectionError.NotFound;
+    return null;
 }
 
 /// A `<font>` body is the filename, optionally followed by `<axis/>` child
@@ -233,7 +275,7 @@ fn selectFamilyFromXml(
     var family_pos: usize = 0;
     while (findTag(data, "family", &family_pos)) |family| {
         const name = attrValue(family.attrs, "name") orelse continue;
-        if (!std.mem.eql(u8, name, target_family)) continue;
+        if (!std.ascii.eqlIgnoreCase(name, target_family)) continue;
 
         var font_pos: usize = 0;
         while (findTag(family.body, "font", &font_pos)) |font| {
@@ -278,7 +320,7 @@ fn resolveAlias(data: []const u8, name: []const u8, weight_filter: *?f32) ?[]con
     var pos: usize = 0;
     while (findTag(data, "alias", &pos)) |alias| {
         const alias_name = attrValue(alias.attrs, "name") orelse continue;
-        if (!std.mem.eql(u8, alias_name, name)) continue;
+        if (!std.ascii.eqlIgnoreCase(alias_name, name)) continue;
         weight_filter.* = parseFloat(attrValue(alias.attrs, "weight"));
         return attrValue(alias.attrs, "to");
     }
@@ -438,7 +480,7 @@ test "Android: fallbackFromXml walks fonts.xml order into unnamed script familie
     var path_storage: [1024]u8 = undefined;
     const coverage = StubCoverage{ .covering = &.{"/system/fonts/NotoNaskhArabic-Regular.ttf"} };
 
-    const handle = try fallbackFromXml(test_fonts_xml, 0x0645, &path_storage, coverage);
+    const handle = try fallbackFromXml(test_fonts_xml, 0x0645, null, &path_storage, coverage);
 
     try std.testing.expectEqualStrings("/system/fonts/NotoNaskhArabic-Regular.ttf", handle.path.path);
 }
@@ -450,7 +492,7 @@ test "Android: fallbackFromXml prefers the first covering font in document order
         "/system/fonts/Roboto-Italic.ttf",
     } };
 
-    const handle = try fallbackFromXml(test_fonts_xml, 'a', &path_storage, coverage);
+    const handle = try fallbackFromXml(test_fonts_xml, 'a', null, &path_storage, coverage);
 
     try std.testing.expectEqualStrings("/system/fonts/Roboto-Italic.ttf", handle.path.path);
 }
@@ -459,7 +501,7 @@ test "Android: fallbackFromXml carries the ttc font_index" {
     var path_storage: [1024]u8 = undefined;
     const coverage = StubCoverage{ .covering = &.{"/system/fonts/MyanmarFonts.ttc"} };
 
-    const handle = try fallbackFromXml(test_fonts_xml, 0x1000, &path_storage, coverage);
+    const handle = try fallbackFromXml(test_fonts_xml, 0x1000, null, &path_storage, coverage);
 
     try std.testing.expectEqual(@as(u32, 2), handle.path.font_index);
 }
@@ -470,8 +512,60 @@ test "Android: fallbackFromXml errors when nothing covers the codepoint" {
 
     try std.testing.expectError(
         discovery.SelectionError.NotFound,
-        fallbackFromXml(test_fonts_xml, 0x1F600, &path_storage, coverage),
+        fallbackFromXml(test_fonts_xml, 0x1F600, null, &path_storage, coverage),
     );
+}
+
+test "Android: selectFamilyFromXml matches alias names case-insensitively" {
+    var handle_buf: [8]discovery.Handle = undefined;
+    var properties_buf: [8]discovery.Properties = undefined;
+    var path_storage: [1024]u8 = undefined;
+
+    const family = try selectFamilyFromXml(test_fonts_xml, "Arial", &handle_buf, &properties_buf, &path_storage);
+
+    try std.testing.expectEqual(@as(usize, 3), family.fonts.len);
+}
+
+const test_cjk_fonts_xml =
+    \\<familyset>
+    \\    <family name="sans-serif">
+    \\        <font weight="400" style="normal">Roboto-Regular.ttf</font>
+    \\    </family>
+    \\    <family lang="zh-Hans">
+    \\        <font weight="400" style="normal" index="2">NotoSansCJK-Regular.ttc</font>
+    \\    </family>
+    \\    <family lang="zh-Hant,zh-Bopo">
+    \\        <font weight="400" style="normal" index="3">NotoSansCJK-Regular.ttc</font>
+    \\    </family>
+    \\    <family lang="ja">
+    \\        <font weight="400" style="normal" index="0">NotoSansCJK-Regular.ttc</font>
+    \\    </family>
+    \\</familyset>
+;
+
+fn expectCjkFallbackIndex(expected_index: u32, codepoint: u21, language: ?[]const u8) !void {
+    var path_storage: [1024]u8 = undefined;
+    const coverage = StubCoverage{ .covering = &.{"/system/fonts/NotoSansCJK-Regular.ttc"} };
+    const handle = try fallbackFromXml(test_cjk_fonts_xml, codepoint, language, &path_storage, coverage);
+    try std.testing.expectEqual(expected_index, handle.path.font_index);
+}
+
+test "Android: fallbackFromXml picks the Han family tagged with the language" {
+    try expectCjkFallbackIndex(0, 0x4E2D, "ja-JP");
+    try expectCjkFallbackIndex(3, 0x4E2D, "zh-TW");
+    try expectCjkFallbackIndex(2, 0x4E2D, "zh-CN");
+}
+
+test "Android: fallbackFromXml takes document order without a matching language" {
+    try expectCjkFallbackIndex(2, 0x4E2D, null);
+    try expectCjkFallbackIndex(2, 0x4E2D, "ko");
+}
+
+test "Android: fallbackFromXml ignores the language outside Han" {
+    var path_storage: [1024]u8 = undefined;
+    const coverage = StubCoverage{ .covering = &.{ "/system/fonts/Roboto-Regular.ttf", "/system/fonts/NotoSansCJK-Regular.ttc" } };
+    const handle = try fallbackFromXml(test_cjk_fonts_xml, 'a', "ja", &path_storage, coverage);
+    try std.testing.expectEqualStrings("/system/fonts/Roboto-Regular.ttf", handle.path.path);
 }
 
 test "Android: fontFileName stops at a variable-font <axis> child" {

@@ -297,6 +297,7 @@ pub const TextAnalysisSource = extern struct {
     vtable: *const IDWriteTextAnalysisSourceVtbl = &vtable_impl,
     text: [*]const WCHAR,
     len: UINT32,
+    locale: ?[*:0]const WCHAR = null,
 
     pub fn init(text: []const WCHAR) TextAnalysisSource {
         return .{ .text = text.ptr, .len = @intCast(text.len) };
@@ -370,9 +371,9 @@ pub const TextAnalysisSource = extern struct {
     fn getLocaleName(this: *IDWriteTextAnalysisSource, position: UINT32, length: *UINT32, locale: *?[*:0]const WCHAR) callconv(.winapi) HRESULT {
         const self: *TextAnalysisSource = @ptrCast(this);
         _ = position;
-        // No locale: the codepoint alone decides the fallback font, and a
-        // wrong locale would bias Han unification the wrong way.
-        locale.* = null;
+        // Null unless the caller chose one: a guessed locale would bias Han
+        // unification the wrong way.
+        locale.* = self.locale;
         length.* = self.len;
         return S_OK;
     }

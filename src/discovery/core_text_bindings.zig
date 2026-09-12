@@ -101,6 +101,8 @@ pub extern fn CTFontManagerCopyAvailableFontFamilyNames() CFArrayRef;
 pub extern fn CTFontCreateWithFontDescriptor(descriptor: CTFontDescriptorRef, size: f64, matrix: ?*const anyopaque) CTFontRef;
 pub extern fn CTFontCreateWithName(name: CFStringRef, size: f64, matrix: ?*const anyopaque) CTFontRef;
 pub extern fn CTFontCreateForString(currentFont: CTFontRef, string: CFStringRef, range: CFRange) CTFontRef;
+// macOS 10.15+ / iOS 13+.
+pub extern fn CTFontCreateForStringWithLanguage(currentFont: CTFontRef, string: CFStringRef, range: CFRange, language: CFStringRef) CTFontRef;
 pub extern fn CTFontCopyFontDescriptor(font: CTFontRef) CTFontDescriptorRef;
 
 // CTFontTableOptions is `uint32_t`, not CFOptionFlags (`c_ulong`, 8 bytes on

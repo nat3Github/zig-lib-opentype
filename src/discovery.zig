@@ -10,6 +10,11 @@ pub const directwrite = if (build_options.directwrite) @import("discovery/direct
 pub const android = if (build_options.android) @import("discovery/android.zig") else struct {};
 pub const manifest = if (build_options.manifest) @import("discovery/manifest.zig") else struct {};
 
+test {
+    _ = fontconfig;
+    _ = android;
+}
+
 // NOTE: ported from vendor/font-kit (src/properties.rs, src/handle.rs,
 // src/family_name.rs, src/matching.rs) — see CLAUDE.md vendor list.
 
@@ -54,30 +59,28 @@ pub const Properties = struct {
 };
 
 /// A value for the CSS `font-family` property (CSS Fonts Level 3 §3.1).
+/// Only the generics that resolve alike on every OS: `cursive` and
+/// `fantasy` have no font shared between platforms to map them to.
 pub const FamilyName = union(enum) {
     title: []const u8,
     serif,
     sans_serif,
     monospace,
-    cursive,
-    fantasy,
 
-    /// The five CSS generic-family keywords, in CSS's own spelling — a UI
-    /// offering "pick a font" wants these listed alongside the concrete
+    /// The supported CSS generic-family keywords, in CSS's own spelling — a
+    /// UI offering "pick a font" wants these listed alongside the concrete
     /// families from `availableFamilies`.
-    pub const generic_keywords = [_][]const u8{ "serif", "sans-serif", "monospace", "cursive", "fantasy" };
+    pub const generic_keywords = [_][]const u8{ "serif", "sans-serif", "monospace" };
 
     /// Parses a `font-family` string: a generic keyword becomes its tag
-    /// (so a backend's `generic_family_names` alias table gets a chance to
-    /// run), anything else is a literal family title.
+    /// (so `generic_family_chains` and a backend's `generic_family_names`
+    /// get a chance to run), anything else is a literal family title.
     pub fn fromString(name: []const u8) FamilyName {
         inline for (generic_keywords, 0..) |keyword, i| {
             if (std.mem.eql(u8, name, keyword)) return switch (i) {
                 0 => .serif,
                 1 => .sans_serif,
-                2 => .monospace,
-                3 => .cursive,
-                else => .fantasy,
+                else => .monospace,
             };
         }
         return .{ .title = name };
@@ -89,8 +92,6 @@ pub const FamilyName = union(enum) {
             .serif => generic_keywords[0],
             .sans_serif => generic_keywords[1],
             .monospace => generic_keywords[2],
-            .cursive => generic_keywords[3],
-            .fantasy => generic_keywords[4],
         };
     }
 
@@ -283,7 +284,18 @@ pub const FamilyList = struct {
     }
 };
 
-/// Default generic->real family name mapping, ported from font-kit's
+/// Tried before a backend's own generic name, so a generic lands on the same
+/// metrics on every OS. Each chain is metric-compatible: Liberation and
+/// Arimo/Tinos clone Arial/Times New Roman, and Menlo and DejaVu Sans Mono
+/// both derive from Bitstream Vera Sans Mono. Android's fonts.xml aliases
+/// "arial"/"times new roman" to its own sans-serif/serif, so those hit too.
+pub const generic_family_chains = struct {
+    pub const serif = [_][]const u8{ "Times New Roman", "Liberation Serif", "Tinos" };
+    pub const sans_serif = [_][]const u8{ "Arial", "Liberation Sans", "Arimo" };
+    pub const monospace = [_][]const u8{ "Menlo", "DejaVu Sans Mono", "Bitstream Vera Sans Mono", "Consolas" };
+};
+
+/// Last resort after `generic_family_chains`, ported from font-kit's
 /// `source.rs` `cfg(not(windows/macos/ios))` block: fontconfig (and other
 /// backends that natively resolve CSS generic aliases) can look these up
 /// as-is.
@@ -291,12 +303,12 @@ const generic_family_names = struct {
     const serif = "serif";
     const sans_serif = "sans-serif";
     const monospace = "monospace";
-    const cursive = "cursive";
-    const fantasy = "fantasy";
 };
 
 /// Resolves a `FamilyName` (title or CSS generic) to a family, by calling
 /// `source.selectFamilyByName(name, handle_buf, properties_buf, scratch...) SelectionError!FamilyHandle`.
+/// A generic tries each `generic_family_chains` entry first, then the
+/// backend's own generic name.
 ///
 /// `scratch` is forwarded verbatim after `properties_buf` — backends that
 /// need extra caller-owned working memory beyond the two buffers (e.g. the
@@ -324,15 +336,47 @@ pub fn selectFamilyByGenericName(
         @TypeOf(source.*).generic_family_names
     else
         generic_family_names;
-    const name: []const u8 = switch (family_name) {
-        .title => |title| title,
+    const chain: []const []const u8 = switch (family_name) {
+        .title => |title| return selectFamilyByTitle(source, title, handle_buf, properties_buf, scratch),
+        .serif => &generic_family_chains.serif,
+        .sans_serif => &generic_family_chains.sans_serif,
+        .monospace => &generic_family_chains.monospace,
+    };
+    for (chain) |name| {
+        return selectFamilyByTitle(source, name, handle_buf, properties_buf, scratch) catch continue;
+    }
+    const native_name: []const u8 = switch (family_name) {
+        .title => unreachable,
         .serif => names.serif,
         .sans_serif => names.sans_serif,
         .monospace => names.monospace,
-        .cursive => names.cursive,
-        .fantasy => names.fantasy,
     };
+    return selectFamilyByTitle(source, native_name, handle_buf, properties_buf, scratch);
+}
+
+fn selectFamilyByTitle(
+    source: anytype,
+    name: []const u8,
+    handle_buf: []Handle,
+    properties_buf: []Properties,
+    scratch: anytype,
+) SelectionError!FamilyHandle {
     return @call(.auto, @TypeOf(source.*).selectFamilyByName, .{ source, name, handle_buf, properties_buf } ++ scratch);
+}
+
+/// Collapses a BCP 47 tag or POSIX locale ("zh_TW.UTF-8") to what font
+/// fallback distinguishes: the primary language, except Chinese, which
+/// splits by script since Simplified and Traditional Han glyphs differ.
+pub fn fallbackLanguage(tag: []const u8) []const u8 {
+    var subtags = std.mem.tokenizeAny(u8, tag, "-_.@");
+    const primary = subtags.next() orelse return tag;
+    if (!std.ascii.eqlIgnoreCase(primary, "zh")) return primary;
+    while (subtags.next()) |subtag| {
+        for ([_][]const u8{ "Hant", "TW", "HK", "MO" }) |traditional| {
+            if (std.ascii.eqlIgnoreCase(subtag, traditional)) return "zh-Hant";
+        }
+    }
+    return "zh-Hans";
 }
 
 /// CSS Fonts Level 3 font matching over a source's families, in family-name

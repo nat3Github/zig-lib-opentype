@@ -39,6 +39,10 @@ pub const DiscoveryFamilyName = discovery.FamilyName;
 
 pub const selectBestFontMatch = discovery.selectBestMatch;
 
+test {
+    _ = discovery;
+}
+
 pub const LineBreakStrictness = unicode.LineBreakStrictness;
 pub const WordBreakMode = unicode.WordBreakMode;
 

@@ -1,5 +1,6 @@
 const std = @import("std");
 const discovery = @import("../discovery.zig");
+const unicode = @import("../unicode.zig");
 
 // NOTE: ported from vendor/font-kit (src/sources/fontconfig.rs) — see
 // CLAUDE.md vendor list.
@@ -59,6 +60,7 @@ const FC_WEIGHT = "weight";
 const FC_WIDTH = "width";
 const FC_FAMILY = "family";
 const FC_CHARSET = "charset";
+const FC_LANG = "lang";
 
 const FC_SLANT_ROMAN: c_int = 0;
 const FC_SLANT_ITALIC: c_int = 100;
@@ -90,6 +92,7 @@ const Lib = struct {
     FcCharSetDestroy: *const fn (*FcCharSet) callconv(.c) void,
     FcCharSetAddChar: *const fn (*FcCharSet, FcChar32) callconv(.c) FcBool,
     FcPatternAddCharSet: *const fn (*FcPattern, [*:0]const u8, *const FcCharSet) callconv(.c) FcBool,
+    FcPatternAddString: *const fn (*FcPattern, [*:0]const u8, [*:0]const FcChar8) callconv(.c) FcBool,
     FcFontMatch: *const fn (?*FcConfig, *FcPattern, *FcResult) callconv(.c) ?*FcPattern,
 
     // Sonames to try in order: ".so.1" is what every distro package ships;
@@ -118,6 +121,10 @@ const Lib = struct {
 pub const Fontconfig = struct {
     lib: Lib,
     config: *FcConfig,
+    /// BCP 47 tag steering `selectFallbackForCodepoint` (e.g. Japanese vs.
+    /// Chinese Han glyphs); `null` leaves it to the process locale, which
+    /// `FcDefaultSubstitute` fills in.
+    language: ?[]const u8 = null,
 
     pub fn init() discovery.SelectionError!Fontconfig {
         var lib = Lib.load() catch return discovery.SelectionError.NotFound;
@@ -253,6 +260,15 @@ pub const Fontconfig = struct {
         const pattern = self.lib.FcPatternCreate() orelse return discovery.SelectionError.NotFound;
         defer self.lib.FcPatternDestroy(pattern);
         if (self.lib.FcPatternAddCharSet(pattern, FC_CHARSET, charset) == 0) return discovery.SelectionError.NotFound;
+        for (preferredFallbackFamilies(unicode.scriptOf(codepoint))) |family| {
+            _ = self.lib.FcPatternAddString(pattern, FC_FAMILY, family);
+        }
+        if (self.language) |tag| {
+            var language_buf: [16]u8 = undefined;
+            if (std.fmt.bufPrintZ(&language_buf, "{s}", .{fontconfigLanguage(tag)})) |language| {
+                _ = self.lib.FcPatternAddString(pattern, FC_LANG, language.ptr);
+            } else |_| {}
+        }
 
         _ = self.lib.FcConfigSubstitute(self.config, pattern, FcMatchPattern);
         self.lib.FcDefaultSubstitute(pattern);
@@ -308,4 +324,63 @@ fn slantToStyle(slant: c_int) discovery.Style {
     if (slant >= FC_SLANT_OBLIQUE) return .oblique;
     if (slant >= FC_SLANT_ITALIC) return .italic;
     return .normal;
+}
+
+/// Noto families to try first per script, so Fedora/Ubuntu fall back to the
+/// same faces Android's fonts.xml uses instead of whatever the distro config
+/// ranks first. `FcFontMatch` ranks charset above family, so a listed family
+/// only wins when it covers the codepoint. Arabic prefers Naskh, matching
+/// Android, Windows (Segoe UI) and macOS (Geeza Pro). CJK is left out: which
+/// Han glyph shapes to use is language-dependent, and the distro configs
+/// already pick the right Noto CJK face from `FC_LANG`.
+const preferred_fallback_families = [_]struct { script: *const [4]u8, families: []const [*:0]const u8 }{
+    .{ .script = "Arab", .families = &.{ "Noto Naskh Arabic UI", "Noto Naskh Arabic", "Noto Sans Arabic UI", "Noto Sans Arabic" } },
+    .{ .script = "Armn", .families = &.{"Noto Sans Armenian"} },
+    .{ .script = "Beng", .families = &.{"Noto Sans Bengali"} },
+    .{ .script = "Deva", .families = &.{"Noto Sans Devanagari"} },
+    .{ .script = "Ethi", .families = &.{"Noto Sans Ethiopic"} },
+    .{ .script = "Geor", .families = &.{"Noto Sans Georgian"} },
+    .{ .script = "Gujr", .families = &.{"Noto Sans Gujarati"} },
+    .{ .script = "Guru", .families = &.{"Noto Sans Gurmukhi"} },
+    .{ .script = "Hebr", .families = &.{"Noto Sans Hebrew"} },
+    .{ .script = "Khmr", .families = &.{"Noto Sans Khmer"} },
+    .{ .script = "Knda", .families = &.{"Noto Sans Kannada"} },
+    .{ .script = "Laoo", .families = &.{"Noto Sans Lao"} },
+    .{ .script = "Mlym", .families = &.{"Noto Sans Malayalam"} },
+    .{ .script = "Mymr", .families = &.{"Noto Sans Myanmar"} },
+    .{ .script = "Orya", .families = &.{"Noto Sans Oriya"} },
+    .{ .script = "Sinh", .families = &.{"Noto Sans Sinhala"} },
+    .{ .script = "Taml", .families = &.{"Noto Sans Tamil"} },
+    .{ .script = "Telu", .families = &.{"Noto Sans Telugu"} },
+    .{ .script = "Thaa", .families = &.{"Noto Sans Thaana"} },
+    .{ .script = "Thai", .families = &.{"Noto Sans Thai"} },
+    .{ .script = "Tibt", .families = &.{"Noto Serif Tibetan"} },
+};
+
+pub fn preferredFallbackFamilies(script: [4]u8) []const [*:0]const u8 {
+    for (preferred_fallback_families) |entry| {
+        if (std.mem.eql(u8, entry.script, &script)) return entry.families;
+    }
+    return &.{};
+}
+
+// fontconfig's orthography table keys Chinese by region, not script.
+pub fn fontconfigLanguage(tag: []const u8) []const u8 {
+    const language = discovery.fallbackLanguage(tag);
+    if (std.mem.eql(u8, language, "zh-Hans")) return "zh-cn";
+    if (std.mem.eql(u8, language, "zh-Hant")) return "zh-tw";
+    return language;
+}
+
+test "Fontconfig: preferred fallback families follow the codepoint's script" {
+    try std.testing.expectEqualStrings("Noto Naskh Arabic UI", std.mem.span(preferredFallbackFamilies(unicode.scriptOf(0x0645))[0]));
+    try std.testing.expectEqualStrings("Noto Sans Hebrew", std.mem.span(preferredFallbackFamilies(unicode.scriptOf(0x05D0))[0]));
+    try std.testing.expectEqual(@as(usize, 0), preferredFallbackFamilies(unicode.scriptOf(0x4E2D)).len);
+    try std.testing.expectEqual(@as(usize, 0), preferredFallbackFamilies(unicode.scriptOf('a')).len);
+}
+
+test "Fontconfig: language tags map Chinese scripts to fontconfig's region codes" {
+    try std.testing.expectEqualStrings("zh-tw", fontconfigLanguage("zh-Hant"));
+    try std.testing.expectEqualStrings("zh-cn", fontconfigLanguage("zh"));
+    try std.testing.expectEqualStrings("ja", fontconfigLanguage("ja_JP.UTF-8"));
 }
