@@ -659,6 +659,78 @@ pub const Buffer = struct {
         return .{ .start = start, .end = end };
     }
 
+    /// Where a caret after the logical byte prefix `[0, byte_offset)` sits:
+    /// past the full advances of glyphs `[0, glyph_start)` plus
+    /// `caretFraction` of the advances of `[glyph_start, glyph_end)`. The
+    /// second range is non-empty only when `byte_offset` falls on a grapheme
+    /// boundary inside one cluster -- a ligature such as "fi" -- where the
+    /// caret sits `component` of `components` graphemes into it.
+    pub const CaretSpot = struct {
+        glyph_start: usize,
+        glyph_end: usize,
+        component: u32 = 0,
+        components: u32 = 1,
+        rtl: bool,
+    };
+
+    pub fn caretSpot(self: *const Buffer, byte_offsets: []const u32, codepoints: []const u21, byte_offset: usize) CaretSpot {
+        const rtl = self.isRtl();
+        const r = self.logicalPrefixGlyphs(byte_offsets, byte_offset);
+        const limit = if (!rtl) r.end else if (r.end == 0) self.info.items.len else r.start;
+        const whole: CaretSpot = .{ .glyph_start = limit, .glyph_end = limit, .rtl = rtl };
+        if (r.end == 0) return whole;
+
+        var cluster: u32 = 0;
+        for (self.info.items[r.start..r.end]) |info| {
+            if (byte_offsets[info.cluster] < byte_offset) cluster = @max(cluster, info.cluster);
+        }
+        var cluster_end: usize = byte_offsets.len - 1;
+        var glyph_start: usize = self.info.items.len;
+        var glyph_end: usize = 0;
+        for (self.info.items, 0..) |info, idx| {
+            if (info.cluster > cluster) cluster_end = @min(cluster_end, info.cluster);
+            if (info.cluster == cluster) {
+                glyph_start = @min(glyph_start, idx);
+                glyph_end = idx + 1;
+            }
+        }
+        if (byte_offsets[cluster_end] <= byte_offset) return whole;
+
+        var components: u32 = 0;
+        var component: u32 = 0;
+        var graphemes = unicode.GraphemeBreakIterator.init(codepoints[cluster..cluster_end]);
+        while (graphemes.next()) |_| {
+            components += 1;
+            if (byte_offsets[cluster + graphemes.pos] <= byte_offset) component += 1;
+        }
+        if (components <= 1) return whole;
+        return .{ .glyph_start = glyph_start, .glyph_end = glyph_end, .component = component, .components = components, .rtl = rtl };
+    }
+
+    /// Share of the `spot` cluster's advance left of the caret. A single
+    /// ligature glyph listed in GDEF's LigCaretList uses the font's own
+    /// caret (hb_ot_layout_get_ligature_carets); otherwise the advance is
+    /// split evenly across the components, as Blink and Android do.
+    pub fn caretFraction(self: *const Buffer, spot: CaretSpot, gdef: ?[]const u8) f32 {
+        if (spot.glyph_end <= spot.glyph_start or spot.components <= 1) return 0;
+        const n = spot.components;
+        const k = spot.component;
+        if (spot.glyph_end - spot.glyph_start == 1 and k > 0 and k < n) if (gdef) |data| {
+            const glyph = self.info.items[spot.glyph_start].codepoint;
+            const advance = self.pos.items[spot.glyph_start].x_advance;
+            // LigCaretList carets run in increasing x, so an RTL ligature's
+            // first component boundary is its rightmost caret.
+            const caret_index: u16 = @intCast(if (spot.rtl) n - 1 - k else k - 1);
+            if (advance > 0 and glyph <= std.math.maxInt(u16) and n <= std.math.maxInt(u16)) {
+                if (parsing.Table.Gdef.ligCaret(data, @intCast(glyph), caret_index, @intCast(n - 1)) catch null) |caret| {
+                    return std.math.clamp(@as(f32, @floatFromInt(caret)) / @as(f32, @floatFromInt(advance)), 0, 1);
+                }
+            }
+        };
+        const logical = @as(f32, @floatFromInt(k)) / @as(f32, @floatFromInt(n));
+        return if (spot.rtl) 1 - logical else logical;
+    }
+
     /// Glyphs run right to left: a later glyph belongs to an earlier cluster.
     /// Answers for one level run, which is what a fragment holds; a buffer
     /// mixing directions reports the direction of its first turn.

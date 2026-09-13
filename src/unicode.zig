@@ -779,6 +779,143 @@ pub const GraphemeBreakIterator = struct {
     }
 };
 
+const Utf8Codepoint = struct { cp: u21, len: usize };
+
+// Ill-formed bytes decode one at a time as U+FFFD so every byte is covered.
+fn decodeUtf8At(utf8: []const u8, i: usize) Utf8Codepoint {
+    const len = std.unicode.utf8ByteSequenceLength(utf8[i]) catch return .{ .cp = 0xFFFD, .len = 1 };
+    if (i + len > utf8.len) return .{ .cp = 0xFFFD, .len = 1 };
+    const cp = std.unicode.utf8Decode(utf8[i..][0..len]) catch return .{ .cp = 0xFFFD, .len = 1 };
+    return .{ .cp = cp, .len = len };
+}
+
+fn decodeUtf8Before(utf8: []const u8, end: usize) Utf8Codepoint {
+    var start = end - 1;
+    while (start > 0 and end - start < 4 and utf8[start] & 0xC0 == 0x80) start -= 1;
+    const d = decodeUtf8At(utf8, start);
+    if (start + d.len != end) return .{ .cp = 0xFFFD, .len = 1 };
+    return d;
+}
+
+/// Byte offset of the grapheme boundary following the one at `start`.
+/// Every lookback rule (GB9c, GB11, GB12) stays inside the cluster being
+/// built, so the codepoints since `start` are all the context needed.
+/// ponytail: a cluster longer than 128 codepoints is cut there; heap-backed
+/// lookback if zalgo text ever needs a single caret stop.
+pub fn nextGraphemeBoundary(utf8: []const u8, start: usize) usize {
+    var cluster: [128]u21 = undefined;
+    var n: usize = 0;
+    var i = start;
+    while (i < utf8.len) {
+        const d = decodeUtf8At(utf8, i);
+        if (n == cluster.len) return i;
+        cluster[n] = d.cp;
+        if (n > 0 and isGraphemeBreakBefore(cluster[0 .. n + 1], n)) return i;
+        n += 1;
+        i += d.len;
+    }
+    return utf8.len;
+}
+
+fn isVariationSelector(cp: u21) bool {
+    return (cp >= 0xFE00 and cp <= 0xFE0F) or (cp >= 0xE0100 and cp <= 0xE01EF);
+}
+
+fn isEmojiModifier(cp: u21) bool {
+    return cp >= 0x1F3FB and cp <= 0x1F3FF;
+}
+
+fn isEmoji(cp: u21) bool {
+    return isEmojiModifier(cp) or GraphemeClusterBreak.of(cp) == .extended_pictographic;
+}
+
+/// Where Backspace starts deleting when the caret sits at `end`. Ported
+/// from Blink's BackspaceStateMachine: an emoji sequence (ZWJ, modifier,
+/// keycap, flag pair, variation selector, tag sequence) goes as one unit,
+/// CR LF as one, anything else one codepoint -- so a base letter survives
+/// losing its accent.
+/// ponytail: Emoji_Modifier_Base is approximated by Extended_Pictographic.
+pub fn backspaceStart(utf8: []const u8, end: usize) usize {
+    const State = enum { start, before_lf, before_keycap, before_vs_and_keycap, before_emoji_modifier, before_vs_and_emoji_modifier, before_vs, before_emoji, before_zwj, before_vs_and_zwj, odd_ris, even_ris, in_tag_sequence };
+    var state: State = .start;
+    var delete_from = end;
+    var single_ri_from = end;
+    var pair_ri_from: ?usize = null;
+    var pos = end;
+    while (pos > 0) {
+        const d = decodeUtf8Before(utf8, pos);
+        pos -= d.len;
+        const cp = d.cp;
+        switch (state) {
+            .start => {
+                delete_from = pos;
+                single_ri_from = pos;
+                state = if (cp == '\n')
+                    .before_lf
+                else if (isVariationSelector(cp))
+                    .before_vs
+                else if (GraphemeClusterBreak.of(cp) == .regional_indicator)
+                    .odd_ris
+                else if (isEmojiModifier(cp))
+                    .before_emoji_modifier
+                else if (cp == 0x20E3)
+                    .before_keycap
+                else if (cp == 0xE007F)
+                    .in_tag_sequence
+                else if (isEmoji(cp))
+                    .before_emoji
+                else
+                    return pos;
+            },
+            .before_lf => return if (cp == '\r') pos else delete_from,
+            .before_keycap => {
+                if (isVariationSelector(cp)) {
+                    state = .before_vs_and_keycap;
+                } else return if ((cp >= '0' and cp <= '9') or cp == '#' or cp == '*') pos else delete_from;
+            },
+            .before_vs_and_keycap => return if ((cp >= '0' and cp <= '9') or cp == '#' or cp == '*') pos else delete_from,
+            .before_emoji_modifier, .before_vs_and_emoji_modifier => {
+                if (state == .before_emoji_modifier and isVariationSelector(cp)) {
+                    state = .before_vs_and_emoji_modifier;
+                } else if (GraphemeClusterBreak.of(cp) == .extended_pictographic) {
+                    delete_from = pos;
+                    state = .before_emoji;
+                } else return delete_from;
+            },
+            .before_vs => {
+                if (isEmoji(cp)) {
+                    delete_from = pos;
+                    state = .before_emoji;
+                } else return if (isVariationSelector(cp)) delete_from else pos;
+            },
+            .before_emoji => {
+                if (cp != 0x200D) return delete_from;
+                state = .before_zwj;
+            },
+            .before_zwj, .before_vs_and_zwj => {
+                if (isEmoji(cp)) {
+                    delete_from = pos;
+                    state = if (isEmojiModifier(cp)) .before_emoji_modifier else .before_emoji;
+                } else if (state == .before_zwj and isVariationSelector(cp)) {
+                    state = .before_vs_and_zwj;
+                } else return delete_from;
+            },
+            .odd_ris, .even_ris => {
+                if (GraphemeClusterBreak.of(cp) != .regional_indicator) return delete_from;
+                pair_ri_from = pair_ri_from orelse pos;
+                delete_from = if (state == .odd_ris) pair_ri_from.? else single_ri_from;
+                state = if (state == .odd_ris) .even_ris else .odd_ris;
+            },
+            .in_tag_sequence => {
+                if (cp >= 0xE0020 and cp <= 0xE007E) {
+                    delete_from = pos;
+                } else return if (cp == 0x1F3F4) pos else delete_from;
+            },
+        }
+    }
+    return delete_from;
+}
+
 // Dictionary-based word segmentation (Thai/Lao/Khmer/Myanmar): UAX #14
 // leaves the Complex Context (SA) class with no default break opportunities
 // (behaves like AL) and defers to "a more sophisticated approach... such as

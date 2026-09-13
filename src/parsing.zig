@@ -3383,10 +3383,36 @@ pub const Table = struct {
     /// parts that drive GSUB/GPOS lookup-flag glyph skipping: the glyph
     /// class definition (Base/Ligature/Mark/Component), the mark
     /// attachment class definition (lookupFlag markAttachmentType) and
-    /// MarkGlyphSetsDef (lookupFlag useMarkFilteringSet). AttachList/
-    /// LigCaretList/ItemVarStore are not needed by any lookup type this
-    /// port applies yet and are left unread.
+    /// MarkGlyphSetsDef (lookupFlag useMarkFilteringSet), plus LigCaretList
+    /// for caret placement inside ligatures. AttachList/ItemVarStore are
+    /// left unread.
     pub const Gdef = struct {
+        /// Caret `caret_index` of ligature `glyph` in design units from the
+        /// glyph origin, ported from hb LigCaretList::get_lig_carets. Null
+        /// unless the glyph lists exactly `caret_count` carets (a mismatch
+        /// means its components are not the ones the caller counted) or
+        /// the caret is format 2 (contour point, needs the outline).
+        /// Format 3's device/variation delta is not applied.
+        pub fn ligCaret(data: []const u8, glyph: u16, caret_index: u16, caret_count: u16) Font.ParseError!?i16 {
+            var c = Cursor{ .data = data, .pos = 8 };
+            const list = try c.readU16();
+            if (list == 0) return null;
+            c.pos = list;
+            const coverage = Layout.Coverage{ .data = data, .offset = list + @as(usize, try c.readU16()) };
+            const index = (try coverage.get(glyph)) orelse return null;
+            if (index >= try c.readU16()) return null;
+            c.pos = list + 4 + @as(usize, index) * 2;
+            const lig_glyph = list + @as(usize, try c.readU16());
+            c.pos = lig_glyph;
+            if (try c.readU16() != caret_count or caret_index >= caret_count) return null;
+            c.pos = lig_glyph + 2 + @as(usize, caret_index) * 2;
+            c.pos = lig_glyph + @as(usize, try c.readU16());
+            const format = try c.readU16();
+            if (format != 1 and format != 3) return null;
+            return try c.readI16();
+        }
+
+
         pub fn glyphClassDef(data: []const u8) Font.ParseError!?Layout.ClassDef {
             var c = Cursor{ .data = data, .pos = 4 };
             const off = try c.readU16();
