@@ -9,6 +9,7 @@ pub const core_text = if (build_options.core_text) @import("discovery/core_text.
 pub const directwrite = if (build_options.directwrite) @import("discovery/directwrite.zig") else struct {};
 pub const android = if (build_options.android) @import("discovery/android.zig") else struct {};
 pub const manifest = if (build_options.manifest) @import("discovery/manifest.zig") else struct {};
+pub const web_fallback = if (build_options.font_fallback) @import("discovery/web_fallback.zig") else struct {};
 
 test {
     _ = fontconfig;

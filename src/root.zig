@@ -33,6 +33,10 @@ pub const discovery_core_text = discovery.core_text;
 pub const discovery_directwrite = discovery.directwrite;
 pub const discovery_android = discovery.android;
 pub const discovery_manifest = discovery.manifest;
+pub const discovery_web_fallback = discovery.web_fallback;
+/// The `font-fallback` build option: false means no discovery backend and
+/// no web fallback is compiled in.
+pub const font_fallback = @import("build_options").font_fallback;
 pub const DiscoveryHandle = discovery.Handle;
 pub const DiscoveryProperties = discovery.Properties;
 pub const DiscoveryFamilyName = discovery.FamilyName;

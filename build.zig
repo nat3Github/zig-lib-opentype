@@ -11,29 +11,42 @@ pub fn build(b: *std.Build) void {
     // consumer that only wants parsing/shaping/rasterization can pass
     // e.g. `-Dcore-text=false` to keep CoreFoundation/CoreText off their
     // link line on macOS.
-    const enable_fontconfig = b.option(
+    const enable_font_fallback = b.option(
+        bool,
+        "font-fallback",
+        "Enable font fallback: the OS font-discovery backends below and the on-demand Noto web fallback (discovery.web_fallback). Off compiles none of them in, overriding the per-backend options",
+    ) orelse true;
+
+    // Declared unconditionally: a short-circuited b.option() would reject a
+    // forwarded -Dfontconfig=... as an invalid option.
+    const option_fontconfig = b.option(
         bool,
         "fontconfig",
         "Enable the Fontconfig font-discovery backend (Linux desktop; dlopen'd at runtime, adds no build-time library dependency)",
     ) orelse (target.result.os.tag == .linux and target.result.abi != .android);
 
-    const enable_core_text = b.option(
+    const option_core_text = b.option(
         bool,
         "core-text",
         "Enable the CoreText font-discovery backend (macOS/iOS; links CoreText + CoreFoundation)",
     ) orelse target.result.os.tag.isDarwin();
 
-    const enable_directwrite = b.option(
+    const option_directwrite = b.option(
         bool,
         "directwrite",
         "Enable the DirectWrite font-discovery backend (Windows; links dwrite + ole32)",
     ) orelse (target.result.os.tag == .windows);
 
-    const enable_android = b.option(
+    const option_android = b.option(
         bool,
         "android",
         "Enable the Android font-discovery backend (parses /system/etc/fonts.xml, no system library)",
     ) orelse (target.result.abi == .android);
+
+    const enable_fontconfig = enable_font_fallback and option_fontconfig;
+    const enable_core_text = enable_font_fallback and option_core_text;
+    const enable_directwrite = enable_font_fallback and option_directwrite;
+    const enable_android = enable_font_fallback and option_android;
 
     const enable_manifest = b.option(
         bool,
@@ -53,6 +66,7 @@ pub fn build(b: *std.Build) void {
     ) orelse false;
 
     const discovery_options = b.addOptions();
+    discovery_options.addOption(bool, "font_fallback", enable_font_fallback);
     discovery_options.addOption(bool, "fontconfig", enable_fontconfig);
     discovery_options.addOption(bool, "core_text", enable_core_text);
     discovery_options.addOption(bool, "directwrite", enable_directwrite);
