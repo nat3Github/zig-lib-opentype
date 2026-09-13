@@ -256,7 +256,7 @@ pub const FamilyHandle = struct {
 
 /// Family-name listing built in caller-owned buffers, the same no-alloc
 /// shape as `selectFamilyByName`'s `handle_buf`/`path_storage`. Backends'
-/// `availableFamilies(names_buf, name_storage, scratch...) []const []const u8`
+/// `availableFamilies(names_buf, name_storage, allocator) []const []const u8`
 /// fill one of these: the OS lists a family once per face (fontconfig) or
 /// with localized duplicates (CoreText), so appends dedupe, and both buffers
 /// are hard caps — a machine with more fonts installed than fit just yields

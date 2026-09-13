@@ -132,6 +132,7 @@ pub const CoreText = struct {
         self: *const CoreText,
         names_buf: [][]const u8,
         name_storage: []u8,
+        _: std.mem.Allocator,
     ) []const []const u8 {
         _ = self;
         var list: discovery.FamilyList = .{ .names = names_buf, .storage = name_storage };

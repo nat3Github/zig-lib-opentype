@@ -665,6 +665,92 @@ pub const Bidi = struct {
         }
         return order;
     }
+
+    pub const LineRun = struct {
+        /// Index into the `slices` given to `lineRuns`.
+        slice: u32,
+        /// Byte range within that slice.
+        start: u32,
+        end: u32,
+        level: u8,
+    };
+
+    // One line held as consecutive UTF-8 slices (styled chunks) is resolved as
+    // one paragraph, so neutrals resolve against neighbours in other slices;
+    // runs are cut at level changes and slice boundaries. Null when every
+    // level is even. An .auto `base_direction` is pinned to the first strong
+    // direction so later lines of the same paragraph can carry it.
+    pub fn lineRuns(allocator: std.mem.Allocator, slices: []const []const u8, base_direction: *ParagraphDirection) (Error || std.mem.Allocator.Error)!?[]LineRun {
+        var total_bytes: usize = 0;
+        for (slices) |s| total_bytes += s.len;
+        if (total_bytes == 0) return null;
+
+        const codepoints = try allocator.alloc(u21, total_bytes);
+        defer allocator.free(codepoints);
+        const slice_of = try allocator.alloc(u32, total_bytes);
+        defer allocator.free(slice_of);
+        const offset_of = try allocator.alloc(u32, total_bytes);
+        defer allocator.free(offset_of);
+        var n: usize = 0;
+        for (slices, 0..) |s, si| {
+            var i: usize = 0;
+            while (i < s.len) {
+                const d = decodeUtf8At(s, i);
+                codepoints[n] = d.cp;
+                slice_of[n] = @intCast(si);
+                offset_of[n] = @intCast(i);
+                n += 1;
+                i += d.len;
+            }
+        }
+
+        const classes = try allocator.alloc(BidiClass, n);
+        defer allocator.free(classes);
+        for (codepoints[0..n], classes) |cp, *c| c.* = BidiClass.of(cp);
+
+        const levels = try paragraphEmbeddingLevels(allocator, classes, base_direction.*, codepoints[0..n]);
+        defer allocator.free(levels);
+        if (base_direction.* == .auto) {
+            if (firstStrongDirection(classes)) |strong| base_direction.* = if (strong == .l) .ltr else .rtl;
+        }
+        for (levels) |l| {
+            if (l % 2 == 1) break;
+        } else return null;
+
+        var runs: std.ArrayList(LineRun) = .empty;
+        errdefer runs.deinit(allocator);
+        for (levels, 0..) |level, i| {
+            const si = slice_of[i];
+            const end: u32 = if (i + 1 < n and slice_of[i + 1] == si) offset_of[i + 1] else @intCast(slices[si].len);
+            if (runs.items.len > 0) {
+                const last = &runs.items[runs.items.len - 1];
+                if (last.slice == si and last.level == level) {
+                    last.end = end;
+                    continue;
+                }
+            }
+            try runs.append(allocator, .{ .slice = si, .start = offset_of[i], .end = end, .level = level });
+        }
+        return try runs.toOwnedSlice(allocator);
+    }
+
+    // Byte-level prefilter: false means no codepoint in `utf8` is RTL or a
+    // bidi control, so an LTR paragraph needs no reordering pass.
+    pub fn mayNeedReorder(utf8: []const u8) bool {
+        for (utf8, 0..) |b, i| {
+            if (b < 0xd6) continue;
+            const next: u8 = if (i + 1 < utf8.len) utf8[i + 1] else 0;
+            switch (b) {
+                0xd6...0xdf => return true, // U+0590..U+07FF Hebrew..NKo
+                0xe0 => if (next >= 0xa0) return true, // U+0800..U+08FF
+                0xe2 => if (next <= 0x81) return true, // U+2000..U+207F bidi controls
+                0xef => if (next >= 0xac) return true, // U+FB00.. presentation forms
+                0xf0 => if (next == 0x90 or next == 0x9e) return true, // U+10xxx, U+1Exxx RTL blocks
+                else => {},
+            }
+        }
+        return false;
+    }
 };
 
 pub const GraphemeClusterBreak = enum {

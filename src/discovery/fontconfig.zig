@@ -158,6 +158,7 @@ pub const Fontconfig = struct {
         handle_buf: []discovery.Handle,
         properties_buf: []discovery.Properties,
         path_storage: []u8,
+        _: std.mem.Allocator,
     ) discovery.SelectionError!discovery.FamilyHandle {
         std.debug.assert(handle_buf.len == properties_buf.len);
 
@@ -222,6 +223,7 @@ pub const Fontconfig = struct {
         self: *const Fontconfig,
         names_buf: [][]const u8,
         name_storage: []u8,
+        _: std.mem.Allocator,
     ) []const []const u8 {
         var list: discovery.FamilyList = .{ .names = names_buf, .storage = name_storage };
 
