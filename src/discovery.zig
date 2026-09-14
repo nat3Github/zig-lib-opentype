@@ -57,21 +57,41 @@ pub const Properties = struct {
     style: Style = .normal,
     weight: Weight = .normal,
     stretch: Stretch = .normal,
+    /// A variable face's `wght`/`wdth` axis span. Matching treats the face
+    /// as every value in the range (CSS Fonts 4 §5.2), so the caller
+    /// instances it at the requested value instead of `weight`/`stretch`.
+    weight_range: ?Range = null,
+    stretch_range: ?Range = null,
+    /// Axis values a named instance of a variable face is fixed at (Android
+    /// fonts.xml `<axis>`); a renderer applies these unless the caller pins
+    /// the same axis itself.
+    pinned_axes: [max_pinned_axes]PinnedAxis = undefined,
+    pinned_axis_count: u8 = 0,
+
+    pub const Range = struct { min: f32, max: f32 };
+    pub const PinnedAxis = struct { tag: [4]u8, value: f32 };
+    pub const max_pinned_axes = 4;
+
+    pub fn pinnedAxes(self: *const Properties) []const PinnedAxis {
+        return self.pinned_axes[0..self.pinned_axis_count];
+    }
 };
 
-/// A value for the CSS `font-family` property (CSS Fonts Level 3 §3.1).
-/// Only the generics that resolve alike on every OS: `cursive` and
-/// `fantasy` have no font shared between platforms to map them to.
+/// A value for the CSS `font-family` property (CSS Fonts Level 4 §2.1.3).
+/// `cursive` and `fantasy` are left out: no font shared between platforms
+/// to map them to. `system_ui` is deliberately per-OS (SF on macOS, Segoe UI
+/// on Windows), so it has no metric-compatible chain.
 pub const FamilyName = union(enum) {
     title: []const u8,
     serif,
     sans_serif,
     monospace,
+    system_ui,
 
     /// The supported CSS generic-family keywords, in CSS's own spelling — a
     /// UI offering "pick a font" wants these listed alongside the concrete
     /// families from `availableFamilies`.
-    pub const generic_keywords = [_][]const u8{ "serif", "sans-serif", "monospace" };
+    pub const generic_keywords = [_][]const u8{ "serif", "sans-serif", "monospace", "system-ui" };
 
     /// Parses a `font-family` string: a generic keyword becomes its tag
     /// (so `generic_family_chains` and a backend's `generic_family_names`
@@ -81,7 +101,8 @@ pub const FamilyName = union(enum) {
             if (std.mem.eql(u8, name, keyword)) return switch (i) {
                 0 => .serif,
                 1 => .sans_serif,
-                else => .monospace,
+                2 => .monospace,
+                else => .system_ui,
             };
         }
         return .{ .title = name };
@@ -93,6 +114,7 @@ pub const FamilyName = union(enum) {
             .serif => generic_keywords[0],
             .sans_serif => generic_keywords[1],
             .monospace => generic_keywords[2],
+            .system_ui => generic_keywords[3],
         };
     }
 
@@ -138,13 +160,26 @@ pub fn findBestMatch(candidates: []const Properties, query: Properties, index_bu
     return index_buf[0];
 }
 
+const Axis = enum { stretch, weight };
+
+/// The value in `candidate`'s span closest to `query`: a static face's only
+/// value, or `query` clamped into a variable face's axis range.
+fn nearestValue(candidate: Properties, comptime axis: Axis, query: f32) f32 {
+    const value, const range = switch (axis) {
+        .stretch => .{ candidate.stretch.value, candidate.stretch_range },
+        .weight => .{ candidate.weight.value, candidate.weight_range },
+    };
+    const r = range orelse return value;
+    return std.math.clamp(query, r.min, r.max);
+}
+
 fn retain(candidates: []const Properties, set: []usize, comptime field: enum { stretch, style, weight }, value: anytype) usize {
     var write: usize = 0;
     for (set) |index| {
         const matches = switch (field) {
-            .stretch => candidates[index].stretch.value == value.value,
+            .stretch => nearestValue(candidates[index], .stretch, value.value) == value.value,
             .style => candidates[index].style == value,
-            .weight => candidates[index].weight.value == value.value,
+            .weight => nearestValue(candidates[index], .weight, value.value) == value.value,
         };
         if (matches) {
             set[write] = index;
@@ -156,7 +191,7 @@ fn retain(candidates: []const Properties, set: []usize, comptime field: enum { s
 
 fn findClosestStretch(candidates: []const Properties, set: []const usize, query: Stretch) Stretch {
     for (set) |index| {
-        if (candidates[index].stretch.value == query.value) return query;
+        if (nearestValue(candidates[index], .stretch, query.value) == query.value) return query;
     }
     if (query.value <= Stretch.normal.value) {
         if (closestBy(candidates, set, query, .stretch, .narrower)) |s| return s;
@@ -169,7 +204,7 @@ fn findClosestStretch(candidates: []const Properties, set: []const usize, query:
 
 fn findClosestWeight(candidates: []const Properties, set: []const usize, query: Weight) Weight {
     for (set) |index| {
-        if (candidates[index].weight.value == query.value) return query;
+        if (nearestValue(candidates[index], .weight, query.value) == query.value) return query;
     }
     // CSS Fonts Level 3 doesn't define the 400..500 exclusive case; font-kit
     // (and browsers) special-case 450 as the tiebreak boundary.
@@ -190,7 +225,7 @@ fn findClosestWeight(candidates: []const Properties, set: []const usize, query: 
 
 fn hasWeight(candidates: []const Properties, set: []const usize, value: f32) bool {
     for (set) |index| {
-        if (candidates[index].weight.value == value) return true;
+        if (nearestValue(candidates[index], .weight, value) == value) return true;
     }
     return false;
 }
@@ -201,16 +236,13 @@ fn closestBy(
     candidates: []const Properties,
     set: []const usize,
     query: anytype,
-    comptime field: enum { stretch, weight },
+    comptime field: Axis,
     direction: ClosestDirection,
 ) ?@TypeOf(query) {
     var best: ?@TypeOf(query) = null;
     var best_delta: f32 = std.math.floatMax(f32);
     for (set) |index| {
-        const candidate_value = switch (field) {
-            .stretch => candidates[index].stretch,
-            .weight => candidates[index].weight,
-        };
+        const candidate_value: @TypeOf(query) = .{ .value = nearestValue(candidates[index], field, query.value) };
         const in_direction = switch (direction) {
             .narrower => candidate_value.value < query.value,
             .wider => candidate_value.value > query.value,
@@ -294,6 +326,7 @@ pub const generic_family_chains = struct {
     pub const serif = [_][]const u8{ "Times New Roman", "Liberation Serif", "Tinos" };
     pub const sans_serif = [_][]const u8{ "Arial", "Liberation Sans", "Arimo" };
     pub const monospace = [_][]const u8{ "Menlo", "DejaVu Sans Mono", "Bitstream Vera Sans Mono", "Consolas" };
+    pub const system_ui = [_][]const u8{};
 };
 
 /// Last resort after `generic_family_chains`, ported from font-kit's
@@ -304,6 +337,7 @@ const generic_family_names = struct {
     const serif = "serif";
     const sans_serif = "sans-serif";
     const monospace = "monospace";
+    const system_ui = "system-ui";
 };
 
 /// Resolves a `FamilyName` (title or CSS generic) to a family, by calling
@@ -342,6 +376,7 @@ pub fn selectFamilyByGenericName(
         .serif => &generic_family_chains.serif,
         .sans_serif => &generic_family_chains.sans_serif,
         .monospace => &generic_family_chains.monospace,
+        .system_ui => &generic_family_chains.system_ui,
     };
     for (chain) |name| {
         return selectFamilyByTitle(source, name, handle_buf, properties_buf, scratch) catch continue;
@@ -351,6 +386,7 @@ pub fn selectFamilyByGenericName(
         .serif => names.serif,
         .sans_serif => names.sans_serif,
         .monospace => names.monospace,
+        .system_ui => names.system_ui,
     };
     return selectFamilyByTitle(source, native_name, handle_buf, properties_buf, scratch);
 }
@@ -391,12 +427,14 @@ pub fn selectBestMatch(
     properties_buf: []Properties,
     index_buf: []usize,
     scratch: anytype,
-) ?Handle {
+) ?Match {
     for (family_names) |family_name| {
         const family = selectFamilyByGenericName(source, family_name, handle_buf, properties_buf, scratch) catch continue;
         if (family.fonts.len == 0) continue;
         const index = findBestMatch(family.properties, properties, index_buf[0..family.fonts.len]) catch continue;
-        return family.fonts[index];
+        return .{ .handle = family.fonts[index], .properties = family.properties[index] };
     }
     return null;
 }
+
+pub const Match = struct { handle: Handle, properties: Properties };

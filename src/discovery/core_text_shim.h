@@ -77,6 +77,10 @@ extern const CFStringRef kCTFontURLAttribute;
 extern const CFStringRef kCTFontNameAttribute;
 extern const CFStringRef kCTFontFamilyNameAttribute;
 extern const CFStringRef kCTFontTraitsAttribute;
+extern const CFStringRef kCTFontVariationAxesAttribute;
+extern const CFStringRef kCTFontVariationAxisIdentifierKey;
+extern const CFStringRef kCTFontVariationAxisMinimumValueKey;
+extern const CFStringRef kCTFontVariationAxisMaximumValueKey;
 
 extern const CFStringRef kCTFontSymbolicTrait;
 extern const CFStringRef kCTFontWeightTrait;
@@ -93,6 +97,8 @@ CFArrayRef CTFontManagerCopyAvailableFontFamilyNames(void);
 
 CTFontRef CTFontCreateWithFontDescriptor(CTFontDescriptorRef descriptor, double size, const void *matrix);
 CTFontRef CTFontCreateWithName(CFStringRef name, double size, const void *matrix);
+typedef uint32_t CTFontUIFontType;
+CTFontRef CTFontCreateUIFontForLanguage(CTFontUIFontType uiType, double size, CFStringRef language);
 CTFontRef CTFontCreateForString(CTFontRef currentFont, CFStringRef string, CFRange range);
 CTFontDescriptorRef CTFontCopyFontDescriptor(CTFontRef font);
 

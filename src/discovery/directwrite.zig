@@ -28,6 +28,7 @@ pub const DirectWrite = struct {
         pub const serif = "Times New Roman";
         pub const sans_serif = "Arial";
         pub const monospace = "Courier New";
+        pub const system_ui = "Segoe UI";
     };
 
     factory: *c.IDWriteFactory,
@@ -93,6 +94,11 @@ pub const DirectWrite = struct {
         for (0..font_count) |i| {
             if (out_count >= handle_buf.len) break;
             if (readFont(family.?, @intCast(i), path_storage[path_offset..])) |result| {
+                // A variable font is listed once per named instance; with its
+                // axis ranges set, one entry per face already matches them all.
+                if (result.properties.weight_range != null or result.properties.stretch_range != null) {
+                    if (listsFace(handle_buf[0..out_count], properties_buf[0..out_count], result)) continue;
+                }
                 handle_buf[out_count] = .{ .path = .{ .path = result.path, .font_index = result.font_index } };
                 properties_buf[out_count] = result.properties;
                 path_offset += result.path.len;
@@ -247,11 +253,56 @@ fn readFont(family: *c.IDWriteFontFamily, index: u32, path_buf: []u8) ?FontResul
 
     const path = copyFilePath(font_face.?, path_buf) orelse return null;
 
+    var properties = readProperties(font.?);
+    readAxisRanges(font_face.?, &properties);
     return .{
         .path = path,
         .font_index = font_face.?.vtable.GetIndex(font_face.?),
-        .properties = readProperties(font.?),
+        .properties = properties,
     };
+}
+
+/// Fills `weight_range`/`stretch_range` from `IDWriteFontResource` (Windows
+/// 10 1803+); on older systems the QueryInterface fails and the face stays a
+/// static named instance.
+fn readAxisRanges(font_face: *c.IDWriteFontFace, properties: *discovery.Properties) void {
+    var face5_ptr: ?*anyopaque = null;
+    if (font_face.vtable.QueryInterface(font_face, &c.IID_IDWriteFontFace5, &face5_ptr) != c.S_OK or face5_ptr == null) return;
+    const face5: *c.IDWriteFontFace5 = @ptrCast(@alignCast(face5_ptr.?));
+    defer _ = face5.vtable.Release(face5);
+    if (face5.vtable.HasVariations(face5) == 0) return;
+
+    var resource: ?*c.IDWriteFontResource = null;
+    if (face5.vtable.GetFontResource(face5, &resource) != c.S_OK or resource == null) return;
+    defer _ = resource.?.vtable.Release(resource.?);
+
+    var ranges: [16]c.DWRITE_FONT_AXIS_RANGE = undefined;
+    const axis_count = resource.?.vtable.GetFontAxisCount(resource.?);
+    if (axis_count == 0 or axis_count > ranges.len) return;
+    if (resource.?.vtable.GetFontAxisRanges(resource.?, &ranges, axis_count) != c.S_OK) return;
+    for (ranges[0..axis_count]) |range| {
+        // Old GX fonts (Skia) scale wght/wdth around 1.0, not CSS units.
+        if (range.minValue < 1.0 or range.maxValue > 1000.0 or range.minValue >= range.maxValue) continue;
+        if (range.axisTag == axisTag("wght")) {
+            properties.weight_range = .{ .min = range.minValue, .max = range.maxValue };
+        } else if (range.axisTag == axisTag("wdth")) {
+            properties.stretch_range = .{ .min = range.minValue / 100.0, .max = range.maxValue / 100.0 };
+        }
+    }
+}
+
+fn axisTag(tag: *const [4]u8) c.DWRITE_FONT_AXIS_TAG {
+    return std.mem.readInt(u32, tag, .little);
+}
+
+/// Style is part of the key: an italic named instance of the same file is a
+/// separate candidate for `findPreferredStyle`.
+fn listsFace(handles: []const discovery.Handle, properties: []const discovery.Properties, result: FontResult) bool {
+    for (handles, properties) |handle, listed| {
+        if (handle.path.font_index == result.font_index and listed.style == result.properties.style and
+            std.mem.eql(u8, handle.path.path, result.path)) return true;
+    }
+    return false;
 }
 
 fn readProperties(font: *c.IDWriteFont) discovery.Properties {

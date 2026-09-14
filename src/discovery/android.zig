@@ -30,6 +30,7 @@ pub const Android = struct {
         pub const serif = "serif";
         pub const sans_serif = "sans-serif";
         pub const monospace = "monospace";
+        pub const system_ui = "sans-serif";
     };
 
     /// BCP 47 tag picking among fonts.xml's per-language Han families
@@ -232,6 +233,23 @@ fn fontFileName(body: []const u8) []const u8 {
     return std.mem.trim(u8, text, " \t\r\n");
 }
 
+/// A `<font>`'s `<axis tag="wdth" stylevalue="75"/>` children pin a variable
+/// font to a named instance (e.g. sans-serif-condensed on Roboto-Regular);
+/// `wght`/`wdth` also feed matching, which otherwise sees the default.
+fn readPinnedAxes(body: []const u8, properties: *discovery.Properties) void {
+    var axis_pos: usize = 0;
+    while (findTag(body, "axis", &axis_pos)) |axis| {
+        if (properties.pinned_axis_count >= discovery.Properties.max_pinned_axes) return;
+        const tag = attrValue(axis.attrs, "tag") orelse continue;
+        if (tag.len != 4) continue;
+        const value = parseFloat(attrValue(axis.attrs, "stylevalue")) orelse continue;
+        properties.pinned_axes[properties.pinned_axis_count] = .{ .tag = tag[0..4].*, .value = value };
+        properties.pinned_axis_count += 1;
+        if (std.mem.eql(u8, tag, "wght")) properties.weight = .{ .value = value };
+        if (std.mem.eql(u8, tag, "wdth")) properties.stretch = .{ .value = value / 100.0 };
+    }
+}
+
 /// Lists every family name fonts.xml defines, including its `<alias>`
 /// names (which `selectFamilyByName` resolves) — those are real, selectable
 /// names on Android, e.g. "arial" mapping to "sans-serif". Unnamed
@@ -303,6 +321,7 @@ fn selectFamilyFromXml(
 
             handle_buf[count] = .{ .path = .{ .path = path, .font_index = @intFromFloat(index) } };
             properties_buf[count] = .{ .style = style, .weight = .{ .value = weight } };
+            readPinnedAxes(font.body, &properties_buf[count]);
             count += 1;
         }
         break;
@@ -400,6 +419,11 @@ const test_fonts_xml =
     \\    </family>
     \\    <family name="myanmar-collection">
     \\        <font weight="400" style="normal" index="2">MyanmarFonts.ttc</font>
+    \\    </family>
+    \\    <family name="sans-serif-condensed">
+    \\        <font weight="400" style="normal">Roboto-Regular.ttf
+    \\            <axis tag="wdth" stylevalue="75" />
+    \\        </font>
     \\    </family>
     \\    <alias name="sans-serif-medium" to="sans-serif" weight="500" />
     \\    <alias name="arial" to="sans-serif" />
@@ -572,4 +596,19 @@ test "Android: fontFileName stops at a variable-font <axis> child" {
     try std.testing.expectEqualStrings("Roboto-Regular.ttf", fontFileName(
         "Roboto-Regular.ttf\n  <axis tag=\"wdth\" stylevalue=\"100\"/>\n",
     ));
+}
+
+test "Android: selectFamilyFromXml pins a named instance's <axis> values" {
+    var handle_buf: [8]discovery.Handle = undefined;
+    var properties_buf: [8]discovery.Properties = undefined;
+    var path_storage: [1024]u8 = undefined;
+
+    const family = try selectFamilyFromXml(test_fonts_xml, "sans-serif-condensed", &handle_buf, &properties_buf, &path_storage);
+
+    try std.testing.expectEqualStrings("/system/fonts/Roboto-Regular.ttf", family.fonts[0].path.path);
+    try std.testing.expectEqual(@as(f32, 0.75), family.properties[0].stretch.value);
+    const pinned = family.properties[0].pinnedAxes();
+    try std.testing.expectEqual(@as(usize, 1), pinned.len);
+    try std.testing.expectEqualStrings("wdth", &pinned[0].tag);
+    try std.testing.expectEqual(@as(f32, 75), pinned[0].value);
 }

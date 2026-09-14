@@ -29,6 +29,7 @@ const FcConfig = opaque {};
 const FcPattern = opaque {};
 const FcObjectSet = opaque {};
 const FcCharSet = opaque {};
+const FcRange = opaque {};
 const FcChar8 = u8;
 const FcChar32 = u32;
 const FcBool = c_int;
@@ -83,6 +84,8 @@ const Lib = struct {
     FcFontSetDestroy: *const fn (*FcFontSet) callconv(.c) void,
     FcPatternGetString: *const fn (*FcPattern, [*:0]const u8, c_int, *[*c]FcChar8) callconv(.c) FcResult,
     FcPatternGetInteger: *const fn (*FcPattern, [*:0]const u8, c_int, *c_int) callconv(.c) FcResult,
+    FcPatternGetRange: *const fn (*FcPattern, [*:0]const u8, c_int, *?*FcRange) callconv(.c) FcResult,
+    FcRangeGetDouble: *const fn (*const FcRange, *f64, *f64) callconv(.c) FcBool,
     FcConfigSubstitute: *const fn (?*FcConfig, *FcPattern, FcMatchKind) callconv(.c) c_int,
     FcDefaultSubstitute: *const fn (*FcPattern) callconv(.c) void,
     FcFontSort: *const fn (?*FcConfig, *FcPattern, c_int, ?*anyopaque, *FcResult) callconv(.c) ?*FcFontSet,
@@ -191,22 +194,30 @@ pub const Fontconfig = struct {
             if (count >= handle_buf.len) break;
             const patt = maybe_patt orelse continue;
 
+            const index = self.getInteger(patt, FC_INDEX) orelse 0;
+            // A variable face is listed once whole (weight/width as ranges)
+            // plus once per named instance; the whole face covers them all.
+            if (@as(u32, @bitCast(index)) >> 16 != 0) continue;
+
             const path = self.getString(patt, FC_FILE) orelse continue;
             if (path_offset + path.len > path_storage.len) break;
             const owned_path = path_storage[path_offset..][0..path.len];
             @memcpy(owned_path, path);
             path_offset += path.len;
 
-            const index = self.getInteger(patt, FC_INDEX) orelse 0;
             const slant = self.getInteger(patt, FC_SLANT) orelse FC_SLANT_ROMAN;
-            const weight = self.getInteger(patt, FC_WEIGHT) orelse FC_WEIGHT_REGULAR;
-            const width = self.getInteger(patt, FC_WIDTH) orelse FC_WIDTH_NORMAL;
+            const weight_range = self.getRange(patt, FC_WEIGHT);
+            const width_range = self.getRange(patt, FC_WIDTH);
+            const weight: f64 = if (weight_range) |r| r[0] else @floatFromInt(self.getInteger(patt, FC_WEIGHT) orelse FC_WEIGHT_REGULAR);
+            const width: f64 = if (width_range) |r| r[0] else @floatFromInt(self.getInteger(patt, FC_WIDTH) orelse FC_WIDTH_NORMAL);
 
             handle_buf[count] = .{ .path = .{ .path = owned_path, .font_index = faceIndex(index) } };
             properties_buf[count] = .{
                 .style = slantToStyle(slant),
-                .weight = .{ .value = @floatCast(self.lib.FcWeightToOpenTypeDouble(@floatFromInt(weight))) },
-                .stretch = .{ .value = @as(f32, @floatFromInt(width)) / 100.0 },
+                .weight = .{ .value = self.openTypeWeight(weight) },
+                .stretch = .{ .value = @floatCast(width / 100.0) },
+                .weight_range = if (weight_range) |r| .{ .min = self.openTypeWeight(r[0]), .max = self.openTypeWeight(r[1]) } else null,
+                .stretch_range = if (width_range) |r| .{ .min = @floatCast(r[0] / 100.0), .max = @floatCast(r[1] / 100.0) } else null,
             };
             count += 1;
         }
@@ -319,6 +330,19 @@ pub const Fontconfig = struct {
         var value: c_int = undefined;
         if (self.lib.FcPatternGetInteger(pattern, object, 0, &value) != FcResultMatch) return null;
         return value;
+    }
+
+    fn getRange(self: *const Fontconfig, pattern: *FcPattern, object: [*:0]const u8) ?[2]f64 {
+        var range: ?*FcRange = null;
+        if (self.lib.FcPatternGetRange(pattern, object, 0, &range) != FcResultMatch) return null;
+        var begin: f64 = 0;
+        var end: f64 = 0;
+        if (self.lib.FcRangeGetDouble(range orelse return null, &begin, &end) == 0) return null;
+        return .{ begin, end };
+    }
+
+    fn openTypeWeight(self: *const Fontconfig, fc_weight: f64) f32 {
+        return @floatCast(self.lib.FcWeightToOpenTypeDouble(fc_weight));
     }
 };
 

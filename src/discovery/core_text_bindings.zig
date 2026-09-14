@@ -80,6 +80,10 @@ pub extern const kCTFontURLAttribute: CFStringRef;
 pub extern const kCTFontNameAttribute: CFStringRef;
 pub extern const kCTFontFamilyNameAttribute: CFStringRef;
 pub extern const kCTFontTraitsAttribute: CFStringRef;
+pub extern const kCTFontVariationAxesAttribute: CFStringRef;
+pub extern const kCTFontVariationAxisIdentifierKey: CFStringRef;
+pub extern const kCTFontVariationAxisMinimumValueKey: CFStringRef;
+pub extern const kCTFontVariationAxisMaximumValueKey: CFStringRef;
 
 pub extern const kCTFontSymbolicTrait: CFStringRef;
 pub extern const kCTFontWeightTrait: CFStringRef;
@@ -100,6 +104,9 @@ pub extern fn CTFontManagerCopyAvailableFontFamilyNames() CFArrayRef;
 // the family-listing path above.
 pub extern fn CTFontCreateWithFontDescriptor(descriptor: CTFontDescriptorRef, size: f64, matrix: ?*const anyopaque) CTFontRef;
 pub extern fn CTFontCreateWithName(name: CFStringRef, size: f64, matrix: ?*const anyopaque) CTFontRef;
+pub const CTFontUIFontType = u32;
+pub const kCTFontUIFontSystem: CTFontUIFontType = 2;
+pub extern fn CTFontCreateUIFontForLanguage(uiType: CTFontUIFontType, size: f64, language: CFStringRef) CTFontRef;
 pub extern fn CTFontCreateForString(currentFont: CTFontRef, string: CFStringRef, range: CFRange) CTFontRef;
 // macOS 10.15+ / iOS 13+.
 pub extern fn CTFontCreateForStringWithLanguage(currentFont: CTFontRef, string: CFStringRef, range: CFRange, language: CFStringRef) CTFontRef;

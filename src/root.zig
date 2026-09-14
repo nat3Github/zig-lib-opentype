@@ -23,6 +23,7 @@ pub const EndMetric = shaping.EndMetric;
 pub const Buffer = shaping.Buffer;
 pub const BidiFallbackResult = shaping.BidiFallbackResult;
 pub const Item = shaping.Item;
+pub const Feature = shaping.Feature;
 
 pub const shapeWithContext = shaping.shapeWithContext;
 pub const shapeBidiParagraphWithFallback = shaping.shapeBidiParagraphWithFallback;

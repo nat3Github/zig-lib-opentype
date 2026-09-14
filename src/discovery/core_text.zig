@@ -1,6 +1,7 @@
 const std = @import("std");
 const discovery = @import("../discovery.zig");
 const parsing = @import("../parsing.zig");
+const unicode = @import("../unicode.zig");
 
 // NOTE: ported from vendor/font-kit (src/sources/core_text.rs,
 // src/loaders/core_text.rs)
@@ -44,6 +45,8 @@ pub const CoreText = struct {
         pub const serif = "Times New Roman";
         pub const sans_serif = "Arial";
         pub const monospace = "Courier New";
+        // CoreText's own alias for the hidden `.AppleSystemUIFont` (SF).
+        pub const system_ui = "System Font";
     };
 
     /// BCP 47 tag steering `selectFallbackForCodepoint` (e.g. Japanese vs.
@@ -113,10 +116,16 @@ pub const CoreText = struct {
             const desc: c.CTFontDescriptorRef = @ptrCast(@alignCast(c.CFArrayGetValueAtIndex(matches, @intCast(i))));
 
             const path = copyFilePath(desc, path_storage[path_offset..]) orelse continue;
+            const properties = readProperties(desc);
+            // CoreText lists a variable face once per named instance ("System
+            // Font" alone is hundreds); its axis ranges already cover them.
+            if (properties.weight_range != null or properties.stretch_range != null) {
+                if (listsPath(handle_buf[0..out_count], path)) continue;
+            }
             path_offset += path.len;
 
             handle_buf[out_count] = .{ .path = .{ .path = path, .font_index = resolveFontIndex(desc, path, allocator) } };
-            properties_buf[out_count] = readProperties(desc);
+            properties_buf[out_count] = properties;
             out_count += 1;
         }
 
@@ -166,6 +175,13 @@ pub const CoreText = struct {
     /// land on the real content font (e.g. `Songti.ttc` for CJK), so try
     /// each and verify actual outline coverage via `CTFontCopyAvailableTables`
     /// rather than trusting the first cascade hit.
+    ///
+    /// The system-UI cascade is still tried first for everything but Han
+    /// and kana: it's what native apps render UI text with (SF Arabic,
+    /// SF Hebrew, Thonburi UI, Apple SD Gothic Neo), where the content seeds
+    /// land on Times New Roman's Arabic or AppleMyungjo's serif Hangul. For
+    /// kana it picks a Chinese symbols font, and for Han the unusable
+    /// PingFangUI.
     pub fn selectFallbackForCodepoint(
         self: *const CoreText,
         codepoint: u21,
@@ -185,16 +201,24 @@ pub const CoreText = struct {
         } else null;
         defer if (language_cfstr) |language| c.CFRelease(language);
 
-        const base_families = [_][]const u8{
+        const script = unicode.scriptOf(codepoint);
+        const han_or_kana = for ([_]*const [4]u8{ "Hani", "Hira", "Kana", "Bopo" }) |tag| {
+            if (std.mem.eql(u8, &script, tag)) break true;
+        } else false;
+
+        const base_families = [_]?[]const u8{
+            null,
             generic_family_names.serif,
             generic_family_names.sans_serif,
             generic_family_names.monospace,
         };
-        for (base_families) |family_name| {
-            const family_cfstr = c.CFStringCreateWithBytes(null, family_name.ptr, @intCast(family_name.len), c.kCFStringEncodingUTF8, 0) orelse continue;
-            defer c.CFRelease(family_cfstr);
+        for (base_families[@intFromBool(han_or_kana)..]) |maybe_family_name| {
             // Size is irrelevant here -- only the resulting cascade list matters.
-            const base_font = c.CTFontCreateWithName(family_cfstr, 12.0, null) orelse continue;
+            const base_font = if (maybe_family_name) |family_name| blk: {
+                const family_cfstr = c.CFStringCreateWithBytes(null, family_name.ptr, @intCast(family_name.len), c.kCFStringEncodingUTF8, 0) orelse continue;
+                defer c.CFRelease(family_cfstr);
+                break :blk c.CTFontCreateWithName(family_cfstr, 12.0, null) orelse continue;
+            } else c.CTFontCreateUIFontForLanguage(c.kCTFontUIFontSystem, 12.0, null) orelse continue;
             defer c.CFRelease(base_font);
 
             const matched_font = (if (language_cfstr != null)
@@ -278,11 +302,40 @@ fn readProperties(desc: c.CTFontDescriptorRef) discovery.Properties {
     else
         .normal;
 
-    return .{
+    var properties: discovery.Properties = .{
         .style = style,
         .weight = coreTextToCssWeight(@floatCast(weight_trait)),
         .stretch = coreTextWidthToCssStretch(@floatCast(width_trait)),
     };
+    readAxisRanges(desc, &properties);
+    return properties;
+}
+
+fn readAxisRanges(desc: c.CTFontDescriptorRef, properties: *discovery.Properties) void {
+    const axes_ref = c.CTFontDescriptorCopyAttribute(desc, c.kCTFontVariationAxesAttribute) orelse return;
+    const axes: c.CFArrayRef = @ptrCast(@alignCast(axes_ref));
+    defer c.CFRelease(axes);
+    const count: usize = @intCast(c.CFArrayGetCount(axes));
+    for (0..count) |i| {
+        const axis: c.CFDictionaryRef = @ptrCast(@alignCast(c.CFArrayGetValueAtIndex(axes, @intCast(i)) orelse continue));
+        const tag = getUInt32(axis, c.kCTFontVariationAxisIdentifierKey) orelse continue;
+        const min = getDouble(axis, c.kCTFontVariationAxisMinimumValueKey) orelse continue;
+        const max = getDouble(axis, c.kCTFontVariationAxisMaximumValueKey) orelse continue;
+        // Old GX fonts (Skia) scale wght/wdth around 1.0, not CSS units.
+        if (min < 1.0 or max > 1000.0 or min >= max) continue;
+        switch (tag) {
+            fourCharCode("wght") => properties.weight_range = .{ .min = @floatCast(min), .max = @floatCast(max) },
+            fourCharCode("wdth") => properties.stretch_range = .{ .min = @floatCast(min / 100.0), .max = @floatCast(max / 100.0) },
+            else => {},
+        }
+    }
+}
+
+fn listsPath(handles: []const discovery.Handle, path: []const u8) bool {
+    for (handles) |handle| {
+        if (std.mem.eql(u8, handle.path.path, path)) return true;
+    }
+    return false;
 }
 
 fn getUInt32(dict: c.CFDictionaryRef, key: c.CFTypeRef) ?u32 {

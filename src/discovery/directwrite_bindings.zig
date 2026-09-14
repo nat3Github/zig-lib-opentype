@@ -386,3 +386,47 @@ pub const TextAnalysisSource = extern struct {
         return S_OK;
     }
 };
+
+pub const IID_IDWriteFontFace5 = GUID{ .data1 = 0x98eff3a5, .data2 = 0xb667, .data3 = 0x479a, .data4 = .{ 0xb1, 0x45, 0xe2, 0xfa, 0x5b, 0x9f, 0xdc, 0x29 } };
+
+// DWRITE_FONT_AXIS_TAG: DWRITE_MAKE_FONT_AXIS_TAG packs the four chars
+// little-endian, so "wght" reads back as 0x74686777.
+pub const DWRITE_FONT_AXIS_TAG = u32;
+
+pub const DWRITE_FONT_AXIS_RANGE = extern struct {
+    axisTag: DWRITE_FONT_AXIS_TAG,
+    minValue: FLOAT,
+    maxValue: FLOAT,
+};
+
+/// `IDWriteFontFace5` (Windows 10 1803+) reached by `QueryInterface` on
+/// `IDWriteFontFace`. 50 inherited slots after IUnknown (IDWriteFontFace 15,
+/// Face1 12, Face2 5, Face3 14, Face4 4) are placeholders, then
+/// `GetFontAxisValueCount`, `GetFontAxisValues`, `HasVariations`,
+/// `GetFontResource`. `Equals` omitted.
+pub const IDWriteFontFace5Vtbl = extern struct {
+    QueryInterface: *const fn (*IDWriteFontFace5, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
+    AddRef: *const fn (*IDWriteFontFace5) callconv(.winapi) u32,
+    Release: *const fn (*IDWriteFontFace5) callconv(.winapi) u32,
+    inherited: [50]*const anyopaque,
+    GetFontAxisValueCount: *const anyopaque,
+    GetFontAxisValues: *const anyopaque,
+    HasVariations: *const fn (*IDWriteFontFace5) callconv(.winapi) BOOL,
+    GetFontResource: *const fn (*IDWriteFontFace5, *?*IDWriteFontResource) callconv(.winapi) HRESULT,
+};
+pub const IDWriteFontFace5 = extern struct { vtable: *const IDWriteFontFace5Vtbl };
+
+/// Slots 0..2 IUnknown, 3 `GetFontFile`, 4 `GetFontFaceIndex` (placeholders),
+/// 5 `GetFontAxisCount`, 6 `GetDefaultFontAxisValues` (placeholder), 7
+/// `GetFontAxisRanges`. Everything after omitted.
+pub const IDWriteFontResourceVtbl = extern struct {
+    QueryInterface: *const fn (*IDWriteFontResource, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
+    AddRef: *const fn (*IDWriteFontResource) callconv(.winapi) u32,
+    Release: *const fn (*IDWriteFontResource) callconv(.winapi) u32,
+    GetFontFile: *const anyopaque,
+    GetFontFaceIndex: *const anyopaque,
+    GetFontAxisCount: *const fn (*IDWriteFontResource) callconv(.winapi) UINT32,
+    GetDefaultFontAxisValues: *const anyopaque,
+    GetFontAxisRanges: *const fn (*IDWriteFontResource, fontAxisRanges: [*]DWRITE_FONT_AXIS_RANGE, fontAxisRangeCount: UINT32) callconv(.winapi) HRESULT,
+};
+pub const IDWriteFontResource = extern struct { vtable: *const IDWriteFontResourceVtbl };

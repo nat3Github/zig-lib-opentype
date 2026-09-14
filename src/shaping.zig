@@ -24,6 +24,8 @@ pub const Direction = common.Direction;
 pub const ClusterLevel = common.ClusterLevel;
 pub const Buffer = common.Buffer;
 pub const Tag = common.Tag;
+/// CSS `font-feature-settings` entry: `value` 0 turns a default feature off.
+pub const Feature = struct { tag: Tag, value: u32 = 1 };
 
 pub const EndMetric = metrics_mod.EndMetric;
 pub const GlyphMetrics = metrics_mod.GlyphMetrics;
@@ -115,9 +117,8 @@ pub const default_features = [_]Tag{
 /// runs the compiled GSUB/GPOS lookups for `script_tags`/`language_tags`
 /// (first match wins, falling back to DFLT/dflt/latn - see MapBuilder.init)
 /// with `default_features` plus any caller-supplied `extra_features`
-/// enabled globally. `extra_features` exists for tests exercising specific
-/// lookups the default feature set doesn't turn on (e.g. the shaping
-/// conformance corpus's synthetic "test" feature). If `hang` appears in
+/// applied globally on top (a later entry for the same tag wins, so
+/// `.{ .tag = "liga".*, .value = 0 }` turns ligatures off). If `hang` appears in
 /// `script_tags`, the Hangul complex shaper (see its section above) runs
 /// first: syllable decompose/compose plus ljmo/vjmo/tjmo feature masking.
 pub fn shape(
@@ -127,7 +128,7 @@ pub fn shape(
     direction: Direction,
     script_tags: []const Tag,
     language_tags: []const Tag,
-    extra_features: []const Tag,
+    extra_features: []const Feature,
 ) (parsing.Font.ParseError || error{OutOfMemory})!Buffer {
     return shapeImpl(allocator, font, codepoints, direction, script_tags, language_tags, extra_features, &.{}, null);
 }
@@ -144,7 +145,7 @@ pub fn shapeVaried(
     direction: Direction,
     script_tags: []const Tag,
     language_tags: []const Tag,
-    extra_features: []const Tag,
+    extra_features: []const Feature,
     normalized_coords: []const f32,
 ) (parsing.Font.ParseError || error{OutOfMemory})!Buffer {
     return shapeImpl(allocator, font, codepoints, direction, script_tags, language_tags, extra_features, normalized_coords, null);
@@ -175,7 +176,7 @@ pub fn shapeWithContext(
     direction: Direction,
     script_tags: []const Tag,
     language_tags: []const Tag,
-    extra_features: []const Tag,
+    extra_features: []const Feature,
 ) (parsing.Font.ParseError || error{OutOfMemory})!Buffer {
     return shapeImpl(allocator, font, codepoints, direction, script_tags, language_tags, extra_features, &.{}, item);
 }
@@ -187,7 +188,7 @@ fn shapeImpl(
     direction: Direction,
     script_tags: []const Tag,
     language_tags: []const Tag,
-    extra_features: []const Tag,
+    extra_features: []const Feature,
     normalized_coords: []const f32,
     item: ?Item,
 ) (parsing.Font.ParseError || error{OutOfMemory})!Buffer {
@@ -266,7 +267,7 @@ fn shapeImpl(
     if (is_myanmar) try collectFeaturesMyanmar(&map_builder);
     if (is_use) try collectFeaturesUse(&map_builder);
     for (default_features) |tag| try map_builder.enableFeature(tag, .{ .global = true }, 1);
-    for (extra_features) |tag| try map_builder.enableFeature(tag, .{ .global = true }, 1);
+    for (extra_features) |feature| try map_builder.enableFeature(feature.tag, .{}, feature.value);
     if (is_hangul) try overrideFeaturesHangul(&map_builder);
     if (is_khmer) try overrideFeaturesKhmer(&map_builder);
     if (indic_config != null) try map_builder.disableFeature(tag_liga);
@@ -361,7 +362,7 @@ pub fn shapeBidiParagraph(
     base_direction: unicode.Bidi.ParagraphDirection,
     script_tags: []const Tag,
     language_tags: []const Tag,
-    extra_features: []const Tag,
+    extra_features: []const Feature,
 ) (parsing.Font.ParseError || unicode.Bidi.Error || error{OutOfMemory})!Buffer {
     return shapeBidiParagraphVaried(allocator, font, codepoints, base_direction, script_tags, language_tags, extra_features, &.{});
 }
@@ -375,7 +376,7 @@ pub fn shapeBidiParagraphVaried(
     base_direction: unicode.Bidi.ParagraphDirection,
     script_tags: []const Tag,
     language_tags: []const Tag,
-    extra_features: []const Tag,
+    extra_features: []const Feature,
     normalized_coords: []const f32,
 ) (parsing.Font.ParseError || unicode.Bidi.Error || error{OutOfMemory})!Buffer {
     return shapeBidiParagraphImpl(allocator, &.{font}, codepoints, base_direction, script_tags, language_tags, extra_features, normalized_coords, null, null);
@@ -412,7 +413,7 @@ pub fn shapeBidiParagraphWithFallback(
     base_direction: unicode.Bidi.ParagraphDirection,
     script_tags: []const Tag,
     language_tags: []const Tag,
-    extra_features: []const Tag,
+    extra_features: []const Feature,
     item: ?Item,
 ) (parsing.Font.ParseError || unicode.Bidi.Error || error{OutOfMemory})!BidiFallbackResult {
     var font_indices: std.ArrayList(usize) = .empty;
@@ -435,7 +436,7 @@ fn shapeBidiParagraphImpl(
     base_direction: unicode.Bidi.ParagraphDirection,
     script_tags: []const Tag,
     language_tags: []const Tag,
-    extra_features: []const Tag,
+    extra_features: []const Feature,
     normalized_coords: []const f32,
     font_indices_out: ?*std.ArrayList(usize),
     item: ?Item,
@@ -624,7 +625,7 @@ pub fn shapeWithFallback(
     direction: Direction,
     script_tags: []const Tag,
     language_tags: []const Tag,
-    extra_features: []const Tag,
+    extra_features: []const Feature,
 ) (parsing.Font.ParseError || error{OutOfMemory})!Buffer {
     const spans = try itemizeByFontCoverage(allocator, fonts, codepoints);
     defer allocator.free(spans);
