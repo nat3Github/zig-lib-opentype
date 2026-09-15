@@ -669,6 +669,9 @@ fn resizeImageBilinear(alloc: Allocator, src: parsing.png.Image, new_width: u32,
     return .{ .width = new_width, .height = new_height, .pixels = pixels };
 }
 
+/// `scratch_alloc` backs temp buffers freed before this returns; `alloc`
+/// backs the returned pixels (exactly `width * rows * 4` bytes), owned by
+/// the caller.
 pub fn rasterizeSbix(
     scratch_alloc: Allocator,
     alloc: Allocator,
@@ -679,6 +682,7 @@ pub fn rasterizeSbix(
 ) RasterizeSbixError!?BitmapRgba8bit {
     const strike = try parsing.Table.sbix.findStrike(sbix_data, ppem) orelse return null;
     var decoded = try parsing.Table.sbix.decodeGlyph(scratch_alloc, alloc, sbix_data, strike, glyph_id) orelse return null;
+    errdefer decoded.image.deinit(alloc);
 
     // sbix only embeds a handful of fixed-size strikes; scale the nearest
     // one (picked by findStrike) to the requested ppem.
@@ -719,6 +723,9 @@ pub fn rasterizeSbix(
 
 pub const RasterizeCbdtError = parsing.Font.ParseError || parsing.Table.CBLC.GraphicError || parsing.PngDecodeError || Allocator.Error;
 
+/// `scratch_alloc` backs temp buffers freed before this returns; `alloc`
+/// backs the returned pixels (exactly `width * rows * 4` bytes), owned by
+/// the caller.
 pub fn rasterizeCbdt(
     scratch_alloc: Allocator,
     alloc: Allocator,
@@ -822,8 +829,12 @@ pub const RasterizeColrOptions = struct {
 };
 
 /// Returns `null` if `glyph_id` isn't a color glyph in this `COLR` table.
+/// `scratch_allocator` backs the per-layer paint ops (freed before this
+/// returns); `output_allocator` backs the returned pixels (exactly
+/// `width * rows * 4` bytes), owned by the caller.
 pub fn rasterizeColr(
-    alloc: Allocator,
+    scratch_allocator: Allocator,
+    output_allocator: Allocator,
     colr_data: []const u8,
     cpal_data: []const u8,
     source: OutlineSource,
@@ -836,7 +847,7 @@ pub fn rasterizeColr(
     coverage_contrast.ppem = ppem;
 
     var walker: ColrWalker = .{
-        .alloc = alloc,
+        .scratch_allocator = scratch_allocator,
         .colr_data = colr_data,
         .cpal_data = cpal_data,
         .palette_index = options.palette_index,
@@ -862,5 +873,5 @@ pub fn rasterizeColr(
         return null;
     }
 
-    return try common.compositeOpsToCanvas(alloc, walker.ops.items, walker.coverage_contrast);
+    return try common.compositeOpsToCanvas(output_allocator, walker.ops.items, walker.coverage_contrast);
 }

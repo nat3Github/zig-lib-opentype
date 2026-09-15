@@ -21,7 +21,7 @@ const BitmapRgba8bit = rasterization.BitmapRgba8bit;
 const freeOps = rasterization.freeOps;
 
 pub const ColrWalker = struct {
-    alloc: Allocator,
+    scratch_allocator: Allocator,
     colr_data: []const u8,
     cpal_data: []const u8,
     palette_index: u16,
@@ -31,8 +31,8 @@ pub const ColrWalker = struct {
     ops: std.ArrayList(DrawOp) = .empty,
 
     pub fn deinit(self: *ColrWalker) void {
-        freeOps(self.alloc, self.ops.items);
-        self.ops.deinit(self.alloc);
+        freeOps(self.scratch_allocator, self.ops.items);
+        self.ops.deinit(self.scratch_allocator);
     }
 
     /// `palette_entry_index == 0xFFFF` is the spec's sentinel for "use the
@@ -56,15 +56,15 @@ pub const ColrWalker = struct {
     fn outlineBitmap(self: ColrWalker, glyph_id: u16, matrix: Affine) RasterizeColrError!Bitmap8bit {
         switch (self.source) {
             .glyf => |g| {
-                const outline = try parsing.Table.glyf.outline(self.alloc, g.glyf_data, g.loca_data, g.index_to_loc_format, glyph_id);
-                defer self.alloc.free(outline.points);
-                defer self.alloc.free(outline.end_points_of_contours);
-                return rasterizeGlyfAffine(self.alloc, outline, matrix);
+                const outline = try parsing.Table.glyf.outline(self.scratch_allocator, g.glyf_data, g.loca_data, g.index_to_loc_format, glyph_id);
+                defer self.scratch_allocator.free(outline.points);
+                defer self.scratch_allocator.free(outline.end_points_of_contours);
+                return rasterizeGlyfAffine(self.scratch_allocator, outline, matrix);
             },
             .cff => |c| {
-                const outline = try parsing.Table.cff.outline(self.alloc, c.cff_data, glyph_id);
-                defer self.alloc.free(outline.segments);
-                return rasterizeCffAffine(self.alloc, outline, matrix);
+                const outline = try parsing.Table.cff.outline(self.scratch_allocator, c.cff_data, glyph_id);
+                defer self.scratch_allocator.free(outline.segments);
+                return rasterizeCffAffine(self.scratch_allocator, outline, matrix);
             },
         }
     }
@@ -73,11 +73,11 @@ pub const ColrWalker = struct {
         if (paint == .solid and paint.solid.alpha <= 0) return;
         const bitmap = try self.outlineBitmap(glyph_id, matrix);
         if (bitmap.width == 0 or bitmap.rows == 0) {
-            bitmap.deinit(self.alloc);
-            paint.free(self.alloc);
+            bitmap.deinit(self.scratch_allocator);
+            paint.free(self.scratch_allocator);
             return;
         }
-        try self.ops.append(self.alloc, .{ .bitmap = bitmap, .paint = paint });
+        try self.ops.append(self.scratch_allocator, .{ .bitmap = bitmap, .paint = paint });
     }
 
     /// Renders `reader`'s paint sub-graph to its own offscreen RGBA canvas
@@ -91,12 +91,12 @@ pub const ColrWalker = struct {
         const saved_ops = self.ops;
         self.ops = .empty;
         defer {
-            freeOps(self.alloc, self.ops.items);
-            self.ops.deinit(self.alloc);
+            freeOps(self.scratch_allocator, self.ops.items);
+            self.ops.deinit(self.scratch_allocator);
             self.ops = saved_ops;
         }
         try self.walkPaint(reader, matrix, depth);
-        return common.compositeOpsToCanvas(self.alloc, self.ops.items, self.coverage_contrast);
+        return common.compositeOpsToCanvas(self.scratch_allocator, self.ops.items, self.coverage_contrast);
     }
 
     /// `ColorLine` (`COLR` spec): extend mode (pad/repeat/reflect) + a
@@ -111,8 +111,8 @@ pub const ColrWalker = struct {
         const num_stops = try reader.u16At(1);
         if (num_stops == 0) return null;
 
-        var stops: std.ArrayList(GradientStop) = try .initCapacity(self.alloc, num_stops);
-        errdefer stops.deinit(self.alloc);
+        var stops: std.ArrayList(GradientStop) = try .initCapacity(self.scratch_allocator, num_stops);
+        errdefer stops.deinit(self.scratch_allocator);
         var i: u32 = 0;
         while (i < num_stops) : (i += 1) {
             const rel = 3 + i * 6;
@@ -122,7 +122,7 @@ pub const ColrWalker = struct {
             const resolved = try self.resolvedColor(palette_index, alpha_raw);
             stops.appendAssumeCapacity(.{ .offset = stop_offset, .color = resolved.color, .alpha = resolved.alpha });
         }
-        return .{ .extend = extend, .stops = try stops.toOwnedSlice(self.alloc) };
+        return .{ .extend = extend, .stops = try stops.toOwnedSlice(self.scratch_allocator) };
     }
 
     /// Builds the `Paint.gradient` for a `PaintLinearGradient` (format 4),
@@ -135,7 +135,7 @@ pub const ColrWalker = struct {
         const inverse = matrix.invert() orelse return null;
         const colorline_off = (try reader.childOffsetAt(1)) orelse return null;
         const line = (try self.readColorLine(reader.at(colorline_off))) orelse return null;
-        errdefer self.alloc.free(line.stops);
+        errdefer self.scratch_allocator.free(line.stops);
 
         const geometry: GradientGeometry = switch (format) {
             4 => .{ .linear = .{
@@ -296,18 +296,18 @@ pub const ColrWalker = struct {
                 if (mode > 27) return;
 
                 const source_canvas = try self.renderSubgraph(reader.at(source_off), matrix, depth + 1);
-                defer self.alloc.free(source_canvas.pixels_row_major);
+                defer self.scratch_allocator.free(source_canvas.pixels_row_major);
                 const backdrop_canvas = try self.renderSubgraph(reader.at(backdrop_off), matrix, depth + 1);
-                defer self.alloc.free(backdrop_canvas.pixels_row_major);
+                defer self.scratch_allocator.free(backdrop_canvas.pixels_row_major);
 
-                const composited = try common.blendCanvases(self.alloc, backdrop_canvas, source_canvas, mode);
+                const composited = try common.blendCanvases(self.scratch_allocator, backdrop_canvas, source_canvas, mode);
                 if (composited.width == 0 or composited.rows == 0) {
-                    self.alloc.free(composited.pixels_row_major);
+                    self.scratch_allocator.free(composited.pixels_row_major);
                     return;
                 }
-                const mask = try self.alloc.alloc(u8, @as(usize, composited.width) * composited.rows);
+                const mask = try self.scratch_allocator.alloc(u8, @as(usize, composited.width) * composited.rows);
                 @memset(mask, 255);
-                try self.ops.append(self.alloc, .{
+                try self.ops.append(self.scratch_allocator, .{
                     .bitmap = .{ .width = composited.width, .rows = composited.rows, .left = composited.left, .top = composited.top, .pixels_row_major = mask },
                     .paint = .{ .image = .{ .rgba = composited.pixels_row_major } },
                 });

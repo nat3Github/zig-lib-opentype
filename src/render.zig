@@ -28,10 +28,10 @@ pub const RenderOptions = struct {
 
 /// `renderGlyph`'s result: the rasterized bitmap plus which family of
 /// source produced it. Callers compositing text need this to tell a
-/// pre-colored glyph (COLR/sbix/CBDT — draw its RGBA as-is) from a coverage
-/// mask (glyf/CFF/CFF2 — broadcast alpha into RGB so the caller's own tint
-/// color applies) apart; `renderOutline` alone can't disambiguate that
-/// after the fact since both paths return the same `ColorBitmap` shape.
+/// pre-colored glyph (COLR/sbix/CBDT — `width * rows * 4` straight RGBA,
+/// draw as-is) from a coverage mask (glyf/CFF/CFF2 — `width * rows`
+/// contrast-mapped coverage bytes, tinted by the caller) apart; the bitmap
+/// type alone can't tell the two layouts apart.
 pub const RenderedGlyph = struct {
     bitmap: rasterization.BitmapRgba8bit,
     is_color: bool,
@@ -279,17 +279,12 @@ pub const Renderer = struct {
         return false;
     }
 
-    fn coverageToRgba(self: Renderer, mask: rasterization.Bitmap8bit, output_allocator: std.mem.Allocator) std.mem.Allocator.Error!rasterization.BitmapRgba8bit {
+    fn contrastedCoverage(self: Renderer, mask: rasterization.Bitmap8bit, output_allocator: std.mem.Allocator) std.mem.Allocator.Error!rasterization.Bitmap8bit {
         const contrast: rasterization.CoverageContrast = .{ .ppem = self.ppem };
         const lut = contrast.lut();
-        const pixels = try output_allocator.alloc(u8, @as(usize, mask.width) * mask.rows * 4);
-        var i: usize = 0;
-        while (i < mask.pixels_row_major.len) : (i += 1) {
-            const o = i * 4;
-            pixels[o] = 0;
-            pixels[o + 1] = 0;
-            pixels[o + 2] = 0;
-            pixels[o + 3] = if (mask.pixels_row_major[i] == 0) 0 else lut[mask.pixels_row_major[i]];
+        const pixels = try output_allocator.alloc(u8, @as(usize, mask.width) * mask.rows);
+        for (pixels, mask.pixels_row_major[0..pixels.len]) |*pixel, coverage| {
+            pixel.* = if (coverage == 0) 0 else lut[coverage];
         }
         return .{ .width = mask.width, .rows = mask.rows, .left = mask.left, .top = mask.top, .pixels_row_major = pixels };
     }
@@ -315,7 +310,7 @@ pub const Renderer = struct {
         phase: rasterization.SubpixelOffset,
         scratch_allocator: std.mem.Allocator,
         output_allocator: std.mem.Allocator,
-    ) RenderError!rasterization.BitmapRgba8bit {
+    ) RenderError!rasterization.Bitmap8bit {
         const units_per_em = self.head.units_per_em;
         const vary = self.vary;
 
@@ -339,7 +334,7 @@ pub const Renderer = struct {
                     phase,
                 );
                 defer mask.deinit(scratch_allocator);
-                return self.coverageToRgba(mask, output_allocator);
+                return self.contrastedCoverage(mask, output_allocator);
             }
             const outline = if (vary) try parsing.Table.glyf.outlineVaried(
                 scratch_allocator,
@@ -363,24 +358,24 @@ pub const Renderer = struct {
             defer scratch_allocator.free(outline.end_points_of_contours);
             const mask = try rasterization.rasterizeTrueTypeGlyfOutline(scratch_allocator, outline, units_per_em, self.ppem, phase);
             defer mask.deinit(scratch_allocator);
-            return self.coverageToRgba(mask, output_allocator);
+            return self.contrastedCoverage(mask, output_allocator);
         } else if (self.cff_context) |ctx| {
             if (self.ppem < cff_hinting_ppem_threshold) {
                 const mask = try rasterization.rasterizeCffOutlineHintedWithContext(scratch_allocator, ctx, glyph_id, units_per_em, self.ppem, phase, true);
                 defer mask.deinit(scratch_allocator);
-                return self.coverageToRgba(mask, output_allocator);
+                return self.contrastedCoverage(mask, output_allocator);
             }
             const outline = try ctx.outline(scratch_allocator, glyph_id);
             defer scratch_allocator.free(outline.segments);
             const mask = try rasterization.rasterizeCffOutline(scratch_allocator, outline, units_per_em, self.ppem, phase);
             defer mask.deinit(scratch_allocator);
-            return self.coverageToRgba(mask, output_allocator);
+            return self.contrastedCoverage(mask, output_allocator);
         } else if (self.cff2_data) |cff2_table| {
             const outline = try parsing.Table.cff2.outline(scratch_allocator, cff2_table, glyph_id);
             defer scratch_allocator.free(outline.segments);
             const mask = try rasterization.rasterizeCffOutline(scratch_allocator, outline, units_per_em, self.ppem, phase);
             defer mask.deinit(scratch_allocator);
-            return self.coverageToRgba(mask, output_allocator);
+            return self.contrastedCoverage(mask, output_allocator);
         } else {
             return error.InvalidTableFormat;
         }
@@ -392,6 +387,9 @@ pub const Renderer = struct {
     /// `scratch_allocator` backs temp buffers freed before this returns;
     /// `output_allocator` backs the returned bitmap's pixels, which the
     /// caller owns and must free with the same allocator (`RenderedGlyph.deinit`).
+    /// Pixel layout follows `is_color`: `false` is exactly `width * rows`
+    /// coverage bytes, `true` is exactly `width * rows * 4` straight RGBA
+    /// bytes, so callers may keep the slice as-is.
     pub fn renderGlyph(
         self: *Renderer,
         glyph_id: u16,
@@ -414,6 +412,7 @@ pub const Renderer = struct {
             if (self.cpal_data) |cpal_table| {
                 if (self.colrOutlineSource()) |source| {
                     if (try rasterization.rasterizeColr(
+                        scratch_allocator,
                         output_allocator,
                         colr_table,
                         cpal_table,
