@@ -21,21 +21,28 @@ fn insertionSort(comptime T: type, items: []T, context: anytype, comptime lessTh
 // test/fixtures/unicode/gen/gen_tables.py from the pinned UCD data; see
 // src/unicode/tables.zig. Re-run that script after bumping the pinned
 // Unicode version.
-fn lookupRange(comptime Range: type, ranges: []const Range, codepoint: u21) ?u8 {
+// Property tables are [N]u32 of (start << 8) | class, sorted by start; an
+// entry runs until the next entry's start, and `no_class` marks a gap. See
+// the header comment in unicode/tables.zig.
+const no_class: u8 = 0xFF;
+
+fn packedLookup(table: []const u32, codepoint: u21) u8 {
     var lo: usize = 0;
-    var hi: usize = ranges.len;
+    var hi: usize = table.len;
     while (lo < hi) {
         const mid = lo + (hi - lo) / 2;
-        const r = ranges[mid];
-        if (codepoint < r.start) {
+        if (codepoint < table[mid] >> 8) {
             hi = mid;
-        } else if (codepoint > r.end) {
-            lo = mid + 1;
         } else {
-            return r.class;
+            lo = mid + 1;
         }
     }
-    return null;
+    if (lo == 0) return no_class;
+    return @truncate(table[lo - 1]);
+}
+
+fn packedContains(table: []const u32, codepoint: u21) bool {
+    return packedLookup(table, codepoint) == 1;
 }
 
 pub const BidiClass = enum {
@@ -64,8 +71,8 @@ pub const BidiClass = enum {
     pdi,
 
     pub fn of(codepoint: u21) BidiClass {
-        const class = lookupRange(tables.BidiClassRange, &tables.bidi_class_ranges, codepoint) orelse
-            @intFromEnum(BidiClass.l);
+        const class = packedLookup(&tables.bidi_class_ranges, codepoint);
+        if (class == no_class) return .l;
         return @enumFromInt(class);
     }
 };
@@ -771,11 +778,8 @@ pub const GraphemeClusterBreak = enum {
     extended_pictographic,
 
     pub fn of(codepoint: u21) GraphemeClusterBreak {
-        const class = lookupRange(
-            tables.GraphemeClusterBreakRange,
-            &tables.grapheme_cluster_break_ranges,
-            codepoint,
-        ) orelse @intFromEnum(GraphemeClusterBreak.other);
+        const class = packedLookup(&tables.grapheme_cluster_break_ranges, codepoint);
+        if (class == no_class) return .other;
         return @enumFromInt(class);
     }
 };
@@ -785,11 +789,8 @@ const incb_linker: u8 = 2;
 const incb_consonant: u8 = 3;
 
 fn indicConjunctBreakOf(codepoint: u21) u8 {
-    return lookupRange(
-        tables.IndicConjunctBreakRange,
-        &tables.indic_conjunct_break_ranges,
-        codepoint,
-    ) orelse 0;
+    const class = packedLookup(&tables.indic_conjunct_break_ranges, codepoint);
+    return if (class == no_class) 0 else class;
 }
 
 // UAX #29 rules GB3-GB999: is there a boundary between text[i - 1] and
@@ -1489,11 +1490,8 @@ pub const LineBreakClass = enum {
     xx,
 
     pub fn of(codepoint: u21) LineBreakClass {
-        const class = lookupRange(
-            tables.LineBreakClassRange,
-            &tables.line_break_class_ranges,
-            codepoint,
-        ) orelse @intFromEnum(LineBreakClass.xx);
+        const class = packedLookup(&tables.line_break_class_ranges, codepoint);
+        if (class == no_class) return .xx;
         return @enumFromInt(class);
     }
 };
@@ -1519,11 +1517,11 @@ pub const LineBreakStrictness = enum { strict, normal, loose };
 pub const WordBreakMode = enum { normal, break_all, keep_all };
 
 fn isInitialPunctuation(codepoint: u21) bool {
-    return lookupRange(tables.QuotePunctuationRange, &tables.quote_punctuation_ranges, codepoint) == 0;
+    return packedLookup(&tables.quote_punctuation_ranges, codepoint) == 0;
 }
 
 fn isFinalPunctuation(codepoint: u21) bool {
-    return lookupRange(tables.QuotePunctuationRange, &tables.quote_punctuation_ranges, codepoint) == 1;
+    return packedLookup(&tables.quote_punctuation_ranges, codepoint) == 1;
 }
 
 // East_Asian_Width in {F, W, H} — used by the LB19a/LB30 overrides below.
@@ -1531,37 +1529,11 @@ fn isFinalPunctuation(codepoint: u21) bool {
 // unassigned-but-Extended_Pictographic-flagged codepoints get the same
 // no-break-before-EM treatment as real EB codepoints.
 fn isExtendedPictographicUnassigned(codepoint: u21) bool {
-    var lo: usize = 0;
-    var hi: usize = tables.extended_pictographic_unassigned_ranges.len;
-    while (lo < hi) {
-        const mid = lo + (hi - lo) / 2;
-        const r = tables.extended_pictographic_unassigned_ranges[mid];
-        if (codepoint < r.start) {
-            hi = mid;
-        } else if (codepoint > r.end) {
-            lo = mid + 1;
-        } else {
-            return true;
-        }
-    }
-    return false;
+    return packedContains(&tables.extended_pictographic_unassigned_ranges, codepoint);
 }
 
 fn isEastAsianWide(codepoint: u21) bool {
-    var lo: usize = 0;
-    var hi: usize = tables.east_asian_wide_ranges.len;
-    while (lo < hi) {
-        const mid = lo + (hi - lo) / 2;
-        const r = tables.east_asian_wide_ranges[mid];
-        if (codepoint < r.start) {
-            hi = mid;
-        } else if (codepoint > r.end) {
-            lo = mid + 1;
-        } else {
-            return true;
-        }
-    }
-    return false;
+    return packedContains(&tables.east_asian_wide_ranges, codepoint);
 }
 
 // LB1 resolution used only by the LB25 override's own backward/forward
@@ -2067,57 +2039,20 @@ const hangul_s_count: u21 = hangul_l_count * hangul_n_count;
 /// test/fixtures/unicode/gen/gen_use_categories.py for how the table is
 /// derived.
 pub fn useCategory(codepoint: u21) u8 {
-    var lo: usize = 0;
-    var hi: usize = tables.use_category_ranges.len;
-    while (lo < hi) {
-        const mid = lo + (hi - lo) / 2;
-        const r = tables.use_category_ranges[mid];
-        if (codepoint < r.start) {
-            hi = mid;
-        } else if (codepoint > r.end) {
-            lo = mid + 1;
-        } else {
-            return r.category;
-        }
-    }
-    return 0;
+    const category = packedLookup(&tables.use_category_ranges, codepoint);
+    return if (category == no_class) 0 else category;
 }
 
 /// Canonical_Combining_Class (UnicodeData.txt field 3); 0 for every
 /// codepoint not explicitly assigned a nonzero class.
 pub fn combiningClass(codepoint: u21) u8 {
-    var lo: usize = 0;
-    var hi: usize = tables.combining_class_ranges.len;
-    while (lo < hi) {
-        const mid = lo + (hi - lo) / 2;
-        const r = tables.combining_class_ranges[mid];
-        if (codepoint < r.start) {
-            hi = mid;
-        } else if (codepoint > r.end) {
-            lo = mid + 1;
-        } else {
-            return r.combining_class;
-        }
-    }
-    return 0;
+    const class = packedLookup(&tables.combining_class_ranges, codepoint);
+    return if (class == no_class) 0 else class;
 }
 
 /// General_Category is Mn, Mc, or Me.
 pub fn isUnicodeMark(codepoint: u21) bool {
-    var lo: usize = 0;
-    var hi: usize = tables.unicode_mark_ranges.len;
-    while (lo < hi) {
-        const mid = lo + (hi - lo) / 2;
-        const r = tables.unicode_mark_ranges[mid];
-        if (codepoint < r.start) {
-            hi = mid;
-        } else if (codepoint > r.end) {
-            lo = mid + 1;
-        } else {
-            return true;
-        }
-    }
-    return false;
+    return packedContains(&tables.unicode_mark_ranges, codepoint);
 }
 
 /// Ported from hb-unicode.hh's `is_default_ignorable` - a hardcoded
@@ -2167,33 +2102,9 @@ pub const ArabicJoiningType = enum(u8) {
 /// General_Category Mn/Me/Cf (combining marks, format controls — invisible
 /// to joining), else `.non_joining` — mirrors hb's `get_joining_type`.
 pub fn arabicJoiningType(codepoint: u21) ArabicJoiningType {
-    var lo: usize = 0;
-    var hi: usize = tables.arabic_joining_ranges.len;
-    while (lo < hi) {
-        const mid = lo + (hi - lo) / 2;
-        const r = tables.arabic_joining_ranges[mid];
-        if (codepoint < r.start) {
-            hi = mid;
-        } else if (codepoint > r.end) {
-            lo = mid + 1;
-        } else {
-            return @enumFromInt(r.joining_type);
-        }
-    }
-
-    lo = 0;
-    hi = tables.arabic_transparent_ranges.len;
-    while (lo < hi) {
-        const mid = lo + (hi - lo) / 2;
-        const r = tables.arabic_transparent_ranges[mid];
-        if (codepoint < r.start) {
-            hi = mid;
-        } else if (codepoint > r.end) {
-            lo = mid + 1;
-        } else {
-            return .transparent;
-        }
-    }
+    const joining_type = packedLookup(&tables.arabic_joining_ranges, codepoint);
+    if (joining_type != no_class) return @enumFromInt(joining_type);
+    if (packedContains(&tables.arabic_transparent_ranges, codepoint)) return .transparent;
     return .non_joining;
 }
 
@@ -2204,20 +2115,8 @@ pub const script_unknown: [4]u8 = .{ 'Z', 'z', 'z', 'z' };
 /// ISO 15924 Script property (UAX #24), same four-letter codes as hb_script_t.
 /// Unlisted codepoints are Unknown (`Zzzz`).
 pub fn scriptOf(codepoint: u21) [4]u8 {
-    var lo: usize = 0;
-    var hi: usize = tables.script_ranges.len;
-    while (lo < hi) {
-        const mid = lo + (hi - lo) / 2;
-        const r = tables.script_ranges[mid];
-        if (codepoint < r.start) {
-            hi = mid;
-        } else if (codepoint > r.end) {
-            lo = mid + 1;
-        } else {
-            return r.tag;
-        }
-    }
-    return script_unknown;
+    const tag_index = packedLookup(&tables.script_ranges, codepoint);
+    return if (tag_index == no_class) script_unknown else tables.script_tags[tag_index];
 }
 
 pub fn scriptIsWeak(script: [4]u8) bool {
@@ -2326,13 +2225,14 @@ pub fn decomposeCanonical(codepoint: u21) ?Decomposition {
     var hi: usize = tables.canonical_decomposition_entries.len;
     while (lo < hi) {
         const mid = lo + (hi - lo) / 2;
-        const e = tables.canonical_decomposition_entries[mid];
-        if (codepoint < e.codepoint) {
+        const entry = tables.canonical_decomposition_entries[mid];
+        const entry_codepoint: u21 = @truncate(entry >> 42);
+        if (codepoint < entry_codepoint) {
             hi = mid;
-        } else if (codepoint > e.codepoint) {
+        } else if (codepoint > entry_codepoint) {
             lo = mid + 1;
         } else {
-            return .{ .first = e.first, .second = e.second };
+            return .{ .first = @truncate(entry >> 21), .second = @truncate(entry) };
         }
     }
     return null;
@@ -2357,17 +2257,19 @@ pub fn composeCanonical(first: u21, second: u21) ?u21 {
         return first + (second - hangul_t_base);
     }
 
+    const key = (@as(u64, first) << 21) | @as(u64, second);
     var lo: usize = 0;
     var hi: usize = tables.canonical_composition_entries.len;
     while (lo < hi) {
         const mid = lo + (hi - lo) / 2;
-        const e = tables.canonical_composition_entries[mid];
-        if (first < e.first or (first == e.first and second < e.second)) {
+        const entry = tables.canonical_composition_entries[mid];
+        const entry_key = entry >> 21;
+        if (key < entry_key) {
             hi = mid;
-        } else if (first > e.first or (first == e.first and second > e.second)) {
+        } else if (key > entry_key) {
             lo = mid + 1;
         } else {
-            return e.composed;
+            return @truncate(entry);
         }
     }
     return null;
