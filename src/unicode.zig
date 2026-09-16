@@ -2135,10 +2135,17 @@ pub fn scriptOf(codepoint: u21) [4]u8 {
     return if (tag_index == no_class) script_unknown else tables.script_tags[tag_index];
 }
 
+// A 4-byte tag compares as one u32 rather than through `mem.eql`'s generic
+// byte loop, which profiled hot in cold frames. Byte order is irrelevant to
+// equality, so the bitcast needs no endianness handling.
+fn tagEql(a: [4]u8, b: [4]u8) bool {
+    return @as(u32, @bitCast(a)) == @as(u32, @bitCast(b));
+}
+
 pub fn scriptIsWeak(script: [4]u8) bool {
-    return std.mem.eql(u8, &script, &script_common) or
-        std.mem.eql(u8, &script, &script_inherited) or
-        std.mem.eql(u8, &script, &script_unknown);
+    return tagEql(script, script_common) or
+        tagEql(script, script_inherited) or
+        tagEql(script, script_unknown);
 }
 
 /// Resolves Common/Inherited/Unknown against adjacent strong scripts
@@ -2180,13 +2187,13 @@ pub fn resolveScriptsInPlace(scripts: [][4]u8) void {
 
 /// hb-ot-tag.cc `hb_ot_old_tag_from_script`: ISO 15924 -> OpenType script tag.
 pub fn openTypeOldScriptTag(iso: [4]u8) [4]u8 {
-    if (std.mem.eql(u8, &iso, &.{ 'H', 'i', 'r', 'a' }) or std.mem.eql(u8, &iso, &.{ 'H', 'r', 'k', 't' }))
+    if (tagEql(iso, .{ 'H', 'i', 'r', 'a' }) or tagEql(iso, .{ 'H', 'r', 'k', 't' }))
         return .{ 'k', 'a', 'n', 'a' };
-    if (std.mem.eql(u8, &iso, &.{ 'L', 'a', 'o', 'o' })) return .{ 'l', 'a', 'o', ' ' };
-    if (std.mem.eql(u8, &iso, &.{ 'Y', 'i', 'i', 'i' })) return .{ 'y', 'i', ' ', ' ' };
-    if (std.mem.eql(u8, &iso, &.{ 'N', 'k', 'o', 'o' })) return .{ 'n', 'k', 'o', ' ' };
-    if (std.mem.eql(u8, &iso, &.{ 'V', 'a', 'i', 'i' })) return .{ 'v', 'a', 'i', ' ' };
-    if (std.mem.eql(u8, &iso, &.{ 'Z', 'm', 't', 'h' })) return .{ 'm', 'a', 't', 'h' };
+    if (tagEql(iso, .{ 'L', 'a', 'o', 'o' })) return .{ 'l', 'a', 'o', ' ' };
+    if (tagEql(iso, .{ 'Y', 'i', 'i', 'i' })) return .{ 'y', 'i', ' ', ' ' };
+    if (tagEql(iso, .{ 'N', 'k', 'o', 'o' })) return .{ 'n', 'k', 'o', ' ' };
+    if (tagEql(iso, .{ 'V', 'a', 'i', 'i' })) return .{ 'v', 'a', 'i', ' ' };
+    if (tagEql(iso, .{ 'Z', 'm', 't', 'h' })) return .{ 'm', 'a', 't', 'h' };
     var tag = iso;
     tag[0] |= 0x20;
     return tag;
@@ -2207,7 +2214,7 @@ pub fn openTypeNewScriptTag(iso: [4]u8) ?[4]u8 {
         .{ .iso = .{ 'M', 'y', 'm', 'r' }, .ot = .{ 'm', 'y', 'm', '2' } },
     };
     for (pairs) |p| {
-        if (std.mem.eql(u8, &iso, &p.iso)) return p.ot;
+        if (tagEql(iso, p.iso)) return p.ot;
     }
     return null;
 }

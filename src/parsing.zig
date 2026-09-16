@@ -29,6 +29,13 @@ pub const Font = struct {
 
     pub const Tag = [4]u8;
 
+    // A 4-byte tag compares as one u32 rather than through `mem.eql`'s
+    // generic byte loop, which profiled hot in cold frames. Byte order is
+    // irrelevant to equality, so the bitcast needs no endianness handling.
+    pub fn tagEql(a: Tag, b: Tag) bool {
+        return @as(u32, @bitCast(a)) == @as(u32, @bitCast(b));
+    }
+
     pub const TableRecord = struct {
         tag: Tag,
         offset: u32,
@@ -73,7 +80,7 @@ pub const Font = struct {
 
     pub fn tableData(self: Font, tag: Tag) ?[]const u8 {
         for (self.table_records) |rec| {
-            if (!std.mem.eql(u8, &rec.tag, &tag)) continue;
+            if (!tagEql(rec.tag, tag)) continue;
             if (@as(u64, rec.offset) + rec.length > self.data.len) return null;
             return self.data[rec.offset..][0..rec.length];
         }

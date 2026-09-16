@@ -898,7 +898,7 @@ pub fn insertDottedCircles(
 pub const Tag = parsing.Font.Tag;
 
 pub fn containsTag(tags: []const Tag, tag: Tag) bool {
-    for (tags) |t| if (std.mem.eql(u8, &t, &tag)) return true;
+    for (tags) |t| if (parsing.Font.tagEql(t, tag)) return true;
     return false;
 }
 

@@ -658,7 +658,7 @@ fn shapeBidiParagraphImpl(
         while (i < levels.len) {
             var j = i + 1;
             while (j < levels.len) {
-                if (!std.mem.eql(u8, &resolved_scripts[j], &resolved_scripts[i])) break;
+                if (!parsing.Font.tagEql(resolved_scripts[j], resolved_scripts[i])) break;
                 const strong = !unicode.scriptIsWeak(unicode.scriptOf(codepoints[j]));
                 // Bidi level boundaries must hold even for weak-script runs
                 // of ordinary punctuation (e.g. U+2018 inheriting an
