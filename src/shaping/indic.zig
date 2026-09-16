@@ -530,7 +530,7 @@ const IndicRephPosition = enum(u8) { after_main, before_sub, after_sub, before_p
 const IndicRephMode = enum(u8) { implicit, explicit, log_repha };
 const IndicBlwfMode = enum(u8) { pre_and_post, post_only };
 
-const IndicScriptConfig = struct {
+pub const IndicScriptConfig = struct {
     tag1: Tag,
     tag2: Tag,
     reph_pos: IndicRephPosition,

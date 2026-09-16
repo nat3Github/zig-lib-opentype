@@ -1,5 +1,6 @@
 const std = @import("std");
 const build_options = @import("build_options");
+const parsing = @import("parsing.zig");
 
 /// Platform font-discovery backends, each compiled in only when its build
 /// option is on (see build.zig) — a link-time dependency like CoreText or
@@ -14,6 +15,30 @@ pub const web_fallback = if (build_options.font_fallback) @import("discovery/web
 test {
     _ = fontconfig;
     _ = android;
+}
+
+/// Index of the face in collection `file` whose `name` table PostScript
+/// name (nameID 6) equals `postscript_name`; 0 for a non-collection, no
+/// match, or any read/parse failure. Reads only the ttcf header, each
+/// face's table directory, and each `name` table, never the whole file.
+pub fn collectionFaceIndexByPostscriptName(io: std.Io, file: std.Io.File, postscript_name: []const u8, allocator: std.mem.Allocator) u32 {
+    var header: [parsing.Collection.max_header_size]u8 = undefined;
+    const header_len = file.readPositionalAll(io, &header, 0) catch return 0;
+    var offsets_buf: [parsing.Collection.max_faces]u32 = undefined;
+    const offsets = parsing.Collection.faceOffsets(header[0..header_len], &offsets_buf) orelse return 0;
+
+    var directory: [parsing.Font.max_directory_size]u8 = undefined;
+    var name_buf: [256]u8 = undefined;
+    for (offsets, 0..) |offset, index| {
+        const directory_len = file.readPositionalAll(io, &directory, offset) catch continue;
+        const record = parsing.Font.findTableInDirectory(directory[0..directory_len], .{ 'n', 'a', 'm', 'e' }) orelse continue;
+        const name_table = allocator.alloc(u8, @min(record.length, parsing.Table.name.max_addressable_size)) catch return 0;
+        defer allocator.free(name_table);
+        const name_len = file.readPositionalAll(io, name_table, record.offset) catch continue;
+        const candidate = parsing.Table.name.postscriptName(name_table[0..name_len], &name_buf) orelse continue;
+        if (std.mem.eql(u8, candidate, postscript_name)) return @intCast(index);
+    }
+    return 0;
 }
 
 // NOTE: ported from vendor/font-kit (src/properties.rs, src/handle.rs,

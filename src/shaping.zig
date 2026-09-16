@@ -130,7 +130,7 @@ pub fn shape(
     language_tags: []const Tag,
     extra_features: []const Feature,
 ) (parsing.Font.ParseError || error{OutOfMemory})!Buffer {
-    return shapeImpl(allocator, font, codepoints, direction, script_tags, language_tags, extra_features, &.{}, null);
+    return shapeImpl(allocator, font, codepoints, direction, script_tags, language_tags, extra_features, &.{}, null, null);
 }
 
 /// Same as `shape`, but `normalized_coords` (per-axis values in [-1, 1],
@@ -148,7 +148,7 @@ pub fn shapeVaried(
     extra_features: []const Feature,
     normalized_coords: []const f32,
 ) (parsing.Font.ParseError || error{OutOfMemory})!Buffer {
-    return shapeImpl(allocator, font, codepoints, direction, script_tags, language_tags, extra_features, normalized_coords, null);
+    return shapeImpl(allocator, font, codepoints, direction, script_tags, language_tags, extra_features, normalized_coords, null, null);
 }
 
 /// Sub-range of a `shape*` call's `codepoints` to actually emit glyphs for.
@@ -178,8 +178,190 @@ pub fn shapeWithContext(
     language_tags: []const Tag,
     extra_features: []const Feature,
 ) (parsing.Font.ParseError || error{OutOfMemory})!Buffer {
-    return shapeImpl(allocator, font, codepoints, direction, script_tags, language_tags, extra_features, &.{}, item);
+    return shapeImpl(allocator, font, codepoints, direction, script_tags, language_tags, extra_features, &.{}, item, null);
 }
+
+/// Everything a `shape*` call derives from the font plus the requested
+/// script/language/features alone: the compiled GSUB/GPOS map, the cmap
+/// subtable glyph lookup uses, and which complex shaper the combination
+/// selects. None of it depends on the text, so a caller shaping many runs
+/// against the same font can build it once and reuse it -- hb's
+/// `hb_shape_plan_t`.
+pub const Plan = struct {
+    map: Map,
+    cmap: ?parsing.Table.cmap.Resolved,
+    indic_config: ?*const indic_mod.IndicScriptConfig,
+    is_hangul: bool,
+    is_arabic: bool,
+    is_thai: bool,
+    is_lao: bool,
+    is_khmer: bool,
+    is_myanmar: bool,
+    is_use: bool,
+    is_use_arabic_joining: bool,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        font: parsing.Font,
+        script_tags: []const Tag,
+        language_tags: []const Tag,
+        extra_features: []const Feature,
+    ) (parsing.Font.ParseError || error{OutOfMemory})!Plan {
+        const cmap: ?parsing.Table.cmap.Resolved = if (font.tableData(.{ 'c', 'm', 'a', 'p' })) |d| parsing.Table.cmap.resolve(d) else null;
+
+        const is_hangul = containsTag(script_tags, hang_script_tag);
+        const is_arabic = containsTag(script_tags, arab_script_tag) or containsTag(script_tags, syrc_script_tag);
+        const is_thai = containsTag(script_tags, thai_script_tag);
+        const is_lao = containsTag(script_tags, lao_script_tag);
+        const is_khmer = containsTag(script_tags, khmr_script_tag);
+
+        var map_builder = try MapBuilder.init(allocator, font, script_tags, language_tags);
+        defer map_builder.deinit();
+
+        // Ported from `hb_ot_shaper_categorize`: the old-spec Indic, Myanmar,
+        // and USE-family complex shapers only run if the font actually declares
+        // GSUB support for the requested script - a font that only ships
+        // DFLT/latn (or, for Myanmar, the pre-mym2 'mymr' tag) gets the plain
+        // default shaper instead, even though the buffer's Unicode script maps
+        // to one of these. Skipping this check made the USE shaper's broken-
+        // cluster/dotted-circle logic fire on fonts with no script-specific
+        // GSUB table at all (e.g. a Tai Viet vowel sign in a font whose GSUB
+        // only has DFLT/cyrl/dev2/grek/latn), diverging from hb/browsers.
+        // A font with no GSUB table at all (or none of the requested/DFLT/latn
+        // scripts present) resolves to `null` here, matching hb's HB_TAG_NONE -
+        // that's NOT the same as the font *having* a GSUB table that explicitly
+        // resolves to DFLT/latn, so `null` must NOT gate off the complex shaper
+        // (a bare cmap-only test font still gets Indic/USE reordering in hb).
+        const gsub_script = map_builder.chosen_script[0];
+        const gsub_is_dflt_or_latn = gsub_script != null and
+            (std.mem.eql(u8, &gsub_script.?, &tag_dflt_script) or
+                std.mem.eql(u8, &gsub_script.?, &tag_latn_script));
+
+        const indic_config = if (gsub_is_dflt_or_latn) null else findIndicConfig(script_tags);
+        const is_myanmar = containsTag(script_tags, mym2_script_tag) and
+            !gsub_is_dflt_or_latn and
+            !(gsub_script != null and std.mem.eql(u8, &gsub_script.?, &tag_mymr_script));
+        var is_use = false;
+        if (!gsub_is_dflt_or_latn) {
+            for (use_script_tags) |tag| {
+                if (containsTag(script_tags, tag)) {
+                    is_use = true;
+                    break;
+                }
+            }
+        }
+        var is_use_arabic_joining = false;
+        for (use_mod.use_arabic_joining_script_tags) |tag| {
+            if (containsTag(script_tags, tag)) {
+                is_use_arabic_joining = true;
+                break;
+            }
+        }
+        if (is_hangul) try collectFeaturesHangul(&map_builder);
+        if (is_arabic) try collectFeaturesArabic(&map_builder);
+        if (indic_config != null) try collectFeaturesIndic(&map_builder);
+        if (is_khmer) try collectFeaturesKhmer(&map_builder);
+        if (is_myanmar) try collectFeaturesMyanmar(&map_builder);
+        if (is_use) try collectFeaturesUse(&map_builder);
+        for (default_features) |tag| try map_builder.enableFeature(tag, .{ .global = true }, 1);
+        for (extra_features) |feature| try map_builder.enableFeature(feature.tag, .{}, feature.value);
+        if (is_hangul) try overrideFeaturesHangul(&map_builder);
+        if (is_khmer) try overrideFeaturesKhmer(&map_builder);
+        if (indic_config != null) try map_builder.disableFeature(tag_liga);
+
+        return .{
+            .map = try map_builder.compile(allocator),
+            .cmap = cmap,
+            .indic_config = indic_config,
+            .is_hangul = is_hangul,
+            .is_arabic = is_arabic,
+            .is_thai = is_thai,
+            .is_lao = is_lao,
+            .is_khmer = is_khmer,
+            .is_myanmar = is_myanmar,
+            .is_use = is_use,
+            .is_use_arabic_joining = is_use_arabic_joining,
+        };
+    }
+
+    pub fn deinit(self: *Plan, allocator: std.mem.Allocator) void {
+        self.map.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+/// Reuses `Plan`s across `shape*` calls, keyed by font identity plus the
+/// tags and features that select one.
+///
+/// A cached plan holds slices into the font's own bytes (its GSUB/GPOS and
+/// cmap tables) and is keyed by their address, so the owner MUST `clear` it
+/// whenever any font's bytes are freed: a font later loaded at the same
+/// address would otherwise hit a stale plan pointing into freed memory.
+pub const PlanCache = struct {
+    plans: std.AutoHashMapUnmanaged(u64, Plan) = .empty,
+
+    /// A plan is cheap to rebuild and a single stack rarely mixes more than
+    /// a handful of (font, script) pairs, so past this the whole cache is
+    /// dropped rather than grown without bound.
+    pub const max_plans = 128;
+
+    pub fn deinit(self: *PlanCache, state_allocator: std.mem.Allocator) void {
+        self.clear(state_allocator);
+        self.plans.deinit(state_allocator);
+        self.* = undefined;
+    }
+
+    pub fn clear(self: *PlanCache, state_allocator: std.mem.Allocator) void {
+        var it = self.plans.valueIterator();
+        while (it.next()) |plan| plan.deinit(state_allocator);
+        self.plans.clearRetainingCapacity();
+    }
+
+    fn key(font: parsing.Font, script_tags: []const Tag, language_tags: []const Tag, extra_features: []const Feature) u64 {
+        var hasher = std.hash.Wyhash.init(0);
+        hasher.update(std.mem.asBytes(&font.data.ptr));
+        hasher.update(std.mem.asBytes(&font.data.len));
+        for (script_tags) |tag| hasher.update(&tag);
+        hasher.update("|");
+        for (language_tags) |tag| hasher.update(&tag);
+        hasher.update("|");
+        for (extra_features) |feature| {
+            hasher.update(&feature.tag);
+            hasher.update(std.mem.asBytes(&feature.value));
+        }
+        return hasher.final();
+    }
+
+    /// The returned pointer is only valid until the next call: inserting can
+    /// rehash the map. One `shapeImpl` call never asks twice, so it holds a
+    /// plan pointer for its whole run without that mattering.
+    fn getOrBuild(
+        self: *PlanCache,
+        state_allocator: std.mem.Allocator,
+        font: parsing.Font,
+        script_tags: []const Tag,
+        language_tags: []const Tag,
+        extra_features: []const Feature,
+    ) (parsing.Font.ParseError || error{OutOfMemory})!*const Plan {
+        const k = key(font, script_tags, language_tags, extra_features);
+        if (self.plans.getPtr(k)) |existing| return existing;
+        if (self.plans.count() >= max_plans) self.clear(state_allocator);
+
+        var plan = try Plan.init(state_allocator, font, script_tags, language_tags, extra_features);
+        errdefer plan.deinit(state_allocator);
+        try self.plans.put(state_allocator, k, plan);
+        return self.plans.getPtr(k).?;
+    }
+};
+
+/// A `PlanCache` together with the allocator its plans are built from.
+/// Separate from `shape*`'s own `allocator`, which is typically a per-call
+/// arena: a cached plan outlives the call that built it, so it must not
+/// come from one.
+pub const Plans = struct {
+    cache: *PlanCache,
+    state_allocator: std.mem.Allocator,
+};
 
 fn shapeImpl(
     allocator: std.mem.Allocator,
@@ -191,6 +373,7 @@ fn shapeImpl(
     extra_features: []const Feature,
     normalized_coords: []const f32,
     item: ?Item,
+    plans: ?Plans,
 ) (parsing.Font.ParseError || error{OutOfMemory})!Buffer {
     var buffer = Buffer.init(allocator);
     errdefer buffer.deinit();
@@ -200,17 +383,10 @@ fn shapeImpl(
     try buffer.info.ensureTotalCapacityPrecise(allocator, codepoints.len);
     try buffer.out_info.ensureTotalCapacityPrecise(allocator, codepoints.len);
 
-    const cmap: ?parsing.Table.cmap.Resolved = if (font.tableData(.{ 'c', 'm', 'a', 'p' })) |d| parsing.Table.cmap.resolve(d) else null;
     for (codepoints, 0..) |cp, i| try buffer.add(cp, @intCast(i));
 
-    const is_hangul = containsTag(script_tags, hang_script_tag);
-    const is_arabic = containsTag(script_tags, arab_script_tag) or containsTag(script_tags, syrc_script_tag);
-    const is_thai = containsTag(script_tags, thai_script_tag);
-    const is_lao = containsTag(script_tags, lao_script_tag);
-    const is_khmer = containsTag(script_tags, khmr_script_tag);
-
-    // Map-building only depends on font+tags, not buffer glyph content, so
-    // it happens before any shaper preprocessing (vs. a naive
+    // The plan only depends on font+tags, not on buffer glyph content, so it
+    // is built before any shaper preprocessing (vs. a naive
     // preprocess-then-map order) both to give setupMasksHangul a chance to
     // run while `codepoint` still holds Unicode values, matching hb's real
     // ordering (setup_masks runs right after normalize, before
@@ -218,61 +394,26 @@ fn shapeImpl(
     // fallback check needs `map.found_script[0]` - in hb this works because
     // the plan (which owns the map) is built once, before preprocess_text
     // even runs.
-    var map_builder = try MapBuilder.init(allocator, font, script_tags, language_tags);
-    defer map_builder.deinit();
+    var owned_plan: ?Plan = null;
+    defer if (owned_plan) |*p| p.deinit(allocator);
+    const plan: *const Plan = if (plans) |p|
+        try p.cache.getOrBuild(p.state_allocator, font, script_tags, language_tags, extra_features)
+    else blk: {
+        owned_plan = try Plan.init(allocator, font, script_tags, language_tags, extra_features);
+        break :blk &owned_plan.?;
+    };
 
-    // Ported from `hb_ot_shaper_categorize`: the old-spec Indic, Myanmar,
-    // and USE-family complex shapers only run if the font actually declares
-    // GSUB support for the requested script - a font that only ships
-    // DFLT/latn (or, for Myanmar, the pre-mym2 'mymr' tag) gets the plain
-    // default shaper instead, even though the buffer's Unicode script maps
-    // to one of these. Skipping this check made the USE shaper's broken-
-    // cluster/dotted-circle logic fire on fonts with no script-specific
-    // GSUB table at all (e.g. a Tai Viet vowel sign in a font whose GSUB
-    // only has DFLT/cyrl/dev2/grek/latn), diverging from hb/browsers.
-    // A font with no GSUB table at all (or none of the requested/DFLT/latn
-    // scripts present) resolves to `null` here, matching hb's HB_TAG_NONE -
-    // that's NOT the same as the font *having* a GSUB table that explicitly
-    // resolves to DFLT/latn, so `null` must NOT gate off the complex shaper
-    // (a bare cmap-only test font still gets Indic/USE reordering in hb).
-    const gsub_script = map_builder.chosen_script[0];
-    const gsub_is_dflt_or_latn = gsub_script != null and
-        (std.mem.eql(u8, &gsub_script.?, &tag_dflt_script) or
-            std.mem.eql(u8, &gsub_script.?, &tag_latn_script));
-
-    const indic_config = if (gsub_is_dflt_or_latn) null else findIndicConfig(script_tags);
-    const is_myanmar = containsTag(script_tags, mym2_script_tag) and
-        !gsub_is_dflt_or_latn and
-        !(gsub_script != null and std.mem.eql(u8, &gsub_script.?, &tag_mymr_script));
-    var is_use = false;
-    if (!gsub_is_dflt_or_latn) {
-        for (use_script_tags) |tag| {
-            if (containsTag(script_tags, tag)) {
-                is_use = true;
-                break;
-            }
-        }
-    }
-    var is_use_arabic_joining = false;
-    for (use_mod.use_arabic_joining_script_tags) |tag| {
-        if (containsTag(script_tags, tag)) {
-            is_use_arabic_joining = true;
-            break;
-        }
-    }
-    if (is_hangul) try collectFeaturesHangul(&map_builder);
-    if (is_arabic) try collectFeaturesArabic(&map_builder);
-    if (indic_config != null) try collectFeaturesIndic(&map_builder);
-    if (is_khmer) try collectFeaturesKhmer(&map_builder);
-    if (is_myanmar) try collectFeaturesMyanmar(&map_builder);
-    if (is_use) try collectFeaturesUse(&map_builder);
-    for (default_features) |tag| try map_builder.enableFeature(tag, .{ .global = true }, 1);
-    for (extra_features) |feature| try map_builder.enableFeature(feature.tag, .{}, feature.value);
-    if (is_hangul) try overrideFeaturesHangul(&map_builder);
-    if (is_khmer) try overrideFeaturesKhmer(&map_builder);
-    if (indic_config != null) try map_builder.disableFeature(tag_liga);
-    var map = try map_builder.compile(allocator);
-    defer map.deinit(allocator);
+    const map = plan.map;
+    const cmap = plan.cmap;
+    const indic_config = plan.indic_config;
+    const is_hangul = plan.is_hangul;
+    const is_arabic = plan.is_arabic;
+    const is_thai = plan.is_thai;
+    const is_lao = plan.is_lao;
+    const is_khmer = plan.is_khmer;
+    const is_myanmar = plan.is_myanmar;
+    const is_use = plan.is_use;
+    const is_use_arabic_joining = plan.is_use_arabic_joining;
 
     // hb runs the shaper's preprocess_text (Hangul syllable decompose/
     // compose, Thai SARA AM reorder/PUA fallback - see those shapers'
@@ -379,7 +520,7 @@ pub fn shapeBidiParagraphVaried(
     extra_features: []const Feature,
     normalized_coords: []const f32,
 ) (parsing.Font.ParseError || unicode.Bidi.Error || error{OutOfMemory})!Buffer {
-    return shapeBidiParagraphImpl(allocator, &.{font}, codepoints, base_direction, script_tags, language_tags, extra_features, normalized_coords, null, null);
+    return shapeBidiParagraphImpl(allocator, &.{font}, codepoints, base_direction, script_tags, language_tags, extra_features, normalized_coords, null, null, null);
 }
 
 /// Result of `shapeBidiParagraphWithFallback`: `buffer` in visual order,
@@ -415,11 +556,12 @@ pub fn shapeBidiParagraphWithFallback(
     language_tags: []const Tag,
     extra_features: []const Feature,
     item: ?Item,
+    plans: ?Plans,
 ) (parsing.Font.ParseError || unicode.Bidi.Error || error{OutOfMemory})!BidiFallbackResult {
     var font_indices: std.ArrayList(usize) = .empty;
     errdefer font_indices.deinit(allocator);
     try font_indices.ensureTotalCapacityPrecise(allocator, codepoints.len);
-    const buffer = try shapeBidiParagraphImpl(allocator, fonts, codepoints, base_direction, script_tags, language_tags, extra_features, &.{}, &font_indices, item);
+    const buffer = try shapeBidiParagraphImpl(allocator, fonts, codepoints, base_direction, script_tags, language_tags, extra_features, &.{}, &font_indices, item, plans);
     return .{ .buffer = buffer, .font_indices = try font_indices.toOwnedSlice(allocator) };
 }
 
@@ -440,6 +582,7 @@ fn shapeBidiParagraphImpl(
     normalized_coords: []const f32,
     font_indices_out: ?*std.ArrayList(usize),
     item: ?Item,
+    plans: ?Plans,
 ) (parsing.Font.ParseError || unicode.Bidi.Error || error{OutOfMemory})!Buffer {
     var result = Buffer.init(allocator);
     errdefer result.deinit();
@@ -532,7 +675,7 @@ fn shapeBidiParagraphImpl(
         const run_direction: Direction = if (run.level % 2 == 1) .right_to_left else .left_to_right;
         var ot_tags_storage: [2]Tag = undefined;
         const run_script_tags: []const Tag = if (script_tags.len != 0) script_tags else unicode.openTypeScriptTags(run.script, &ot_tags_storage);
-        run_buffers[i] = try shapeImpl(allocator, fonts[run.font_index], codepoints[run.start..run.end], run_direction, run_script_tags, language_tags, extra_features, normalized_coords, null);
+        run_buffers[i] = try shapeImpl(allocator, fonts[run.font_index], codepoints[run.start..run.end], run_direction, run_script_tags, language_tags, extra_features, normalized_coords, null, plans);
         run_buffers_made += 1;
         for (run_buffers[i].info.items) |*info| info.cluster += @intCast(run.start);
         run_levels[i] = run.level;

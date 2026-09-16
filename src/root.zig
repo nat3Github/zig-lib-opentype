@@ -22,6 +22,8 @@ pub const PositionedGlyph = render.PositionedGlyph;
 pub const EndMetric = shaping.EndMetric;
 pub const Buffer = shaping.Buffer;
 pub const BidiFallbackResult = shaping.BidiFallbackResult;
+pub const PlanCache = shaping.PlanCache;
+pub const Plans = shaping.Plans;
 pub const Item = shaping.Item;
 pub const Feature = shaping.Feature;
 

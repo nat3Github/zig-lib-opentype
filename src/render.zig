@@ -41,6 +41,16 @@ pub const RenderedGlyph = struct {
     }
 };
 
+/// `Renderer.glyphBounds`' result: the same `width`/`rows`/`left`/`top` the
+/// `RenderedGlyph` bitmap would carry, with no pixels behind them.
+pub const GlyphBounds = struct {
+    width: u32,
+    rows: u32,
+    left: i32,
+    top: i32,
+    is_color: bool,
+};
+
 pub const PositionedGlyph = struct {
     bitmap: rasterization.BitmapRgba8bit,
     origin_x: i32,
@@ -304,12 +314,32 @@ pub const Renderer = struct {
         return null;
     }
 
+    /// Metrics-only callers get the grid-fit box the rasterizer computes
+    /// before scan conversion; the coverage-contrast pass and the pixel
+    /// allocation only happen when `want_pixels` is set.
+    fn finishOutlineMask(
+        self: Renderer,
+        mask: rasterization.Bitmap8bit,
+        output_allocator: std.mem.Allocator,
+        want_pixels: bool,
+    ) std.mem.Allocator.Error!rasterization.Bitmap8bit {
+        if (!want_pixels) return .{
+            .width = mask.width,
+            .rows = mask.rows,
+            .left = mask.left,
+            .top = mask.top,
+            .pixels_row_major = rasterization.Bitmap8bit.empty.pixels_row_major,
+        };
+        return self.contrastedCoverage(mask, output_allocator);
+    }
+
     fn renderOutline(
         self: *Renderer,
         glyph_id: u16,
         phase: rasterization.SubpixelOffset,
         scratch_allocator: std.mem.Allocator,
         output_allocator: std.mem.Allocator,
+        want_pixels: bool,
     ) RenderError!rasterization.Bitmap8bit {
         const units_per_em = self.head.units_per_em;
         const vary = self.vary;
@@ -332,9 +362,10 @@ pub const Renderer = struct {
                     units_per_em,
                     self.ppem,
                     phase,
+                    want_pixels,
                 );
                 defer mask.deinit(scratch_allocator);
-                return self.contrastedCoverage(mask, output_allocator);
+                return self.finishOutlineMask(mask, output_allocator, want_pixels);
             }
             const outline = if (vary) try parsing.Table.glyf.outlineVaried(
                 scratch_allocator,
@@ -356,26 +387,26 @@ pub const Renderer = struct {
             );
             defer scratch_allocator.free(outline.points);
             defer scratch_allocator.free(outline.end_points_of_contours);
-            const mask = try rasterization.rasterizeTrueTypeGlyfOutline(scratch_allocator, outline, units_per_em, self.ppem, phase);
+            const mask = try rasterization.rasterizeTrueTypeGlyfOutline(scratch_allocator, outline, units_per_em, self.ppem, phase, want_pixels);
             defer mask.deinit(scratch_allocator);
-            return self.contrastedCoverage(mask, output_allocator);
+            return self.finishOutlineMask(mask, output_allocator, want_pixels);
         } else if (self.cff_context) |ctx| {
             if (self.ppem < cff_hinting_ppem_threshold) {
-                const mask = try rasterization.rasterizeCffOutlineHintedWithContext(scratch_allocator, ctx, glyph_id, units_per_em, self.ppem, phase, true);
+                const mask = try rasterization.rasterizeCffOutlineHintedWithContext(scratch_allocator, ctx, glyph_id, units_per_em, self.ppem, phase, true, want_pixels);
                 defer mask.deinit(scratch_allocator);
-                return self.contrastedCoverage(mask, output_allocator);
+                return self.finishOutlineMask(mask, output_allocator, want_pixels);
             }
             const outline = try ctx.outline(scratch_allocator, glyph_id);
             defer scratch_allocator.free(outline.segments);
-            const mask = try rasterization.rasterizeCffOutline(scratch_allocator, outline, units_per_em, self.ppem, phase);
+            const mask = try rasterization.rasterizeCffOutline(scratch_allocator, outline, units_per_em, self.ppem, phase, want_pixels);
             defer mask.deinit(scratch_allocator);
-            return self.contrastedCoverage(mask, output_allocator);
+            return self.finishOutlineMask(mask, output_allocator, want_pixels);
         } else if (self.cff2_data) |cff2_table| {
             const outline = try parsing.Table.cff2.outline(scratch_allocator, cff2_table, glyph_id);
             defer scratch_allocator.free(outline.segments);
-            const mask = try rasterization.rasterizeCffOutline(scratch_allocator, outline, units_per_em, self.ppem, phase);
+            const mask = try rasterization.rasterizeCffOutline(scratch_allocator, outline, units_per_em, self.ppem, phase, want_pixels);
             defer mask.deinit(scratch_allocator);
-            return self.contrastedCoverage(mask, output_allocator);
+            return self.finishOutlineMask(mask, output_allocator, want_pixels);
         } else {
             return error.InvalidTableFormat;
         }
@@ -453,8 +484,40 @@ pub const Renderer = struct {
             }
         }
 
-        const bitmap = try self.renderOutline(glyph_id, phase, scratch_allocator, output_allocator);
+        const bitmap = try self.renderOutline(glyph_id, phase, scratch_allocator, output_allocator, true);
         return .{ .bitmap = bitmap, .is_color = false };
+    }
+
+    /// Just the box `renderGlyph` would produce, without scan-converting the
+    /// glyph or allocating its pixels -- for callers that lay out text (or
+    /// pack an atlas) before deciding which glyphs actually get drawn. The
+    /// box is computed by the same grid fit the rasterizer uses, so it is
+    /// identical to the one `renderGlyph` reports.
+    /// Color glyphs (COLR/sbix/CBDT) have no outline to measure, so they are
+    /// rasterized into `scratch_allocator` and thrown away; only outline
+    /// fonts actually skip the work.
+    pub fn glyphBounds(
+        self: *Renderer,
+        glyph_id: u16,
+        phase: rasterization.SubpixelOffset,
+        scratch_allocator: std.mem.Allocator,
+    ) RenderError!GlyphBounds {
+        if (glyph_id >= self.num_glyphs) return .{ .width = 0, .rows = 0, .left = 0, .top = 0, .is_color = false };
+
+        if (self.colr_data != null or self.sbix_data != null or self.cbdt_data != null) {
+            const rendered = try self.renderGlyph(glyph_id, phase, scratch_allocator, scratch_allocator);
+            defer rendered.deinit(scratch_allocator);
+            return .{
+                .width = rendered.bitmap.width,
+                .rows = rendered.bitmap.rows,
+                .left = rendered.bitmap.left,
+                .top = rendered.bitmap.top,
+                .is_color = rendered.is_color,
+            };
+        }
+
+        const mask = try self.renderOutline(glyph_id, phase, scratch_allocator, scratch_allocator, false);
+        return .{ .width = mask.width, .rows = mask.rows, .left = mask.left, .top = mask.top, .is_color = false };
     }
 
     /// Rasterizes and positions every glyph in a shaped `buffer`, walking

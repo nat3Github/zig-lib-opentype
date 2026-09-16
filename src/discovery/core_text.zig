@@ -380,24 +380,11 @@ fn piecewiseLinearFindIndex(query: f32, mapping: []const f32) f32 {
 }
 
 /// Resolves which face of `path` a descriptor names. CoreText's matching
-/// API has no face-index attribute, so for a `.ttc` this opens the file and
-/// matches the descriptor's PostScript name (`kCTFontNameAttribute`)
-/// against each face's `name` table (nameID 6) — same approach as
-/// font-kit's `create_handles_from_core_text_collection`. Non-collection
-/// fonts are always face 0, no file access needed.
+/// API has no face-index attribute, so for a `.ttc` this matches the
+/// descriptor's PostScript name (`kCTFontNameAttribute`) against each
+/// face's `name` table (nameID 6) — same approach as font-kit's
+/// `create_handles_from_core_text_collection`.
 fn resolveFontIndex(desc: c.CTFontDescriptorRef, path: []const u8, allocator: std.mem.Allocator) u32 {
-    var threaded: std.Io.Threaded = .init(allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    var magic: [4]u8 = undefined;
-    {
-        var file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return 0;
-        defer file.close(io);
-        const n = file.readPositionalAll(io, &magic, 0) catch return 0;
-        if (n < 4 or !std.mem.eql(u8, &magic, "ttcf")) return 0;
-    }
-
     const postscript_ref = c.CTFontDescriptorCopyAttribute(desc, c.kCTFontNameAttribute) orelse return 0;
     const postscript_cfstr: c.CFStringRef = @ptrCast(@alignCast(postscript_ref));
     defer c.CFRelease(postscript_cfstr);
@@ -405,20 +392,10 @@ fn resolveFontIndex(desc: c.CTFontDescriptorRef, path: []const u8, allocator: st
     if (c.CFStringGetCString(postscript_cfstr, &postscript_buf, postscript_buf.len, c.kCFStringEncodingUTF8) == 0) return 0;
     const postscript_name = std.mem.sliceTo(&postscript_buf, 0);
 
-    // Matches Font.zig's system_font_size_limit -- Apple Color Emoji.ttc is
-    // ~180MB; a lower cap here silently falls back to face index 0 (wrong
-    // face, e.g. a Latin/Roman face instead of the matched script's face)
-    // while the actual font bytes load fine downstream with the correct cap.
-    const data = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(256 * 1024 * 1024)) catch return 0;
-    defer allocator.free(data);
-
-    const collection = parsing.Collection.parse(allocator, data) catch return 0;
-    defer collection.deinit(allocator);
-    var name_buf: [256]u8 = undefined;
-    for (collection.fonts, 0..) |font, index| {
-        const name_data = font.tableData(.{ 'n', 'a', 'm', 'e' }) orelse continue;
-        const candidate = parsing.Table.name.postscriptName(name_data, &name_buf) orelse continue;
-        if (std.mem.eql(u8, candidate, postscript_name)) return @intCast(index);
-    }
-    return 0;
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return 0;
+    defer file.close(io);
+    return discovery.collectionFaceIndexByPostscriptName(io, file, postscript_name, allocator);
 }

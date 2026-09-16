@@ -215,6 +215,7 @@ pub fn renderScaledPoints(
     allocator: std.mem.Allocator,
     points: []ScaledPoint,
     end_points_of_contours: []const u16,
+    want_pixels: bool,
 ) RasterizeError!Bitmap8bit {
     var cbox_min_x: i32 = std.math.maxInt(i32);
     var cbox_min_y: i32 = std.math.maxInt(i32);
@@ -235,6 +236,13 @@ pub fn renderScaledPoints(
     const height = fit.height;
     if (width <= 0 or height <= 0) {
         return .{ .width = 0, .rows = 0, .left = x_min_px, .top = y_max_px, .pixels_row_major = try allocator.alloc(u8, 0) };
+    }
+
+    // Grid fit above is the whole answer for a metrics-only caller; the
+    // returned `width`/`rows` are the real dimensions, but `pixels_row_major`
+    // is empty rather than `width * rows` bytes.
+    if (!want_pixels) {
+        return .{ .width = @intCast(width), .rows = @intCast(height), .left = x_min_px, .top = y_max_px, .pixels_row_major = try allocator.alloc(u8, 0) };
     }
 
     for (points) |*sp| {
@@ -272,7 +280,7 @@ pub fn renderScaledPoints(
 /// and sweeps them into an AA coverage bitmap — the CFF/cubic analogue of
 /// `renderScaledPoints`, shared by `rasterizeCff` and `rasterizeCffHinted`
 /// once each has produced its own scaled segment list.
-pub fn renderScaledCffSegments(allocator: std.mem.Allocator, segments: []IScaledCffSegment) RasterizeError!Bitmap8bit {
+pub fn renderScaledCffSegments(allocator: std.mem.Allocator, segments: []IScaledCffSegment, want_pixels: bool) RasterizeError!Bitmap8bit {
     var cbox_min_x: i32 = std.math.maxInt(i32);
     var cbox_min_y: i32 = std.math.maxInt(i32);
     var cbox_max_x: i32 = std.math.minInt(i32);
@@ -297,6 +305,11 @@ pub fn renderScaledCffSegments(allocator: std.mem.Allocator, segments: []IScaled
     const height = fit.height;
     if (width <= 0 or height <= 0) {
         return .{ .width = 0, .rows = 0, .left = x_min_px, .top = y_max_px, .pixels_row_major = try allocator.alloc(u8, 0) };
+    }
+
+    // See `renderScaledPoints`: metrics-only callers stop at the grid fit.
+    if (!want_pixels) {
+        return .{ .width = @intCast(width), .rows = @intCast(height), .left = x_min_px, .top = y_max_px, .pixels_row_major = try allocator.alloc(u8, 0) };
     }
 
     for (segments) |*segment| {
