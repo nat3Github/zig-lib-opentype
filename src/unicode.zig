@@ -2146,27 +2146,34 @@ pub fn scriptIsWeak(script: [4]u8) bool {
 /// matching). `out` is parallel to `codepoints`.
 pub fn resolveScripts(codepoints: []const u21, out: [][4]u8) void {
     std.debug.assert(out.len >= codepoints.len);
+    for (codepoints, 0..) |cp, i| out[i] = scriptOf(cp);
+    resolveScriptsInPlace(out[0..codepoints.len]);
+}
+
+/// Same resolution as `resolveScripts` for a caller that already holds each
+/// codepoint's raw `scriptOf` value, so the lookup is not repeated.
+/// `scripts` enters raw and leaves resolved.
+pub fn resolveScriptsInPlace(scripts: [][4]u8) void {
     var prev_strong: ?[4]u8 = null;
-    for (codepoints, 0..) |cp, i| {
-        const raw = scriptOf(cp);
-        if (!scriptIsWeak(raw)) {
-            prev_strong = raw;
-            out[i] = raw;
-        } else if (prev_strong) |s| {
-            out[i] = s;
-        } else {
-            out[i] = raw;
+    for (scripts) |*script| {
+        if (!scriptIsWeak(script.*)) {
+            prev_strong = script.*;
+        } else if (prev_strong) |strong| {
+            script.* = strong;
         }
     }
+    // A weak entry that the forward pass already filled holds a strong
+    // script from its left, so treating it as strong here is harmless: an
+    // entry still weak can only precede the first strong one, and every
+    // entry before that is still weak too.
     var next_strong: ?[4]u8 = null;
-    var i = codepoints.len;
+    var i = scripts.len;
     while (i > 0) {
         i -= 1;
-        const raw = scriptOf(codepoints[i]);
-        if (!scriptIsWeak(raw)) {
-            next_strong = out[i];
-        } else if (scriptIsWeak(out[i])) {
-            if (next_strong) |s| out[i] = s;
+        if (!scriptIsWeak(scripts[i])) {
+            next_strong = scripts[i];
+        } else if (next_strong) |strong| {
+            scripts[i] = strong;
         }
     }
 }

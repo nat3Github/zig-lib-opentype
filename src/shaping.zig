@@ -607,14 +607,12 @@ fn shapeBidiParagraphImpl(
 
     const classes = try allocator.alloc(unicode.BidiClass, codepoints.len);
     defer allocator.free(classes);
-    for (codepoints, 0..) |cp, i| classes[i] = unicode.BidiClass.of(cp);
-
-    const levels = try unicode.Bidi.paragraphEmbeddingLevels(allocator, classes, base_direction, codepoints);
-    defer allocator.free(levels);
 
     const resolved_scripts = try allocator.alloc([4]u8, codepoints.len);
     defer allocator.free(resolved_scripts);
-    unicode.resolveScripts(codepoints, resolved_scripts);
+
+    const script_is_strong = try allocator.alloc(bool, codepoints.len);
+    defer allocator.free(script_is_strong);
 
     const cmaps = try allocator.alloc(?parsing.Table.cmap.Resolved, fonts.len);
     defer allocator.free(cmaps);
@@ -625,14 +623,23 @@ fn shapeBidiParagraphImpl(
     // `itemizeByFontCoverage`.
     const font_of = try allocator.alloc(usize, codepoints.len);
     defer allocator.free(font_of);
+
     {
-        var prev: usize = 0;
+        var previous_font_index: usize = 0;
         for (codepoints, 0..) |cp, i| {
-            const fi = coverageFontIndex(cmaps, cp) orelse prev;
-            font_of[i] = fi;
-            prev = fi;
+            classes[i] = unicode.BidiClass.of(cp);
+            const raw_script = unicode.scriptOf(cp);
+            resolved_scripts[i] = raw_script;
+            script_is_strong[i] = !unicode.scriptIsWeak(raw_script);
+            const font_index = coverageFontIndex(cmaps, cp) orelse previous_font_index;
+            font_of[i] = font_index;
+            previous_font_index = font_index;
         }
     }
+    unicode.resolveScriptsInPlace(resolved_scripts);
+
+    const levels = try unicode.Bidi.paragraphEmbeddingLevels(allocator, classes, base_direction, codepoints);
+    defer allocator.free(levels);
 
     // Itemize by resolved Unicode script (Common/Inherited/Unknown absorbed
     // into adjacent strong scripts) intersecting bidi level and fallback
