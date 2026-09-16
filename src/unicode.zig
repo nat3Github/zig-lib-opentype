@@ -404,6 +404,17 @@ fn resolveIsolatingRunSequence(
     }
 }
 
+// Under a level-0 paragraph every one of these resolves to level 0: no
+// strong RTL, no numbers (I1 lifts EN/AN by two even at an even level) and
+// no explicit directional control that could push the stack off level 0.
+fn everyClassResolvesToLevelZero(classes: []const BidiClass) bool {
+    for (classes) |c| switch (c) {
+        .l, .es, .et, .cs, .nsm, .bn, .b, .s, .ws, .on => {},
+        .r, .al, .en, .an, .lre, .lro, .rle, .rlo, .pdf, .lri, .rli, .fsi, .pdi => return false,
+    };
+    return true;
+}
+
 pub const Bidi = struct {
     pub const ParagraphDirection = enum { auto, ltr, rtl };
 
@@ -426,6 +437,11 @@ pub const Bidi = struct {
         const result = try allocator.alloc(u8, n);
         errdefer allocator.free(result);
         if (n == 0) return result;
+
+        if (base_direction != .rtl and everyClassResolvesToLevelZero(classes)) {
+            @memset(result, 0);
+            return result;
+        }
 
         var arena_state = std.heap.ArenaAllocator.init(allocator);
         defer arena_state.deinit();
