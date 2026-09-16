@@ -1125,6 +1125,7 @@ fn applyReverseChainSingleSubst(
 
     const new_gid = try reader.u16At(sub_base + @as(usize, index) * 2);
     buffer.info.items[buffer.idx].codepoint = new_gid;
+    buffer.digest.add(new_gid);
     return true;
 }
 
@@ -1472,6 +1473,51 @@ fn isReverseLookup(layout: parsing.Table.Layout, lk: parsing.Table.Layout.Lookup
     return unwrapped.lookup_type == gsub_tag_reverse_chain_single;
 }
 
+/// Ports hb's per-lookup `hb_set_digest_t` (the lookup accelerator in
+/// hb-ot-layout-gsubgpos.hh): the union of each subtable's first input
+/// Coverage, built once per plan and probed before walking the buffer for a
+/// lookup. Most lookups in a large font cover nothing in a given run.
+///
+/// The digest may only over-approximate: anything unreadable here yields a
+/// full digest, which filters nothing and leaves the walk exactly as it was.
+pub fn lookupDigest(layout: parsing.Table.Layout, lookup_index: u16, table_index: u1) common.Digest {
+    const extension_tag: u16 = if (table_index == 0) gsub_tag_extension else gpos_tag_extension;
+    const context_tag: u16 = if (table_index == 0) gsub_tag_context else gpos_tag_context;
+    const chain_context_tag: u16 = if (table_index == 0) gsub_tag_chain_context else gpos_tag_chain_context;
+
+    var digest: common.Digest = .{};
+    const lk = layout.lookupAt(lookup_index) catch return .full();
+    const lookup_type = lk.lookupType() catch return .full();
+    const sub_count = lk.subtableCount() catch return .full();
+
+    var si: u16 = 0;
+    while (si < sub_count) : (si += 1) {
+        const sub_off = lk.subtableOffset(si) catch return .full();
+        var reader = parsing.Table.Layout.SubtableReader{ .data = layout.data, .offset = sub_off };
+        var effective_type = lookup_type;
+        if (effective_type == extension_tag) {
+            const unwrapped = (unwrapExtension(reader, extension_tag) catch return .full()) orelse return .full();
+            effective_type = unwrapped.lookup_type;
+            reader = .{ .data = layout.data, .offset = unwrapped.sub_off };
+        }
+        const format = reader.u16At(0) catch return .full();
+        // Every subtable format keeps its input Coverage at offset 2 except
+        // Context/ChainContext format 3, where offset 2 is a glyph count and
+        // the coverage offsets follow the counts.
+        const coverage_rel: usize = if (format == 3 and (effective_type == context_tag or effective_type == chain_context_tag)) blk: {
+            const offs = (if (effective_type == context_tag)
+                readContextFormat3Offsets(reader)
+            else
+                readChainContextFormat3Offsets(reader)) catch return .full();
+            if (offs.input_count == 0) return .full();
+            break :blk offs.input_base;
+        } else 2;
+        const cov = reader.coverageAt(coverage_rel) catch return .full();
+        cov.collectRanges(&digest) catch return .full();
+    }
+    return digest;
+}
+
 fn applyLookup(
     layout: parsing.Table.Layout,
     entry: LookupMapEntry,
@@ -1490,7 +1536,7 @@ fn applyLookup(
         var idx = buffer.len() - 1;
         while (true) {
             buffer.idx = idx;
-            if (buffer.info.items[idx].mask & entry.mask != 0) {
+            if (buffer.info.items[idx].mask & entry.mask != 0 and entry.digest.mayHave(buffer.info.items[idx].codepoint)) {
                 var si: u16 = 0;
                 while (si < sub_count) : (si += 1) {
                     const sub_off = try lk.subtableOffset(si);
@@ -1507,7 +1553,7 @@ fn applyLookup(
     if (table_index == 0) buffer.clearOutput();
     while (buffer.idx < buffer.len()) {
         var applied = false;
-        if (buffer.info.items[buffer.idx].mask & entry.mask != 0) {
+        if (buffer.info.items[buffer.idx].mask & entry.mask != 0 and entry.digest.mayHave(buffer.info.items[buffer.idx].codepoint)) {
             var si: u16 = 0;
             while (si < sub_count) : (si += 1) {
                 const sub_off = try lk.subtableOffset(si);
@@ -1534,7 +1580,12 @@ pub fn applyTable(
     const tag = if (table_index == 0) table_tag_gsub else table_tag_gpos;
     const data = font.tableData(tag) orelse return;
     const layout = parsing.Table.Layout{ .data = data };
+    buffer.updateDigest();
     for (map.getStageLookups(table_index, 0)) |entry| {
+        // Substitutions during this pass only ever add glyphs to the buffer
+        // digest, so a lookup skipped here could not have matched earlier in
+        // the pass either.
+        if (!entry.digest.mayIntersect(buffer.digest)) continue;
         try applyLookup(layout, entry, gdef, buffer, table_index, direction);
     }
 }

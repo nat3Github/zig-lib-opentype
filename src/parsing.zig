@@ -3253,6 +3253,33 @@ pub const Table = struct {
                 return c.readU16();
             }
 
+            /// Feeds every covered glyph range to `sink.addRange(first, last)`
+            /// (comptime duck-typed, no vtable). Used to build the set digests
+            /// that let a shaping pass skip lookups it cannot match.
+            pub fn collectRanges(self: Coverage, sink: anytype) Font.ParseError!void {
+                const format = try self.u16At(self.offset);
+                const count = try self.u16At(self.offset + 2);
+                switch (format) {
+                    1 => {
+                        var i: u16 = 0;
+                        while (i < count) : (i += 1) {
+                            const g = try self.u16At(self.offset + 4 + @as(usize, i) * 2);
+                            sink.addRange(g, g);
+                        }
+                    },
+                    2 => {
+                        var i: u16 = 0;
+                        while (i < count) : (i += 1) {
+                            const rec_pos = self.offset + 4 + @as(usize, i) * 6;
+                            const start = try self.u16At(rec_pos);
+                            const end = try self.u16At(rec_pos + 2);
+                            if (start <= end) sink.addRange(start, end);
+                        }
+                    },
+                    else => return error.InvalidTableFormat,
+                }
+            }
+
             pub fn get(self: Coverage, glyph: u16) Font.ParseError!?u16 {
                 const format = try self.u16At(self.offset);
                 switch (format) {

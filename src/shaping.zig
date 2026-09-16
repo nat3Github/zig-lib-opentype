@@ -32,6 +32,7 @@ pub const GlyphMetrics = metrics_mod.GlyphMetrics;
 pub const measureGlyphRange = metrics_mod.measureGlyphRange;
 
 pub const Map = map_mod.Map;
+pub const Digest = common.Digest;
 pub const MapBuilder = map_mod.MapBuilder;
 pub const MapFeatureFlags = map_mod.MapFeatureFlags;
 pub const FeatureMapEntry = map_mod.FeatureMapEntry;
@@ -187,6 +188,18 @@ pub fn shapeWithContext(
 /// selects. None of it depends on the text, so a caller shaping many runs
 /// against the same font can build it once and reuse it -- hb's
 /// `hb_shape_plan_t`.
+fn fillLookupDigests(font: parsing.Font, map: *Map) void {
+    inline for (0..2) |table_index| {
+        const tag = if (table_index == 0) map_mod.table_tag_gsub else map_mod.table_tag_gpos;
+        if (font.tableData(tag)) |data| {
+            const layout = parsing.Table.Layout{ .data = data };
+            for (map.lookups[table_index].items) |*entry| {
+                entry.digest = apply_mod.lookupDigest(layout, entry.index, table_index);
+            }
+        }
+    }
+}
+
 pub const Plan = struct {
     map: Map,
     cmap: ?parsing.Table.cmap.Resolved,
@@ -269,8 +282,12 @@ pub const Plan = struct {
         if (is_khmer) try overrideFeaturesKhmer(&map_builder);
         if (indic_config != null) try map_builder.disableFeature(tag_liga);
 
+        var map = try map_builder.compile(allocator);
+        errdefer map.deinit(allocator);
+        fillLookupDigests(font, &map);
+
         return .{
-            .map = try map_builder.compile(allocator),
+            .map = map,
             .cmap = cmap,
             .indic_config = indic_config,
             .is_hangul = is_hangul,

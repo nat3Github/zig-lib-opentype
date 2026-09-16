@@ -123,8 +123,71 @@ fn clusterGroupFunc(a: GlyphInfo, b: GlyphInfo) bool {
     return a.cluster == b.cluster;
 }
 
+/// Ported from vendor/harfbuzz/src/hb-set-digest.hh: three bits-pattern
+/// filters over glyph ids, ANDed together to answer "might this set contain
+/// g?". Approximate on the positive side only -- a false positive costs a
+/// wasted lookup walk, a false negative would silently drop a substitution,
+/// so every path that puts a glyph into a buffer has to `add` it.
+pub const Digest = struct {
+    masks: [n]u64 = @splat(0),
+
+    const shifts = [_]u5{ 4, 0, 6 };
+    const n = shifts.len;
+    const mb1: u32 = 63;
+
+    pub fn add(self: *Digest, glyph: u32) void {
+        inline for (shifts, 0..) |shift, i| {
+            self.masks[i] |= @as(u64, 1) << @intCast((glyph >> shift) & mb1);
+        }
+    }
+
+    pub fn addRange(self: *Digest, first: u32, last: u32) void {
+        inline for (shifts, 0..) |shift, i| {
+            if ((last >> shift) - (first >> shift) >= mb1) {
+                self.masks[i] = std.math.maxInt(u64);
+            } else {
+                const ma = @as(u64, 1) << @intCast((first >> shift) & mb1);
+                const mb = @as(u64, 1) << @intCast((last >> shift) & mb1);
+                self.masks[i] |= mb +% (mb -% ma) -% @intFromBool(mb < ma);
+            }
+        }
+    }
+
+    pub fn unionWith(self: *Digest, other: Digest) void {
+        inline for (0..n) |i| self.masks[i] |= other.masks[i];
+    }
+
+    pub fn mayHave(self: Digest, glyph: u32) bool {
+        inline for (shifts, 0..) |shift, i| {
+            if (self.masks[i] & (@as(u64, 1) << @intCast((glyph >> shift) & mb1)) == 0) return false;
+        }
+        return true;
+    }
+
+    pub fn mayIntersect(self: Digest, other: Digest) bool {
+        inline for (0..n) |i| {
+            if (self.masks[i] & other.masks[i] == 0) return false;
+        }
+        return true;
+    }
+
+    pub fn clear(self: *Digest) void {
+        self.masks = @splat(0);
+    }
+
+    /// Matches everything -- the safe answer whenever a lookup's coverage
+    /// could not be read, so a malformed table degrades to "no filtering"
+    /// instead of dropping lookups.
+    pub fn full() Digest {
+        return .{ .masks = @splat(std.math.maxInt(u64)) };
+    }
+};
+
 pub const Buffer = struct {
     allocator: std.mem.Allocator,
+    /// Glyph ids currently in `info`/`out_info`; ANDed against a lookup's own
+    /// digest to skip lookups that cannot match anything in this run.
+    digest: Digest = .{},
     info: std.ArrayList(GlyphInfo) = .empty,
     out_info: std.ArrayList(GlyphInfo) = .empty,
     pos: std.ArrayList(GlyphPosition) = .empty,
@@ -214,6 +277,7 @@ pub const Buffer = struct {
             var glyph_info = orig_info;
             glyph_info.codepoint = gid;
             self.out_info.appendAssumeCapacity(glyph_info);
+            self.digest.add(gid);
         }
 
         self.idx += num_in;
@@ -231,6 +295,17 @@ pub const Buffer = struct {
 
     pub fn outputInfo(self: *Buffer, glyph_info: GlyphInfo) !void {
         try self.out_info.append(self.allocator, glyph_info);
+        self.digest.add(glyph_info.codepoint);
+    }
+
+    /// Rebuilds `digest` from the glyphs the buffer currently holds -- hb's
+    /// `hb_buffer_t::update_digest`, called at the start of each GSUB/GPOS
+    /// pass so stages that rewrite `codepoint` in place (glyph mapping, Thai
+    /// PUA shaping, composition, ignorable hiding) are accounted for.
+    pub fn updateDigest(self: *Buffer) void {
+        self.digest.clear();
+        for (self.info.items) |glyph_info| self.digest.add(glyph_info.codepoint);
+        for (self.out_info.items) |glyph_info| self.digest.add(glyph_info.codepoint);
     }
 
     /// Copies the glyph at idx to output without advancing idx.

@@ -79,6 +79,10 @@ pub const FeatureMapEntry = struct {
 pub const LookupMapEntry = struct {
     index: u16,
     mask: u32,
+    /// Union of this lookup's subtable Coverages; filled by `shaping.Plan`
+    /// (the map builder has no reason to walk subtables). Left full so an
+    /// unfilled entry filters nothing.
+    digest: common.Digest = common.Digest.full(),
     auto_zwnj: bool = true,
     auto_zwj: bool = true,
     random: bool = false,
@@ -318,6 +322,7 @@ pub const MapBuilder = struct {
                 list.items[j] = entry;
             } else {
                 list.items[j].mask |= entry.mask;
+                list.items[j].digest.unionWith(entry.digest);
                 list.items[j].auto_zwnj = list.items[j].auto_zwnj and entry.auto_zwnj;
                 list.items[j].auto_zwj = list.items[j].auto_zwj and entry.auto_zwj;
             }
