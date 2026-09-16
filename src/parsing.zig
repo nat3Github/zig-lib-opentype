@@ -50,6 +50,27 @@ pub const Font = struct {
         if (self.owned_data) alloc.free(self.data);
     }
 
+    pub const max_directory_tables = 256;
+    pub const max_directory_size = 12 + max_directory_tables * 16;
+
+    /// Looks `tag` up in a standalone prefix of an sfnt table directory
+    /// (at most `max_directory_size` bytes), without the rest of the font.
+    /// The returned range is unchecked: the caller reads it from its source.
+    pub fn findTableInDirectory(directory: []const u8, tag: Tag) ?TableRecord {
+        var cursor = Cursor{ .data = directory };
+        if (!isSfntVersion(cursor.readU32() catch return null)) return null;
+        const num_tables = @min(cursor.readU16() catch return null, max_directory_tables);
+        cursor.skip(6) catch return null;
+        for (0..num_tables) |_| {
+            const record_tag = cursor.readBytes(4) catch return null;
+            cursor.skip(4) catch return null;
+            const offset = cursor.readU32() catch return null;
+            const length = cursor.readU32() catch return null;
+            if (std.mem.eql(u8, record_tag, &tag)) return .{ .tag = tag, .offset = offset, .length = length };
+        }
+        return null;
+    }
+
     pub fn tableData(self: Font, tag: Tag) ?[]const u8 {
         for (self.table_records) |rec| {
             if (!std.mem.eql(u8, &rec.tag, &tag)) continue;
@@ -81,6 +102,19 @@ pub const Collection = struct {
             initialized += 1;
         }
         return .{ .data = bytes, .fonts = fonts };
+    }
+
+    pub const max_faces = 256;
+    pub const max_header_size = 12 + max_faces * 4;
+
+    /// Face directory offsets from a standalone prefix of a `ttcf` header
+    /// (at most `max_header_size` bytes); faces past `max_faces` are ignored.
+    pub fn faceOffsets(header: []const u8, out: *[max_faces]u32) ?[]const u32 {
+        if (header.len < 12 or !std.mem.eql(u8, header[0..4], "ttcf")) return null;
+        const num_fonts = @min(std.mem.readInt(u32, header[8..][0..4], .big), max_faces);
+        if (12 + @as(usize, num_fonts) * 4 > header.len) return null;
+        for (out[0..num_fonts], 0..) |*offset, i| offset.* = std.mem.readInt(u32, header[12 + i * 4 ..][0..4], .big);
+        return out[0..num_fonts];
     }
 
     pub fn deinit(self: Collection, alloc: Allocator) void {
@@ -156,11 +190,13 @@ fn sliceChecked(data: []const u8, offset: u32, len: u32) Font.ParseError![]const
     return data[offset..][0..len];
 }
 
+fn isSfntVersion(version: u32) bool {
+    return version == 0x00010000 or version == 0x4F54544F or version == 0x74727565;
+}
+
 fn parseSfntAt(alloc: Allocator, data: []const u8, directory_start: usize) (Font.ParseError || error{OutOfMemory})!Font {
     var cursor = Cursor{ .data = data, .pos = directory_start };
-    const version = try cursor.readU32();
-    if (version != 0x00010000 and version != 0x4F54544F and version != 0x74727565)
-        return error.InvalidSfntVersion;
+    if (!isSfntVersion(try cursor.readU32())) return error.InvalidSfntVersion;
     const num_tables = try cursor.readU16();
     try cursor.skip(6);
     if (directory_start + 12 + @as(u64, num_tables) * 16 > data.len) return error.InvalidTableDirectory;
@@ -229,13 +265,37 @@ fn parseWoff2(alloc: Allocator, bytes: []const u8) (Font.ParseError || error{Out
         error.OutOfMemory => return error.OutOfMemory,
         error.Corrupt => return error.InvalidWoff2,
     };
-    errdefer alloc.free(result.data);
+    defer alloc.free(result.data);
     defer alloc.free(result.tables);
 
-    const table_records = try alloc.alloc(Font.TableRecord, result.tables.len);
-    for (table_records, result.tables) |*rec, t| rec.* = .{ .tag = t.tag, .offset = t.offset, .length = t.length };
+    const flavor = std.mem.readInt(u32, bytes[4..8], .big);
+    if (!isSfntVersion(flavor)) return error.InvalidWoff2;
+    if (result.tables.len > Font.max_directory_tables) return error.InvalidWoff2;
 
-    return .{ .data = result.data, .table_records = table_records, .owned_data = true };
+    // Assemble a real sfnt, not just the table bytes: `data` outlives this
+    // Font as a reusable font source, so it has to still describe itself
+    // when something reparses it without the original table records.
+    const directory_size = 12 + result.tables.len * 16;
+    const sfnt = try alloc.alloc(u8, directory_size + result.data.len);
+    errdefer alloc.free(sfnt);
+    const table_records = try alloc.alloc(Font.TableRecord, result.tables.len);
+    errdefer alloc.free(table_records);
+
+    std.mem.writeInt(u32, sfnt[0..4], flavor, .big);
+    std.mem.writeInt(u16, sfnt[4..6], @intCast(result.tables.len), .big);
+    @memset(sfnt[6..12], 0); // searchRange/entrySelector/rangeShift: unread by parseSfntAt
+    @memcpy(sfnt[directory_size..], result.data);
+    for (table_records, result.tables, 0..) |*rec, t, i| {
+        const offset: u32 = @intCast(directory_size + t.offset);
+        rec.* = .{ .tag = t.tag, .offset = offset, .length = t.length };
+        const entry = sfnt[12 + i * 16 ..][0..16];
+        entry[0..4].* = t.tag;
+        std.mem.writeInt(u32, entry[4..8], 0, .big); // checksum: unread by parseSfntAt
+        std.mem.writeInt(u32, entry[8..12], offset, .big);
+        std.mem.writeInt(u32, entry[12..16], t.length, .big);
+    }
+
+    return .{ .data = sfnt, .table_records = table_records, .owned_data = true };
 }
 
 pub const Table = struct {
@@ -310,6 +370,10 @@ pub const Table = struct {
     /// by dropping the (always-zero) high byte rather than pulling in a
     /// full UTF-16 decoder.
     pub const name = struct {
+        /// u16 count/offsets can't address past 6 + 65535*12 + 2*65535
+        /// bytes, so a prefix this long loses no name records.
+        pub const max_addressable_size = 1 << 20;
+
         pub fn postscriptName(data: []const u8, buf: []u8) ?[]const u8 {
             return findImpl(data, 6, buf) catch null;
         }
