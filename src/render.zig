@@ -169,10 +169,7 @@ pub const Renderer = struct {
         const head = try parsing.Table.head.parse(head_data);
 
         const maxp_data = font.tableData(.{ 'm', 'a', 'x', 'p' }) orelse return error.InvalidTableFormat;
-        const num_glyphs = (try parsing.Table.maxp.parse(maxp_data)).num_glyphs;
-
-        const normalized = try normalizedCoords(state_allocator, scratch_allocator, font, options.user_coords, ppem);
-        errdefer if (normalized.len != 0) state_allocator.free(normalized);
+        const maxp = try parsing.Table.maxp.parse(maxp_data);
 
         var gvar_header: ?parsing.Table.gvar.Header = null;
         const gvar_data = font.tableData(.{ 'g', 'v', 'a', 'r' }) orelse &.{};
@@ -209,34 +206,10 @@ pub const Renderer = struct {
         }
         errdefer if (cff_context) |ctx| state_allocator.destroy(ctx);
 
-        const vary = gvar_header != null and anyNonDefault(normalized);
-        const glyf_table = font.tableData(.{ 'g', 'l', 'y', 'f' });
-        var max_twilight_points: u16 = 0;
-        var glyf_interp: ?hinting.Interpreter = null;
-        if (options.hint_glyf and glyf_table != null and ppem < glyf_hinting_ppem_threshold and !vary) {
-            if (font.tableData(.{ 'm', 'a', 'x', 'p' })) |maxp_table| {
-                max_twilight_points = (try parsing.Table.maxp.parse(maxp_table)).max_twilight_points;
-            }
-
-            var interp = try hinting.Interpreter.init(state_allocator, .{});
-            errdefer interp.deinit();
-            try interp.runFontProgram(font.tableData(.{ 'f', 'p', 'g', 'm' }) orelse &.{});
-
-            interp.cur_ppem = @intFromFloat(@round(ppem));
-            interp.scale = rasterization.ppemScale(head.units_per_em, ppem);
-            const cvt_data = font.tableData(.{ 'c', 'v', 't', ' ' }) orelse &.{};
-            const scaled_cvt = try rasterization.scaleCvtFwordTableToF26Dot6Pixels(scratch_allocator, cvt_data, head.units_per_em, ppem);
-            defer scratch_allocator.free(scaled_cvt);
-            try interp.setCvt(scaled_cvt);
-            try interp.runCvtProgram(font.tableData(.{ 'p', 'r', 'e', 'p' }) orelse &.{});
-
-            glyf_interp = interp;
-        }
-
-        return .{
+        var renderer: Renderer = .{
             .font = font,
             .head = head,
-            .glyf_data = glyf_table,
+            .glyf_data = font.tableData(.{ 'g', 'l', 'y', 'f' }),
             .loca_data = font.tableData(.{ 'l', 'o', 'c', 'a' }),
             .cff_data = font.tableData(.{ 'C', 'F', 'F', ' ' }),
             .cff_context = cff_context,
@@ -247,18 +220,69 @@ pub const Renderer = struct {
             .cblc_data = font.tableData(.{ 'C', 'B', 'L', 'C' }),
             .cbdt_data = font.tableData(.{ 'C', 'B', 'D', 'T' }),
             .ppem = ppem,
-            .num_glyphs = num_glyphs,
-            .normalized = normalized,
+            .num_glyphs = maxp.num_glyphs,
+            .normalized = &.{},
             .gvar_header = gvar_header,
             .gvar_data = gvar_data,
             .hmtx_data = hmtx_data,
             .number_of_h_metrics = number_of_h_metrics,
             .vmtx_data = vmtx_data,
             .number_of_v_metrics = number_of_v_metrics,
-            .vary = vary,
-            .glyf_interp = glyf_interp,
-            .max_twilight_points = max_twilight_points,
+            .vary = false,
+            .glyf_interp = null,
+            .max_twilight_points = maxp.max_twilight_points,
         };
+        // gvar/cff unwind through their own errdefers above; this covers only
+        // what `setPpem` itself allocates.
+        errdefer {
+            if (renderer.normalized.len != 0) state_allocator.free(renderer.normalized);
+            if (renderer.glyf_interp) |*interp| interp.deinit();
+        }
+
+        try renderer.setPpem(state_allocator, scratch_allocator, ppem, options);
+        return renderer;
+    }
+
+    /// Re-targets an existing `Renderer` at a different ppem, keeping the
+    /// parsed tables, gvar header, CFF context and hinting allocation —
+    /// only the normalized coords (auto-opsz depends on ppem) and the
+    /// hinter's scaled CVT/`prep` state actually depend on it. `options`
+    /// must be the ones `init` was called with. `state_allocator` must be
+    /// the one passed to `init`.
+    pub fn setPpem(
+        self: *Renderer,
+        state_allocator: std.mem.Allocator,
+        scratch_allocator: std.mem.Allocator,
+        ppem: f32,
+        options: RenderOptions,
+    ) (InitError || hinting.Error)!void {
+        const normalized = try normalizedCoords(state_allocator, scratch_allocator, self.font, options.user_coords, ppem);
+        if (self.normalized.len != 0) state_allocator.free(self.normalized);
+        self.normalized = normalized;
+        self.ppem = ppem;
+        self.vary = self.gvar_header != null and anyNonDefault(normalized);
+
+        if (options.hint_glyf and self.glyf_data != null and ppem < glyf_hinting_ppem_threshold and !self.vary) {
+            if (self.glyf_interp == null) self.glyf_interp = try hinting.Interpreter.init(state_allocator, .{});
+            const interp = &self.glyf_interp.?;
+
+            // `fpgm`/`prep` persist storage and FDEFs, so a re-target has to
+            // replay them from a zeroed storage area to land where a freshly
+            // constructed interpreter would.
+            @memset(interp.storage, 0);
+            try interp.runFontProgram(self.font.tableData(.{ 'f', 'p', 'g', 'm' }) orelse &.{});
+
+            interp.cur_ppem = @intFromFloat(@round(ppem));
+            interp.scale = rasterization.ppemScale(self.head.units_per_em, ppem);
+            const cvt_data = self.font.tableData(.{ 'c', 'v', 't', ' ' }) orelse &.{};
+            const scaled_cvt = try rasterization.scaleCvtFwordTableToF26Dot6Pixels(scratch_allocator, cvt_data, self.head.units_per_em, ppem);
+            defer scratch_allocator.free(scaled_cvt);
+            try interp.setCvt(scaled_cvt);
+            try interp.runCvtProgram(self.font.tableData(.{ 'p', 'r', 'e', 'p' }) orelse &.{});
+        } else if (self.glyf_interp) |*interp| {
+            interp.deinit();
+            self.glyf_interp = null;
+        }
     }
 
     /// Converts a raw font-unit value (e.g. an `hhea` ascender or a GPOS
