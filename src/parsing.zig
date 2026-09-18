@@ -86,6 +86,198 @@ pub const Font = struct {
         }
         return null;
     }
+
+    /// Bounds the assembled sfnt by something other than the directory's own
+    /// length fields.
+    pub const max_face_subset_size: u64 = 1 << 28;
+    /// Same, for one `sbix` strike (Apple Color Emoji's largest is 74MiB).
+    pub const max_sbix_strike_size: u64 = 1 << 27;
+
+    pub const FaceSubsetOptions = struct {
+        /// Leave the `sbix` table out of the assembled sfnt. Colour-bitmap
+        /// strikes dominate some system faces -- Apple Color Emoji is 179MiB
+        /// of sbix in a 180MiB face -- and only the strike matching the
+        /// target ppem is ever decoded, so a caller that can supply that one
+        /// strike later (`readSbixStrike`) should not read all nine. The
+        /// table is omitted whole rather than left hollow: a strike list
+        /// pointing at bytes that aren't there reads as a font whose glyphs
+        /// are absent from every strike, which silently rasterizes the wrong
+        /// thing instead of failing.
+        drop_sbix: bool = false,
+    };
+
+    /// Reads face `face_index`'s table directory out of `file`, following the
+    /// `ttcf` header if there is one. Shared by the two readers below, which
+    /// both need the directory and nothing else before they know what to read.
+    fn readFaceDirectory(
+        io: std.Io,
+        file: std.Io.File,
+        face_index: u32,
+        out: *[max_directory_size]u8,
+    ) !usize {
+        var header: [Collection.max_header_size]u8 = undefined;
+        const header_len = try file.readPositionalAll(io, &header, 0);
+        var offsets_buf: [Collection.max_faces]u32 = undefined;
+        const directory_start: u64 = if (Collection.faceOffsets(header[0..header_len], &offsets_buf)) |offsets| blk: {
+            if (face_index >= offsets.len) return error.InvalidCollection;
+            break :blk offsets[face_index];
+        } else 0;
+        return file.readPositionalAll(io, out, directory_start);
+    }
+
+    /// Assembles face `face_index` of the sfnt or `ttcf` collection in `file`
+    /// as a standalone sfnt, reading only that face's directory and tables --
+    /// a collection's other faces are never touched, so one face of a
+    /// multi-face .ttc costs its own tables instead of the whole file. Table
+    /// offsets are rewritten for the new layout, so the result reparses with
+    /// `parse` like any other font.
+    pub fn readFaceAsStandaloneSfnt(
+        alloc: Allocator,
+        io: std.Io,
+        file: std.Io.File,
+        face_index: u32,
+        options: FaceSubsetOptions,
+    ) ![]u8 {
+        const file_size = (try file.stat(io)).size;
+
+        var directory: [max_directory_size]u8 = undefined;
+        const directory_len = try readFaceDirectory(io, file, face_index, &directory);
+        var cursor = Cursor{ .data = directory[0..directory_len] };
+        const sfnt_version = try cursor.readU32();
+        if (!isSfntVersion(sfnt_version)) return error.InvalidSfntVersion;
+        const num_tables = try cursor.readU16();
+        if (num_tables > max_directory_tables) return error.InvalidTableDirectory;
+        try cursor.skip(6);
+
+        const records = try alloc.alloc(TableRecord, num_tables);
+        defer alloc.free(records);
+        var kept: usize = 0;
+        var total: u64 = 0;
+        for (0..num_tables) |_| {
+            const tag = try cursor.readBytes(4);
+            _ = try cursor.readU32();
+            const offset = try cursor.readU32();
+            const length = try cursor.readU32();
+            if (@as(u64, offset) + length > file_size) return error.InvalidTableDirectory;
+            if (options.drop_sbix and tagEql(tag[0..4].*, .{ 's', 'b', 'i', 'x' })) continue;
+            total = std.mem.alignForward(u64, total + length, 4);
+            if (total > max_face_subset_size) return error.InvalidTableDirectory;
+            records[kept] = .{ .tag = tag[0..4].*, .offset = offset, .length = length };
+            kept += 1;
+        }
+
+        const directory_size = 12 + kept * 16;
+        const sfnt = try alloc.alloc(u8, directory_size + @as(usize, @intCast(total)));
+        errdefer alloc.free(sfnt);
+
+        std.mem.writeInt(u32, sfnt[0..4], sfnt_version, .big);
+        std.mem.writeInt(u16, sfnt[4..6], @intCast(kept), .big);
+        @memset(sfnt[6..12], 0); // searchRange/entrySelector/rangeShift: unread by parseSfntAt
+
+        var write_offset: usize = directory_size;
+        for (records[0..kept], 0..) |rec, i| {
+            const read = try file.readPositionalAll(io, sfnt[write_offset..][0..rec.length], rec.offset);
+            if (read != rec.length) return error.UnexpectedEndOfData;
+            const entry = sfnt[12 + i * 16 ..][0..16];
+            entry[0..4].* = rec.tag;
+            std.mem.writeInt(u32, entry[4..8], 0, .big); // checksum: unread by parseSfntAt
+            std.mem.writeInt(u32, entry[8..12], @intCast(write_offset), .big);
+            std.mem.writeInt(u32, entry[12..16], rec.length, .big);
+            const padded = std.mem.alignForward(usize, write_offset + rec.length, 4);
+            // Only the alignment gap needs zeroing -- the preads cover every
+            // other byte. Zeroing the whole table region instead costs ~30ms
+            // on a 180MB face, all of it immediately overwritten.
+            @memset(sfnt[write_offset + rec.length .. padded], 0);
+            write_offset = padded;
+        }
+        return sfnt;
+    }
+
+    /// The one `sbix` strike a renderer at `ppem` would pick, rebuilt as a
+    /// valid single-strike `sbix` table, reading only that strike's bytes.
+    /// A strike is self-contained (its glyph offsets are strike-relative),
+    /// so moving one into a fresh table rewrites nothing but the strike list.
+    /// Null when the face has no `sbix`, or none of its strikes is usable --
+    /// the caller then holds a font with no colour bitmaps, exactly like one
+    /// that never shipped any.
+    ///
+    /// Strike choice mirrors `Table.sbix.findStrike`: the smallest strike at
+    /// or above `ppem`, else the largest below it.
+    pub fn readSbixStrike(
+        alloc: Allocator,
+        io: std.Io,
+        file: std.Io.File,
+        face_index: u32,
+        ppem: u16,
+    ) !?[]u8 {
+        var directory: [max_directory_size]u8 = undefined;
+        const directory_len = try readFaceDirectory(io, file, face_index, &directory);
+        const record = findTableInDirectory(directory[0..directory_len], .{ 's', 'b', 'i', 'x' }) orelse return null;
+
+        const file_size = (try file.stat(io)).size;
+        if (@as(u64, record.offset) + record.length > file_size) return error.InvalidTableDirectory;
+        if (record.length < 8) return null;
+
+        var header: [8]u8 = undefined;
+        const header_read = try file.readPositionalAll(io, &header, record.offset);
+        if (header_read != header.len) return error.UnexpectedEndOfData;
+        const num_strikes = std.mem.readInt(u32, header[4..8], .big);
+        if (num_strikes == 0) return null;
+        if (8 + @as(u64, num_strikes) * 4 > record.length) return error.InvalidTableFormat;
+
+        const offset_bytes = try alloc.alloc(u8, @as(usize, num_strikes) * 4);
+        defer alloc.free(offset_bytes);
+        const offsets_read = try file.readPositionalAll(io, offset_bytes, record.offset + 8);
+        if (offsets_read != offset_bytes.len) return error.UnexpectedEndOfData;
+
+        var chosen: ?u32 = null;
+        var chosen_ppem: u16 = 0;
+        for (0..num_strikes) |i| {
+            const offset = std.mem.readInt(u32, offset_bytes[i * 4 ..][0..4], .big);
+            if (@as(u64, offset) + 4 > record.length) return error.InvalidTableFormat;
+            var strike_header: [4]u8 = undefined;
+            const strike_read = try file.readPositionalAll(io, &strike_header, record.offset + offset);
+            if (strike_read != strike_header.len) return error.UnexpectedEndOfData;
+            const strike_ppem = std.mem.readInt(u16, strike_header[0..2], .big);
+            if (strike_ppem == 0) continue;
+            if (chosen == null) {
+                chosen = offset;
+                chosen_ppem = strike_ppem;
+                continue;
+            }
+            const fits = strike_ppem >= ppem;
+            const chosen_fits = chosen_ppem >= ppem;
+            if (fits and (!chosen_fits or strike_ppem < chosen_ppem)) {
+                chosen = offset;
+                chosen_ppem = strike_ppem;
+            } else if (!fits and !chosen_fits and strike_ppem > chosen_ppem) {
+                chosen = offset;
+                chosen_ppem = strike_ppem;
+            }
+        }
+        const strike_offset = chosen orelse return null;
+
+        // A strike runs until the next one starts. The list is not required to
+        // be sorted, so this is the nearest following offset, not the next index.
+        var strike_end: u32 = record.length;
+        for (0..num_strikes) |i| {
+            const offset = std.mem.readInt(u32, offset_bytes[i * 4 ..][0..4], .big);
+            if (offset > strike_offset and offset < strike_end) strike_end = offset;
+        }
+        if (strike_end <= strike_offset) return error.InvalidTableFormat;
+        const strike_len = strike_end - strike_offset;
+        if (strike_len > max_sbix_strike_size) return error.InvalidTableFormat;
+
+        const table = try alloc.alloc(u8, 12 + @as(usize, strike_len));
+        errdefer alloc.free(table);
+        table[0..2].* = header[0..2].*; // version
+        table[2..4].* = header[2..4].*; // flags
+        std.mem.writeInt(u32, table[4..8], 1, .big);
+        std.mem.writeInt(u32, table[8..12], 12, .big);
+        const body_read = try file.readPositionalAll(io, table[12..], record.offset + strike_offset);
+        if (body_read != strike_len) return error.UnexpectedEndOfData;
+        return table;
+    }
 };
 
 pub const Collection = struct {

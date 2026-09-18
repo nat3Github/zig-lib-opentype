@@ -100,13 +100,15 @@ pub extern fn CTFontCollectionCreateMatchingFontDescriptors(collection: CTFontCo
 // list, the same one Font Book and every Cocoa font picker shows.
 pub extern fn CTFontManagerCopyAvailableFontFamilyNames() CFArrayRef;
 
-// Used by `selectFallbackForCodepoint`'s CoreText cascade-list lookup, not
-// the family-listing path above.
+// Used by `selectFallbackForCodepoint`'s CoreText cascade-list lookup, and
+// by `selectFamilyByName`'s system-UI shortcut around the family listing.
 pub extern fn CTFontCreateWithFontDescriptor(descriptor: CTFontDescriptorRef, size: f64, matrix: ?*const anyopaque) CTFontRef;
 pub extern fn CTFontCreateWithName(name: CFStringRef, size: f64, matrix: ?*const anyopaque) CTFontRef;
 pub const CTFontUIFontType = u32;
 pub const kCTFontUIFontSystem: CTFontUIFontType = 2;
 pub extern fn CTFontCreateUIFontForLanguage(uiType: CTFontUIFontType, size: f64, language: CFStringRef) CTFontRef;
+pub const CTFontSymbolicTraits = u32;
+pub extern fn CTFontCreateCopyWithSymbolicTraits(font: CTFontRef, size: f64, matrix: ?*const anyopaque, symTraitValue: CTFontSymbolicTraits, symTraitMask: CTFontSymbolicTraits) CTFontRef;
 pub extern fn CTFontCreateForString(currentFont: CTFontRef, string: CFStringRef, range: CFRange) CTFontRef;
 // macOS 10.15+ / iOS 13+.
 pub extern fn CTFontCreateForStringWithLanguage(currentFont: CTFontRef, string: CFStringRef, range: CFRange, language: CFStringRef) CTFontRef;

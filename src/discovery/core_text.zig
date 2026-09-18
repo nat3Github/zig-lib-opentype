@@ -76,6 +76,9 @@ pub const CoreText = struct {
         _ = self;
         std.debug.assert(handle_buf.len == properties_buf.len);
 
+        if (std.mem.eql(u8, family_name, generic_family_names.system_ui))
+            return selectSystemUiFamily(handle_buf, properties_buf, path_storage, allocator);
+
         const family_cfstr = c.CFStringCreateWithBytes(null, family_name.ptr, @intCast(family_name.len), c.kCFStringEncodingUTF8, 0) orelse
             return discovery.SelectionError.NotFound;
         defer c.CFRelease(family_cfstr);
@@ -109,6 +112,13 @@ pub const CoreText = struct {
         const count: usize = @intCast(c.CFArrayGetCount(matches));
         if (count == 0) return discovery.SelectionError.NotFound;
 
+        // One thread pool for the whole candidate loop: `resolveFontIndex`
+        // used to build and tear one down per candidate, which dominated the
+        // cost of a family lookup.
+        var threaded: std.Io.Threaded = .init(allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+
         var out_count: usize = 0;
         var path_offset: usize = 0;
         for (0..count) |i| {
@@ -124,7 +134,7 @@ pub const CoreText = struct {
             }
             path_offset += path.len;
 
-            handle_buf[out_count] = .{ .path = .{ .path = path, .font_index = resolveFontIndex(desc, path, allocator) } };
+            handle_buf[out_count] = .{ .path = .{ .path = path, .font_index = resolveFontIndex(desc, path, io, allocator) } };
             properties_buf[out_count] = properties;
             out_count += 1;
         }
@@ -212,6 +222,10 @@ pub const CoreText = struct {
             generic_family_names.sans_serif,
             generic_family_names.monospace,
         };
+        var threaded: std.Io.Threaded = .init(allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+
         for (base_families[@intFromBool(han_or_kana)..]) |maybe_family_name| {
             // Size is irrelevant here -- only the resulting cascade list matters.
             const base_font = if (maybe_family_name) |family_name| blk: {
@@ -238,11 +252,57 @@ pub const CoreText = struct {
             if (!hasOutlineTable(matched_font)) continue;
 
             const path = copyFilePath(matched_descriptor, path_storage) orelse continue;
-            return .{ .path = .{ .path = path, .font_index = resolveFontIndex(matched_descriptor, path, allocator) } };
+            return .{ .path = .{ .path = path, .font_index = resolveFontIndex(matched_descriptor, path, io, allocator) } };
         }
         return discovery.SelectionError.NotFound;
     }
 };
+
+/// The system UI font's faces, without listing the family. CoreText lists a
+/// variable family once per named instance and SF has hundreds, so
+/// `CTFontCollectionCreateMatchingFontDescriptors` spends ~30ms cold
+/// materializing instances that `selectFamilyByName`'s dedupe then collapses
+/// back to one handle per file. `kCTFontUIFontSystem` names the same font
+/// directly, and its italic sibling is one symbolic-trait copy away.
+fn selectSystemUiFamily(
+    handle_buf: []discovery.Handle,
+    properties_buf: []discovery.Properties,
+    path_storage: []u8,
+    allocator: std.mem.Allocator,
+) discovery.SelectionError!discovery.FamilyHandle {
+    // Size is irrelevant here -- only the resulting font files matter.
+    const regular = c.CTFontCreateUIFontForLanguage(c.kCTFontUIFontSystem, 12.0, null) orelse
+        return discovery.SelectionError.NotFound;
+    defer c.CFRelease(regular);
+
+    const italic = c.CTFontCreateCopyWithSymbolicTraits(regular, 12.0, null, c.kCTFontTraitItalic, c.kCTFontTraitItalic);
+    defer if (italic) |font| c.CFRelease(font);
+
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var out_count: usize = 0;
+    var path_offset: usize = 0;
+    for ([_]c.CTFontRef{ regular, italic }) |maybe_font| {
+        if (out_count >= handle_buf.len) break;
+        const font = maybe_font orelse continue;
+
+        const descriptor = c.CTFontCopyFontDescriptor(font) orelse continue;
+        defer c.CFRelease(descriptor);
+
+        const path = copyFilePath(descriptor, path_storage[path_offset..]) orelse continue;
+        if (listsPath(handle_buf[0..out_count], path)) continue;
+        path_offset += path.len;
+
+        handle_buf[out_count] = .{ .path = .{ .path = path, .font_index = resolveFontIndex(descriptor, path, io, allocator) } };
+        properties_buf[out_count] = readProperties(descriptor);
+        out_count += 1;
+    }
+
+    if (out_count == 0) return discovery.SelectionError.NotFound;
+    return .{ .fonts = handle_buf[0..out_count], .properties = properties_buf[0..out_count] };
+}
 
 /// True if `font` has an outline table this codebase can rasterize.
 /// Queried straight from CoreText (`CTFontCopyAvailableTables`) rather than
@@ -384,7 +444,7 @@ fn piecewiseLinearFindIndex(query: f32, mapping: []const f32) f32 {
 /// descriptor's PostScript name (`kCTFontNameAttribute`) against each
 /// face's `name` table (nameID 6) — same approach as font-kit's
 /// `create_handles_from_core_text_collection`.
-fn resolveFontIndex(desc: c.CTFontDescriptorRef, path: []const u8, allocator: std.mem.Allocator) u32 {
+fn resolveFontIndex(desc: c.CTFontDescriptorRef, path: []const u8, io: std.Io, allocator: std.mem.Allocator) u32 {
     const postscript_ref = c.CTFontDescriptorCopyAttribute(desc, c.kCTFontNameAttribute) orelse return 0;
     const postscript_cfstr: c.CFStringRef = @ptrCast(@alignCast(postscript_ref));
     defer c.CFRelease(postscript_cfstr);
@@ -392,9 +452,6 @@ fn resolveFontIndex(desc: c.CTFontDescriptorRef, path: []const u8, allocator: st
     if (c.CFStringGetCString(postscript_cfstr, &postscript_buf, postscript_buf.len, c.kCFStringEncodingUTF8) == 0) return 0;
     const postscript_name = std.mem.sliceTo(&postscript_buf, 0);
 
-    var threaded: std.Io.Threaded = .init(allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
     const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return 0;
     defer file.close(io);
     return discovery.collectionFaceIndexByPostscriptName(io, file, postscript_name, allocator);

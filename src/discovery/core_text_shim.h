@@ -99,6 +99,8 @@ CTFontRef CTFontCreateWithFontDescriptor(CTFontDescriptorRef descriptor, double 
 CTFontRef CTFontCreateWithName(CFStringRef name, double size, const void *matrix);
 typedef uint32_t CTFontUIFontType;
 CTFontRef CTFontCreateUIFontForLanguage(CTFontUIFontType uiType, double size, CFStringRef language);
+typedef uint32_t CTFontSymbolicTraits;
+CTFontRef CTFontCreateCopyWithSymbolicTraits(CTFontRef font, double size, const void *matrix, CTFontSymbolicTraits symTraitValue, CTFontSymbolicTraits symTraitMask);
 CTFontRef CTFontCreateForString(CTFontRef currentFont, CFStringRef string, CFRange range);
 CTFontDescriptorRef CTFontCopyFontDescriptor(CTFontRef font);
 
