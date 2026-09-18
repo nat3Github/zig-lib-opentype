@@ -125,6 +125,21 @@ pub const Font = struct {
         return file.readPositionalAll(io, out, directory_start);
     }
 
+    /// Whether face `face_index` has an outline table this codebase can
+    /// rasterize, answered from the face's table directory alone -- no table
+    /// bytes, no parse. Font discovery uses it to drop a candidate whose
+    /// glyphs are in a format we can't draw (Apple's `hvgl`-only UI faces)
+    /// before anything reads the file proper.
+    pub fn faceHasOutlineTable(io: std.Io, file: std.Io.File, face_index: u32) !bool {
+        var directory: [max_directory_size]u8 = undefined;
+        const directory_len = try readFaceDirectory(io, file, face_index, &directory);
+        const outline_tags = [_]Tag{ .{ 'g', 'l', 'y', 'f' }, .{ 'C', 'F', 'F', ' ' }, .{ 'C', 'F', 'F', '2' } };
+        for (outline_tags) |tag| {
+            if (findTableInDirectory(directory[0..directory_len], tag) != null) return true;
+        }
+        return false;
+    }
+
     /// Assembles face `face_index` of the sfnt or `ttcf` collection in `file`
     /// as a standalone sfnt, reading only that face's directory and tables --
     /// a collection's other faces are never touched, so one face of a

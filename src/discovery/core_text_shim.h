@@ -104,7 +104,4 @@ CTFontRef CTFontCreateCopyWithSymbolicTraits(CTFontRef font, double size, const 
 CTFontRef CTFontCreateForString(CTFontRef currentFont, CFStringRef string, CFRange range);
 CTFontDescriptorRef CTFontCopyFontDescriptor(CTFontRef font);
 
-typedef uint32_t CTFontTableOptions;
-CFArrayRef CTFontCopyAvailableTables(CTFontRef font, CTFontTableOptions options);
-
 #endif

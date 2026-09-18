@@ -183,8 +183,8 @@ pub const CoreText = struct {
     /// Seeding from each generic content-font family instead (same families
     /// `generic_family_names` already maps for direct lookups) tends to
     /// land on the real content font (e.g. `Songti.ttc` for CJK), so try
-    /// each and verify actual outline coverage via `CTFontCopyAvailableTables`
-    /// rather than trusting the first cascade hit.
+    /// each and verify actual outline coverage in the matched face's own
+    /// table directory rather than trusting the first cascade hit.
     ///
     /// The system-UI cascade is still tried first for everything but Han
     /// and kana: it's what native apps render UI text with (SF Arabic,
@@ -249,10 +249,11 @@ pub const CoreText = struct {
             // to a boxed placeholder glyph) -- that's a fake match, not real
             // coverage.
             if (familyNameIs(matched_descriptor, "LastResort")) continue;
-            if (!hasOutlineTable(matched_font)) continue;
 
             const path = copyFilePath(matched_descriptor, path_storage) orelse continue;
-            return .{ .path = .{ .path = path, .font_index = resolveFontIndex(matched_descriptor, path, io, allocator) } };
+            const font_index = resolveFontIndex(matched_descriptor, path, io, allocator);
+            if (!faceHasOutlines(io, path, font_index)) continue;
+            return .{ .path = .{ .path = path, .font_index = font_index } };
         }
         return discovery.SelectionError.NotFound;
     }
@@ -304,28 +305,16 @@ fn selectSystemUiFamily(
     return .{ .fonts = handle_buf[0..out_count], .properties = properties_buf[0..out_count] };
 }
 
-/// True if `font` has an outline table this codebase can rasterize.
-/// Queried straight from CoreText (`CTFontCopyAvailableTables`) rather than
-/// opening and parsing the file ourselves -- cheaper, and avoids duplicating
-/// dvui's own `hasUsableOutlines` file-based check just to reject a
-/// known-bad candidate one step earlier.
-fn hasOutlineTable(font: c.CTFontRef) bool {
-    const tables = c.CTFontCopyAvailableTables(font, 0) orelse return false;
-    defer c.CFRelease(tables);
-    const count: usize = @intCast(c.CFArrayGetCount(tables));
-    for (0..count) |i| {
-        const tag_ptr = c.CFArrayGetValueAtIndex(tables, @intCast(i)) orelse continue;
-        const tag: u32 = @truncate(@intFromPtr(tag_ptr));
-        switch (tag) {
-            fourCharCode("glyf"), fourCharCode("CFF "), fourCharCode("CFF2") => return true,
-            else => {},
-        }
-    }
-    return false;
-}
-
-fn fourCharCode(comptime tag: *const [4]u8) u32 {
-    return (@as(u32, tag[0]) << 24) | (@as(u32, tag[1]) << 16) | (@as(u32, tag[2]) << 8) | tag[3];
+/// True if the face at `path`/`face_index` has an outline table this codebase
+/// can rasterize. Read from that face's own table directory rather than asked
+/// of CoreText: `CTFontCopyAvailableTables` makes CoreText build a CGFont and
+/// parse the whole file through libFontParser (~7ms on the first cold
+/// fallback), where the directory is one pread of a file the caller is about
+/// to open anyway.
+fn faceHasOutlines(io: std.Io, path: []const u8, face_index: u32) bool {
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return false;
+    defer file.close(io);
+    return parsing.Font.faceHasOutlineTable(io, file, face_index) catch false;
 }
 
 fn familyNameIs(desc: c.CTFontDescriptorRef, name: []const u8) bool {
@@ -369,6 +358,10 @@ fn readProperties(desc: c.CTFontDescriptorRef) discovery.Properties {
     };
     readAxisRanges(desc, &properties);
     return properties;
+}
+
+fn fourCharCode(comptime tag: *const [4]u8) u32 {
+    return (@as(u32, tag[0]) << 24) | (@as(u32, tag[1]) << 16) | (@as(u32, tag[2]) << 8) | tag[3];
 }
 
 fn readAxisRanges(desc: c.CTFontDescriptorRef, properties: *discovery.Properties) void {

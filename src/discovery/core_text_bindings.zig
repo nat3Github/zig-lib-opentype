@@ -114,12 +114,6 @@ pub extern fn CTFontCreateForString(currentFont: CTFontRef, string: CFStringRef,
 pub extern fn CTFontCreateForStringWithLanguage(currentFont: CTFontRef, string: CFStringRef, range: CFRange, language: CFStringRef) CTFontRef;
 pub extern fn CTFontCopyFontDescriptor(font: CTFontRef) CTFontDescriptorRef;
 
-// CTFontTableOptions is `uint32_t`, not CFOptionFlags (`c_ulong`, 8 bytes on
-// arm64/x86_64) -- binding it as the wrong width breaks the ABI on Apple
-// Silicon.
-pub const CTFontTableOptions = u32;
-pub extern fn CTFontCopyAvailableTables(font: CTFontRef, options: CTFontTableOptions) CFArrayRef;
-
 // CTFontSymbolicTraits bit (CTFontTraits.h) — enum constant, no extern
 // symbol to bind, so declared directly rather than round-tripped through
 // translate-c.
