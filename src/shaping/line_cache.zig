@@ -247,6 +247,11 @@ pub fn Cache(comptime FontKey: type) type {
 
         map: std.HashMapUnmanaged(Key, Tracked, Key.Context, std.hash_map.default_max_load_percentage) = .empty,
         bytes: usize = 0,
+        /// Compiled GSUB/GPOS plans, reused across shape calls (and
+        /// frames) for the same font + script + features. Holds slices
+        /// into font bytes, so a caller that frees any must `clearPlans`
+        /// first. Self-bounded by `PlanCache.max_plans`.
+        plans: root.PlanCache = .{},
 
         /// Budget before the cache is dropped wholesale. Counted in bytes,
         /// not lines: line length is caller-controlled and unbounded, so a
@@ -412,7 +417,14 @@ pub fn Cache(comptime FontKey: type) type {
         pub fn deinit(self: *Self, gpa: std.mem.Allocator) void {
             self.clear(gpa);
             self.map.deinit(gpa);
+            self.plans.deinit(gpa);
             self.* = undefined;
+        }
+
+        /// Compiled plans hold slices into font bytes; a caller about to
+        /// free or remap any font file must clear them first.
+        pub fn clearPlans(self: *Self, gpa: std.mem.Allocator) void {
+            self.plans.clear(gpa);
         }
 
         // ponytail: bulk clear rather than LRU -- eviction order only
@@ -524,5 +536,247 @@ pub fn Cache(comptime FontKey: type) type {
                 .segments = segments,
             };
         }
+
+        /// Shapes one line of `text` against `fonts` (priority order,
+        /// parallel to `font_keys`), extending that stack on demand with
+        /// whatever `provider` discovers for codepoints none of them
+        /// cover, and caches the result under `font_key`.
+        ///
+        /// `output` may be a frame-scoped arena that resets right after
+        /// the call: it backs the returned line and all scratch.
+        /// `state_gpa` backs everything the cache and the caller's font
+        /// state keep, and must outlive the call.
+        ///
+        /// `provider` supplies, by comptime duck typing:
+        ///   coversCodepoint(cp: u21) bool
+        ///   fontForCodepoint(state_gpa, cp: u21) ?FontKey
+        ///   ensureFont(state_gpa, key: FontKey) !parsing.Font
+        ///   fontIndexForKey(key: FontKey) ?u16
+        ///   toPixels(font_index: u16, font_units: i32) f32
+        ///   noteMissingCoverage(state_gpa, cp: u21) void
+        pub fn shapeLine(
+            self: *Self,
+            output: std.mem.Allocator,
+            state_gpa: std.mem.Allocator,
+            provider: anytype,
+            font_key: FontKey,
+            fonts: []const root.parsing.Font,
+            font_keys: []const FontKey,
+            text: []const u8,
+            item: ?Buffer.ByteRange,
+            base_direction: unicode.Bidi.ParagraphDirection,
+            style: Style,
+        ) std.mem.Allocator.Error!ShapedLine {
+            const has_tab = std.mem.indexOfScalar(u8, text, '\t') != null;
+            const cache_key: Key = .{
+                .font_key = font_key,
+                .text = text,
+                .item = item,
+                .base_direction = base_direction,
+                .features = style.features,
+                // Tab-free text shapes the same wherever it starts, so it keeps one key.
+                .tab = if (has_tab) .{ .size = style.tab_size, .origin_bits = @bitCast(style.tab_origin) } else null,
+            };
+            if (self.getPtr(cache_key)) |cached| {
+                if (try self.materialize(output, cached, provider)) |line| return line;
+                // A segment's font is gone since this line was cached, so
+                // the cached line is now unrenderable as-is: drop it and
+                // reshape from scratch rather than silently rendering with
+                // missing segments.
+                self.remove(state_gpa, cache_key);
+            }
+
+            const decoded = try decodeLine(output, text);
+            var line_codepoints = decoded.codepoints;
+            var line_byte_offsets = decoded.byte_offsets;
+            errdefer output.free(line_codepoints);
+            errdefer output.free(line_byte_offsets);
+
+            // Codepoint range matching `item`'s byte range; the shaper works
+            // in codepoint indices. Clamped to what decodeLine produced,
+            // which stops at a hard break.
+            var item_cp: ?root.Item = null;
+            if (item) |it| {
+                var cp_start: usize = 0;
+                while (cp_start < decoded.codepoints.len and decoded.byte_offsets[cp_start] < it.start) cp_start += 1;
+                var cp_end: usize = cp_start;
+                while (cp_end < decoded.codepoints.len and decoded.byte_offsets[cp_end] < it.end) cp_end += 1;
+                item_cp = .{ .start = cp_start, .end = cp_end };
+            }
+
+            const static_fonts = fonts.len;
+            var fonts_list: std.ArrayList(root.parsing.Font) = .empty;
+            defer fonts_list.deinit(output);
+            var keys_list: std.ArrayList(FontKey) = .empty;
+            defer keys_list.deinit(output);
+            try fonts_list.appendSlice(output, fonts);
+            try keys_list.appendSlice(output, font_keys);
+
+            // Ask the provider for each newly-uncovered codepoint, skipping
+            // any already covered by a font discovered earlier in this same
+            // line. Uncapped: a CJK web fallback font is split into ~100
+            // slices, so a long CJK line can need dozens, and every missing
+            // codepoint must reach the provider to be fetched.
+            var dynamic_cmaps: std.ArrayList([]const u8) = .empty;
+            defer dynamic_cmaps.deinit(output);
+            if (static_fonts > 0) {
+                for (decoded.codepoints) |cp| {
+                    if (provider.coversCodepoint(cp)) continue;
+                    var covered = false;
+                    for (dynamic_cmaps.items) |cm| {
+                        if (root.Cmap.lookup(cm, cp) != null) {
+                            covered = true;
+                            break;
+                        }
+                    }
+                    if (covered) continue;
+                    if (provider.fontForCodepoint(state_gpa, cp)) |dyn_key| {
+                        var already_added = false;
+                        for (keys_list.items[static_fonts..]) |k| {
+                            if (FontKey.Context.eql(.{}, k, dyn_key)) {
+                                already_added = true;
+                                break;
+                            }
+                        }
+                        if (already_added) continue;
+                        const dyn_font = provider.ensureFont(state_gpa, dyn_key) catch continue;
+                        try fonts_list.append(output, dyn_font);
+                        try keys_list.append(output, dyn_key);
+                        const cmap = dyn_font.tableData(.{ 'c', 'm', 'a', 'p' }) orelse &.{};
+                        if (cmap.len > 0) try dynamic_cmaps.append(output, cmap);
+                    } else provider.noteMissingCoverage(state_gpa, cp);
+                }
+            }
+
+            var result = Buffer.init(output);
+            errdefer result.deinit();
+            var segments: std.ArrayList(ShapedLine.Segment) = .empty;
+            errdefer segments.deinit(output);
+            var cache_segments: std.ArrayList(Cached.Segment) = .empty;
+            errdefer cache_segments.deinit(output);
+
+            if (decoded.codepoints.len > 0 and fonts_list.items.len > 0) {
+                // Bidi outer, font fallback inner, so visual reordering
+                // crosses font boundaries. state_gpa backs the plan cache:
+                // `output` may be a frame arena, and a cached plan has to
+                // outlive the call that built it.
+                const shaped = root.shapeBidiParagraphWithFallback(output, fonts_list.items, decoded.codepoints, base_direction, &.{}, &.{}, style.features, item_cp, .{ .cache = &self.plans, .state_allocator = state_gpa }) catch |err| switch (err) {
+                    error.OutOfMemory => |e| return e,
+                    else => root.BidiFallbackResult{ .buffer = Buffer.init(output), .font_indices = &.{} },
+                };
+                defer output.free(shaped.font_indices);
+                result.deinit();
+                result = shaped.buffer;
+
+                // Coalesce consecutive same-font glyphs into segments. One
+                // pass: segments name fonts by index, so nothing here holds
+                // a caller-side pointer that a later font load could move.
+                var g: usize = 0;
+                while (g < shaped.font_indices.len) {
+                    const fi = shaped.font_indices[g];
+                    var h = g + 1;
+                    while (h < shaped.font_indices.len and shaped.font_indices[h] == fi) h += 1;
+                    try segments.append(output, .{ .font_index = @intCast(fi), .glyph_start = @intCast(g), .glyph_end = @intCast(h) });
+                    try cache_segments.append(output, .{ .font_key = keys_list.items[fi], .glyph_start = @intCast(g), .glyph_end = @intCast(h) });
+                    g = h;
+                }
+                if (has_tab) applyTabStops(&result, provider, fonts_list.items, segments.items, decoded.codepoints, style);
+            }
+            result.have_positions = true;
+
+            // Rebase onto the item: from here on the line reads exactly like
+            // a shape of `text[item.start..item.end]` alone -- clusters and
+            // byte offsets relative to the item -- so every caller's
+            // byte-offset math is unchanged by the context having been there.
+            if (item_cp) |it_cp| {
+                const it = item.?;
+                const new_codepoints = try output.dupe(u21, line_codepoints[it_cp.start..it_cp.end]);
+                errdefer output.free(new_codepoints);
+                const new_offsets = try output.alloc(u32, it_cp.end - it_cp.start + 1);
+                for (new_offsets[0 .. it_cp.end - it_cp.start], line_byte_offsets[it_cp.start..it_cp.end]) |*dst, off| {
+                    dst.* = off -| @as(u32, @intCast(it.start));
+                }
+                new_offsets[it_cp.end - it_cp.start] = line_byte_offsets[it_cp.end] -| @as(u32, @intCast(it.start));
+                for (result.info.items) |*info| info.cluster -= @intCast(it_cp.start);
+                output.free(line_codepoints);
+                output.free(line_byte_offsets);
+                line_codepoints = new_codepoints;
+                line_byte_offsets = new_offsets;
+            }
+
+            const cluster_tables = try result.buildClusterTables(output, line_byte_offsets);
+            errdefer output.free(cluster_tables.starts);
+            errdefer output.free(cluster_tables.ends);
+
+            const line: ShapedLine = .{
+                .allocator = output,
+                .codepoints = line_codepoints,
+                .byte_offsets = line_byte_offsets,
+                .buffer = result,
+                .cluster_starts = cluster_tables.starts,
+                .cluster_ends = cluster_tables.ends,
+                .segments = try segments.toOwnedSlice(output),
+            };
+
+            self.store(state_gpa, cache_key, &line, cache_segments.items);
+            cache_segments.deinit(output);
+
+            return line;
+        }
     };
+}
+
+/// What a caller adds to shaping beyond the fonts themselves.
+pub const Style = struct {
+    features: []const root.Feature = &.{},
+    tab_size: u8 = 8,
+    /// Device-pixel pen x the text starts at on its line, so tab stops
+    /// count from the line start rather than from the text.
+    tab_origin: f32 = 0,
+};
+
+/// Fonts have no real tab glyph (U+0009 is .notdef or a zero-width
+/// control), so each tab becomes the space glyph with whatever advance
+/// reaches the next stop, `tab_size` space advances apart from the line
+/// start. Stops follow the pen in reading order: an RTL line counts
+/// them from its right edge.
+/// ponytail: pen positions in a mixed-direction line are visual, so a
+/// tab inside its embedded opposite-direction run snaps off the
+/// visual pen rather than a per-run one.
+fn applyTabStops(
+    buffer: *Buffer,
+    provider: anytype,
+    fonts: []const root.parsing.Font,
+    segments: []const ShapedLine.Segment,
+    codepoints: []const u21,
+    style: Style,
+) void {
+    const rtl = buffer.isRtl();
+    var pen = style.tab_origin;
+    for (0..segments.len) |si| {
+        const seg = segments[if (rtl) segments.len - 1 - si else si];
+        const font = fonts[seg.font_index];
+        const space_glyph = root.Cmap.lookup(font.tableData("cmap".*) orelse &.{}, ' ') orelse 0;
+        const space_units: i32 = blk: {
+            const hhea = root.parsing.Table.hhea.parse(font.tableData("hhea".*) orelse &.{}) catch break :blk 0;
+            const hmtx = font.tableData("hmtx".*) orelse break :blk 0;
+            break :blk root.parsing.Table.hmtx.metricForGlyph(hmtx, space_glyph, hhea.number_of_h_metrics).advance_width;
+        };
+        const space_px = provider.toPixels(seg.font_index, space_units);
+        for (seg.glyph_start..seg.glyph_end) |k| {
+            const g = if (rtl) seg.glyph_end - 1 - (k - seg.glyph_start) else k;
+            const info = &buffer.info.items[g];
+            const pos = &buffer.pos.items[g];
+            if (codepoints[info.cluster] == '\t' and space_px > 0) {
+                const stop = space_px * @as(f32, @floatFromInt(style.tab_size));
+                var next = if (stop > 0) (@floor(pen / stop) + 1) * stop else pen;
+                // CSS: a stop closer than half a space is skipped.
+                if (stop > 0 and next - pen < space_px * 0.5) next += stop;
+                info.codepoint = space_glyph;
+                pos.x_offset = 0;
+                pos.x_advance = @intFromFloat(@round((next - pen) * @as(f32, @floatFromInt(space_units)) / space_px));
+            }
+            pen += provider.toPixels(seg.font_index, pos.x_advance);
+        }
+    }
 }
