@@ -140,6 +140,17 @@ fn isMandatoryBreakClass(class: unicode.LineBreakClass) bool {
 pub fn firstHardBreak(text: []const u8) ?HardBreak {
     var i: usize = 0;
     while (i < text.len) {
+        // Of the ASCII range only LF/VT/FF/CR carry a mandatory class --
+        // 0x0E..0x1F are CM, not BK -- so ASCII never needs the decode and
+        // line-break table lookup below.
+        if (text[i] < 0x80) {
+            if (text[i] >= 0x0A and text[i] <= 0x0D) {
+                const len: usize = if (text[i] == '\r' and i + 1 < text.len and text[i + 1] == '\n') 2 else 1;
+                return .{ .start = i, .len = len };
+            }
+            i += 1;
+            continue;
+        }
         const cplen = std.unicode.utf8ByteSequenceLength(text[i]) catch {
             i += 1;
             continue;

@@ -1599,17 +1599,29 @@ pub fn applyTable(
 /// the ignorable's glyph id; `zeroDefaultIgnorableAdvances` (after GPOS)
 /// zeroes its advance/offset so it takes up no visible space either.
 ///
-/// Scope cut vs. hb: hb falls back to deleting the glyph outright when the
-/// font has no space glyph at all (`REMOVE_DEFAULT_IGNORABLES`-equivalent
-/// path) - that needs buffer-splice machinery this port doesn't have
-/// elsewhere, and virtually every font maps space, so a missing space glyph
-/// just leaves the original (rare, font-specific) glyph in place instead.
+/// A font with no space glyph in its cmap at all (Noto Color Emoji and the
+/// web-fallback slices cut from it) takes hb's other branch, deleting the
+/// glyphs outright: the only substitute left would be .notdef, which with a
+/// zeroed advance draws a visible box on top of the following glyph (U+FE0F
+/// after an emoji base).
 pub fn hideDefaultIgnorables(buffer: *Buffer, cmap: ?Cmap) void {
-    const resolved = cmap orelse return;
-    const space_glyph = resolved.lookup(' ') orelse return;
-    for (buffer.info.items) |*info| {
-        if (info.is_default_ignorable) info.codepoint = space_glyph;
+    if (cmap) |resolved| if (resolved.lookup(' ')) |space_glyph| {
+        for (buffer.info.items) |*info| {
+            if (info.is_default_ignorable) info.codepoint = space_glyph;
+        }
+        return;
+    };
+    const with_positions = buffer.pos.items.len == buffer.info.items.len;
+    var kept: usize = 0;
+    for (buffer.info.items, 0..) |info, i| {
+        if (info.is_default_ignorable) continue;
+        buffer.info.items[kept] = info;
+        if (with_positions) buffer.pos.items[kept] = buffer.pos.items[i];
+        kept += 1;
     }
+    buffer.info.shrinkRetainingCapacity(kept);
+    if (with_positions) buffer.pos.shrinkRetainingCapacity(kept);
+    buffer.idx = @min(buffer.idx, kept);
 }
 
 /// Ported from hb-ot-shape.cc's `hb_ot_zero_width_default_ignorables`: runs
