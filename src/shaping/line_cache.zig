@@ -414,6 +414,21 @@ pub fn Cache(comptime FontKey: type) type {
             }
         };
 
+        /// A shaped line together with the font list its segment indices
+        /// refer to: `font_keys[segment.font_index]` is the font that
+        /// shaped that glyph range. Both come from the call's `output`
+        /// allocator; `line.deinit()` frees the line, `font_keys` is the
+        /// caller's to free.
+        pub const ShapeResult = struct {
+            line: ShapedLine,
+            font_keys: []FontKey,
+
+            pub fn deinit(self: *ShapeResult, output: std.mem.Allocator) void {
+                self.line.deinit();
+                output.free(self.font_keys);
+            }
+        };
+
         pub fn deinit(self: *Self, gpa: std.mem.Allocator) void {
             self.clear(gpa);
             self.map.deinit(gpa);
@@ -487,23 +502,36 @@ pub fn Cache(comptime FontKey: type) type {
             value.deinit(gpa);
         }
 
-        /// Turns a hit into a caller-owned `ShapedLine`, resolving each
-        /// segment's `FontKey` back to an index into the caller's current
-        /// font list via `provider.fontIndexForKey`. `null` when any
-        /// segment's font is gone, so the caller reshapes from scratch
+        /// Turns a hit into a caller-owned line plus the font list its
+        /// segment indices refer to. Indices are assigned by first
+        /// appearance among the cached segments, so the result describes
+        /// its own font list rather than depending on one the caller
+        /// happened to pass. `null` when any segment's font is gone
+        /// (`provider.hasFont`), so the caller reshapes from scratch
         /// rather than rendering with segments silently missing.
         pub fn materialize(
             _: *Self,
             output: std.mem.Allocator,
             cached: *const Cached,
             provider: anytype,
-        ) std.mem.Allocator.Error!?ShapedLine {
+        ) std.mem.Allocator.Error!?ShapeResult {
             const segments = try output.alloc(ShapedLine.Segment, cached.segments.len);
             errdefer output.free(segments);
+
+            var font_keys: std.ArrayList(FontKey) = .empty;
+            errdefer font_keys.deinit(output);
             for (segments, cached.segments) |*dst, seg| {
-                const font_index = provider.fontIndexForKey(seg.font_key) orelse {
+                if (!provider.hasFont(seg.font_key)) {
                     output.free(segments);
+                    font_keys.deinit(output);
                     return null;
+                }
+                const font_index: u16 = blk: {
+                    for (font_keys.items, 0..) |existing, i| {
+                        if (FontKey.Context.eql(.{}, existing, seg.font_key)) break :blk @intCast(i);
+                    }
+                    try font_keys.append(output, seg.font_key);
+                    break :blk @intCast(font_keys.items.len - 1);
                 };
                 dst.* = .{ .font_index = font_index, .glyph_start = seg.glyph_start, .glyph_end = seg.glyph_end };
             }
@@ -527,13 +555,16 @@ pub fn Cache(comptime FontKey: type) type {
             const cluster_ends = try output.dupe(u32, cached.cluster_ends);
 
             return .{
-                .allocator = output,
-                .codepoints = codepoints,
-                .byte_offsets = byte_offsets,
-                .buffer = buffer,
-                .cluster_starts = cluster_starts,
-                .cluster_ends = cluster_ends,
-                .segments = segments,
+                .line = .{
+                    .allocator = output,
+                    .codepoints = codepoints,
+                    .byte_offsets = byte_offsets,
+                    .buffer = buffer,
+                    .cluster_starts = cluster_starts,
+                    .cluster_ends = cluster_ends,
+                    .segments = segments,
+                },
+                .font_keys = try font_keys.toOwnedSlice(output),
             };
         }
 
@@ -551,7 +582,7 @@ pub fn Cache(comptime FontKey: type) type {
         ///   coversCodepoint(cp: u21) bool
         ///   fontForCodepoint(state_gpa, cp: u21) ?FontKey
         ///   ensureFont(state_gpa, key: FontKey) !parsing.Font
-        ///   fontIndexForKey(key: FontKey) ?u16
+        ///   hasFont(key: FontKey) bool
         ///   toPixels(font_index: u16, font_units: i32) f32
         ///   noteMissingCoverage(state_gpa, cp: u21) void
         pub fn shapeLine(
@@ -566,7 +597,7 @@ pub fn Cache(comptime FontKey: type) type {
             item: ?Buffer.ByteRange,
             base_direction: unicode.Bidi.ParagraphDirection,
             style: Style,
-        ) std.mem.Allocator.Error!ShapedLine {
+        ) std.mem.Allocator.Error!ShapeResult {
             const has_tab = std.mem.indexOfScalar(u8, text, '\t') != null;
             const cache_key: Key = .{
                 .font_key = font_key,
@@ -578,7 +609,7 @@ pub fn Cache(comptime FontKey: type) type {
                 .tab = if (has_tab) .{ .size = style.tab_size, .origin_bits = @bitCast(style.tab_origin) } else null,
             };
             if (self.getPtr(cache_key)) |cached| {
-                if (try self.materialize(output, cached, provider)) |line| return line;
+                if (try self.materialize(output, cached, provider)) |result| return result;
                 // A segment's font is gone since this line was cached, so
                 // the cached line is now unrenderable as-is: drop it and
                 // reshape from scratch rather than silently rendering with
@@ -721,7 +752,9 @@ pub fn Cache(comptime FontKey: type) type {
             self.store(state_gpa, cache_key, &line, cache_segments.items);
             cache_segments.deinit(output);
 
-            return line;
+            // toOwnedSlice empties the list, so the deferred deinit above
+            // is left a no-op rather than a double free.
+            return .{ .line = line, .font_keys = try keys_list.toOwnedSlice(output) };
         }
     };
 }
