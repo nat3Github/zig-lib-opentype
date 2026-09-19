@@ -31,6 +31,10 @@ pub const shapeWithContext = shaping.shapeWithContext;
 pub const shapeBidiParagraphWithFallback = shaping.shapeBidiParagraphWithFallback;
 pub const measureGlyphRange = shaping.measureGlyphRange;
 
+pub const line_cache = @import("shaping/line_cache.zig");
+pub const ShapedLine = line_cache.ShapedLine;
+pub const decodeLine = line_cache.decodeLine;
+
 pub const discovery_fontconfig = discovery.fontconfig;
 pub const discovery_core_text = discovery.core_text;
 pub const discovery_directwrite = discovery.directwrite;
