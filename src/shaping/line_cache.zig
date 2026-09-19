@@ -456,6 +456,15 @@ pub fn Cache(comptime FontKey: type) type {
             return self.map.count();
         }
 
+        /// Position of `key` in `keys`, which is a handful of fonts at
+        /// most -- a line's whole fallback stack.
+        fn indexOfKey(keys: []const FontKey, key: FontKey) ?u16 {
+            for (keys, 0..) |candidate, i| {
+                if (FontKey.Context.eql(.{}, candidate, key)) return @intCast(i);
+            }
+            return null;
+        }
+
         /// Marks the entry used, so the next `evictUnused` keeps it.
         pub fn getPtr(self: *Self, key: Key) ?*Cached {
             const tracked = self.map.getPtr(key) orelse return null;
@@ -685,6 +694,9 @@ pub fn Cache(comptime FontKey: type) type {
             errdefer segments.deinit(output);
             var cache_segments: std.ArrayList(Cached.Segment) = .empty;
             errdefer cache_segments.deinit(output);
+            // The fonts some segment actually uses, in first-appearance order.
+            var used_keys: std.ArrayList(FontKey) = .empty;
+            errdefer used_keys.deinit(output);
 
             if (decoded.codepoints.len > 0 and fonts_list.items.len > 0) {
                 // Bidi outer, font fallback inner, so visual reordering
@@ -711,7 +723,27 @@ pub fn Cache(comptime FontKey: type) type {
                     try cache_segments.append(output, .{ .font_key = keys_list.items[fi], .glyph_start = @intCast(g), .glyph_end = @intCast(h) });
                     g = h;
                 }
+
+                // Only the fonts that actually shaped something are realized
+                // and returned: a stack family no glyph needed never costs
+                // the caller anything. Ahead of the tab stops below, which
+                // measure a space through `provider` per segment font.
+                for (segments.items) |seg| {
+                    const key = keys_list.items[seg.font_index];
+                    if (indexOfKey(used_keys.items, key) != null) continue;
+                    _ = provider.ensureFont(state_gpa, key) catch {};
+                    try used_keys.append(output, key);
+                }
+
                 if (has_tab) applyTabStops(&result, provider, fonts_list.items, segments.items, decoded.codepoints, style);
+
+                // Renumber onto that list, so the returned font list
+                // describes the segments exactly -- the same numbering a
+                // later cache hit rebuilds in `materialize`.
+                for (segments.items) |*seg| {
+                    const key = keys_list.items[seg.font_index];
+                    if (indexOfKey(used_keys.items, key)) |i| seg.font_index = i;
+                }
             }
             result.have_positions = true;
 
@@ -754,7 +786,7 @@ pub fn Cache(comptime FontKey: type) type {
 
             // toOwnedSlice empties the list, so the deferred deinit above
             // is left a no-op rather than a double free.
-            return .{ .line = line, .font_keys = try keys_list.toOwnedSlice(output) };
+            return .{ .line = line, .font_keys = try used_keys.toOwnedSlice(output) };
         }
     };
 }
