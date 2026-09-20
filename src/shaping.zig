@@ -29,7 +29,6 @@ pub const Feature = struct { tag: Tag, value: u32 = 1 };
 
 pub const EndMetric = metrics_mod.EndMetric;
 pub const GlyphMetrics = metrics_mod.GlyphMetrics;
-pub const measureGlyphRange = metrics_mod.measureGlyphRange;
 
 pub const Map = map_mod.Map;
 pub const Digest = common.Digest;

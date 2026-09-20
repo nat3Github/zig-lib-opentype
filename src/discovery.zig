@@ -12,9 +12,16 @@ pub const android = if (build_options.android) @import("discovery/android.zig") 
 pub const manifest = if (build_options.manifest) @import("discovery/manifest.zig") else struct {};
 pub const web_fallback = if (build_options.font_fallback) @import("discovery/web_fallback.zig") else struct {};
 
+const stack = @import("discovery/stack.zig");
+/// Family-alias graph: registration, flatten, and the per-stack merged
+/// cmap coverage the flatten feeds.
+pub const Aliases = stack.Aliases;
+pub const CoverageCache = stack.CoverageCache;
+
 test {
     _ = fontconfig;
     _ = android;
+    _ = stack;
 }
 
 /// Index of the face in collection `file` whose `name` table PostScript

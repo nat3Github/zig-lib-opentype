@@ -46,8 +46,7 @@ pub fn decodeLine(output: std.mem.Allocator, text: []const u8) std.mem.Allocator
 /// shaper was handed, never by a caller-side pointer: the caller's own
 /// font objects may be relocated by an unrelated load between the shape
 /// and a later read of this line. `provider` arguments below resolve an
-/// index back to glyph metrics by comptime duck typing, the same seam
-/// `measureGlyphRange` uses.
+/// index back to glyph metrics by comptime duck typing.
 pub const ShapedLine = struct {
     allocator: std.mem.Allocator,
     codepoints: []u21,
@@ -122,13 +121,87 @@ pub const ShapedLine = struct {
         return saw_forward and saw_back;
     }
 
-    /// Size of the logical byte prefix [0, byte_offset) of this already
-    /// shaped line; no reshaping. In an RTL run that prefix is the
-    /// buffer's trailing glyphs, not its leading ones.
+    /// Optional width cap on a measuring walk. The default measures
+    /// everything it is given.
+    pub const WidthLimit = struct {
+        max: f32 = std.math.inf(f32),
+        end_metric: EndMetric = .before,
+    };
+
+    /// What a measuring walk found: the extent it committed to, and how
+    /// many glyphs of `range` it got through before `limit` stopped it.
+    pub const Extents = struct { size: metrics.Size, glyphs_used: usize };
+
+    /// Device-pixel ink extent of `range`'s glyphs on this already-shaped
+    /// line; no reshaping. The one place glyph extents are accumulated --
+    /// every other measurement here (`measureLogicalPrefix`,
+    /// `logicalPrefixForWidth`, and a caller's own max-width search) is a
+    /// choice of `range` and `limit`, not a second copy of this walk.
     ///
-    /// Measured per glyph against *that glyph's own* font rather than
-    /// through `measureGlyphRange`: an RTL run from a fallback font must
-    /// measure against the fallback's metrics, not the primary's.
+    /// Measured per glyph against *that glyph's own* font: an RTL run
+    /// from a fallback font must measure against the fallback's metrics,
+    /// not the primary's. `provider` supplies those by font index --
+    /// `glyphInfoGet(gpa, font_index, codepoint)`, `toPixels` and
+    /// `ascent`, plus `baseHeight()` for the line's own height floor --
+    /// which belongs to the caller's primary font, not to whichever
+    /// fallback happened to draw the first glyph.
+    ///
+    /// `size` is the extent as of the last glyph that *fit*, not as of
+    /// the one that broke the limit.
+    pub fn measureGlyphs(
+        self: ShapedLine,
+        gpa: std.mem.Allocator,
+        provider: anytype,
+        range: Buffer.GlyphRange,
+        limit: WidthLimit,
+        snap: bool,
+    ) !Extents {
+        var x: f32 = 0;
+        var minx: f32 = 0;
+        var maxx: f32 = 0;
+        var miny: f32 = 0;
+        var maxy: f32 = provider.baseHeight();
+        var out: Extents = .{ .size = .{ .w = 0, .h = maxy }, .glyphs_used = 0 };
+        var last_one = false;
+
+        for (
+            self.buffer.info.items[range.start..range.end],
+            self.buffer.pos.items[range.start..range.end],
+            range.start..,
+        ) |info, pos, gidx| {
+            const fi = self.fontIndexForGlyph(gidx);
+            const gi = try provider.glyphInfoGet(gpa, fi, info.codepoint);
+            const off_x = provider.toPixels(fi, pos.x_offset);
+            const adv = provider.toPixels(fi, pos.x_advance);
+            const adv_used = if (snap) @round(adv) else adv;
+
+            minx = @min(minx, x + off_x + gi.leftBearing);
+            maxx = @max(maxx, x + off_x + gi.leftBearing + gi.w);
+            maxx = @max(maxx, x + adv_used);
+
+            miny = @min(miny, provider.ascent(fi) - gi.topBearing);
+            maxy = @max(maxy, provider.ascent(fi) - gi.topBearing + gi.h);
+
+            if (maxx - minx > limit.max) {
+                if (limit.end_metric == .before) break;
+                // .nearest: keep this glyph only if overshooting is the
+                // closer of the two answers.
+                if ((maxx - minx) - limit.max >= limit.max - out.size.w) break;
+                last_one = true;
+            }
+
+            out.glyphs_used = gidx - range.start + 1;
+            out.size = .{ .w = maxx - minx, .h = maxy - miny };
+            x += adv_used;
+
+            if (last_one) break;
+        }
+        return out;
+    }
+
+    /// Size of the logical byte prefix [0, byte_offset) of this already
+    /// shaped line. In an RTL run that prefix is the buffer's trailing
+    /// glyphs, not its leading ones.
     pub fn measureLogicalPrefix(
         self: ShapedLine,
         gpa: std.mem.Allocator,
@@ -136,26 +209,7 @@ pub const ShapedLine = struct {
         byte_offset: usize,
         snap: bool,
     ) !metrics.Size {
-        const r = self.logicalPrefixGlyphs(byte_offset);
-        var x: f32 = 0;
-        var minx: f32 = 0;
-        var maxx: f32 = 0;
-        var miny: f32 = 0;
-        var maxy: f32 = provider.height(0);
-        for (self.buffer.info.items[r.start..r.end], self.buffer.pos.items[r.start..r.end], r.start..) |info, pos, gidx| {
-            const fi = self.fontIndexForGlyph(gidx);
-            const gi = try provider.glyphInfoGet(gpa, fi, info.codepoint);
-            const off_x = provider.toPixels(fi, pos.x_offset);
-            const adv = provider.toPixels(fi, pos.x_advance);
-            const adv_used = if (snap) @round(adv) else adv;
-            minx = @min(minx, x + off_x + gi.leftBearing);
-            maxx = @max(maxx, x + off_x + gi.leftBearing + gi.w);
-            maxx = @max(maxx, x + adv_used);
-            miny = @min(miny, provider.ascent(fi) - gi.topBearing);
-            maxy = @max(maxy, provider.ascent(fi) - gi.topBearing + gi.h);
-            x += adv_used;
-        }
-        return .{ .w = maxx - minx, .h = maxy - miny };
+        return (try self.measureGlyphs(gpa, provider, self.logicalPrefixGlyphs(byte_offset), .{}, snap)).size;
     }
 
     pub const PrefixFit = struct { byte: usize, w: f32 };
@@ -592,7 +646,7 @@ pub fn Cache(comptime FontKey: type) type {
         ///   fontForCodepoint(state_gpa, cp: u21) ?FontKey
         ///   ensureFont(state_gpa, key: FontKey) !parsing.Font
         ///   hasFont(key: FontKey) bool
-        ///   toPixels(font_index: u16, font_units: i32) f32
+        ///   toPixels(key: FontKey, font_units: i32) f32
         ///   noteMissingCoverage(state_gpa, cp: u21) void
         pub fn shapeLine(
             self: *Self,
@@ -693,7 +747,7 @@ pub fn Cache(comptime FontKey: type) type {
             var segments: std.ArrayList(ShapedLine.Segment) = .empty;
             errdefer segments.deinit(output);
             var cache_segments: std.ArrayList(Cached.Segment) = .empty;
-            errdefer cache_segments.deinit(output);
+            defer cache_segments.deinit(output);
             // The fonts some segment actually uses, in first-appearance order.
             var used_keys: std.ArrayList(FontKey) = .empty;
             errdefer used_keys.deinit(output);
@@ -735,7 +789,7 @@ pub fn Cache(comptime FontKey: type) type {
                     try used_keys.append(output, key);
                 }
 
-                if (has_tab) applyTabStops(&result, provider, fonts_list.items, segments.items, decoded.codepoints, style);
+                if (has_tab) applyTabStops(&result, provider, fonts_list.items, keys_list.items, segments.items, decoded.codepoints, style);
 
                 // Renumber onto that list, so the returned font list
                 // describes the segments exactly -- the same numbering a
@@ -782,10 +836,7 @@ pub fn Cache(comptime FontKey: type) type {
             };
 
             self.store(state_gpa, cache_key, &line, cache_segments.items);
-            cache_segments.deinit(output);
 
-            // toOwnedSlice empties the list, so the deferred deinit above
-            // is left a no-op rather than a double free.
             return .{ .line = line, .font_keys = try used_keys.toOwnedSlice(output) };
         }
     };
@@ -812,6 +863,7 @@ fn applyTabStops(
     buffer: *Buffer,
     provider: anytype,
     fonts: []const root.parsing.Font,
+    font_keys: anytype,
     segments: []const ShapedLine.Segment,
     codepoints: []const u21,
     style: Style,
@@ -827,7 +879,7 @@ fn applyTabStops(
             const hmtx = font.tableData("hmtx".*) orelse break :blk 0;
             break :blk root.parsing.Table.hmtx.metricForGlyph(hmtx, space_glyph, hhea.number_of_h_metrics).advance_width;
         };
-        const space_px = provider.toPixels(seg.font_index, space_units);
+        const space_px = provider.toPixels(font_keys[seg.font_index], space_units);
         for (seg.glyph_start..seg.glyph_end) |k| {
             const g = if (rtl) seg.glyph_end - 1 - (k - seg.glyph_start) else k;
             const info = &buffer.info.items[g];
@@ -841,7 +893,7 @@ fn applyTabStops(
                 pos.x_offset = 0;
                 pos.x_advance = @intFromFloat(@round((next - pen) * @as(f32, @floatFromInt(space_units)) / space_px));
             }
-            pen += provider.toPixels(seg.font_index, pos.x_advance);
+            pen += provider.toPixels(font_keys[seg.font_index], pos.x_advance);
         }
     }
 }

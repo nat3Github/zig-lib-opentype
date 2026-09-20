@@ -29,7 +29,6 @@ pub const Feature = shaping.Feature;
 
 pub const shapeWithContext = shaping.shapeWithContext;
 pub const shapeBidiParagraphWithFallback = shaping.shapeBidiParagraphWithFallback;
-pub const measureGlyphRange = shaping.measureGlyphRange;
 
 pub const line_cache = @import("shaping/line_cache.zig");
 pub const ShapedLine = line_cache.ShapedLine;
@@ -49,6 +48,8 @@ pub const DiscoveryProperties = discovery.Properties;
 pub const DiscoveryFamilyName = discovery.FamilyName;
 
 pub const selectBestFontMatch = discovery.selectBestMatch;
+pub const FamilyAliases = discovery.Aliases;
+pub const CoverageCache = discovery.CoverageCache;
 
 test {
     _ = discovery;
