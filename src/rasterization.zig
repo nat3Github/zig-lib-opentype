@@ -35,6 +35,14 @@ const common = @import("rasterization/common.zig");
 const mask_gamma = @import("rasterization/mask_gamma.zig");
 const Rasterizer = @import("rasterization/rasterizer.zig").Rasterizer;
 
+test {
+    _ = cff_hint;
+    _ = colr;
+    _ = common;
+    _ = mask_gamma;
+    _ = @import("rasterization/rasterizer.zig");
+}
+
 const ColrWalker = colr.ColrWalker;
 const Affine = colr.Affine;
 const ScaledPoint = common.ScaledPoint;

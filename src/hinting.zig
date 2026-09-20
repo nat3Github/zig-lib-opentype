@@ -806,7 +806,7 @@ pub const Interpreter = struct {
             },
             0x1A => self.gs.minimum_distance = args[0],
             0x1B => unreachable, // ELSE: handled in step()
-            0x1C => self.insJmpr(args),
+            0x1C => try self.insJmpr(args),
             0x1D => self.gs.control_value_cutin = args[0],
             0x1E => self.gs.single_width_cutin = args[0],
             0x1F => self.gs.single_width_value = args[0],
@@ -900,8 +900,8 @@ pub const Interpreter = struct {
                 self.setSuperRound(0x2D41, args[0]);
                 self.gs.round_state = .super_45;
             },
-            0x78 => if (args[1] != 0) self.insJmpr(args),
-            0x79 => if (args[1] == 0) self.insJmpr(args),
+            0x78 => if (args[1] != 0) try self.insJmpr(args),
+            0x79 => if (args[1] == 0) try self.insJmpr(args),
             0x7A => {
                 self.gs.round_state = .off;
             },
@@ -966,7 +966,7 @@ pub const Interpreter = struct {
         }
     }
 
-    fn insJmpr(self: *Interpreter, args: []i32) void {
+    fn insJmpr(self: *Interpreter, args: []i32) Error!void {
         const new_ip: i64 = @as(i64, self.ip) + args[0];
         if (new_ip < 0) return;
         if (self.call_top > 0) {
@@ -980,6 +980,7 @@ pub const Interpreter = struct {
         self.length = 0;
         if (args[0] < 0) {
             self.neg_jump_counter += 1;
+            if (self.neg_jump_counter > self.neg_jump_counter_max) return error.ExecutionTooLong;
         }
     }
 

@@ -429,7 +429,7 @@ test "single hstem pair produces a two-edge hint map with mid-stem scale" {
 
     var mask: HintMask = .{};
     var xblues: blues.Blues = undefined;
-    xblues.init(&xblues, .{
+    blues.init(&xblues, .{
         .scale = one,
         .darken_y = 0,
         .stem_darkened = false,

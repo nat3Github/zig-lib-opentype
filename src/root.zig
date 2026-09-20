@@ -53,6 +53,13 @@ pub const CoverageCache = discovery.CoverageCache;
 
 test {
     _ = discovery;
+    _ = parsing;
+    _ = unicode;
+    _ = shaping;
+    _ = rasterization;
+    _ = hinting;
+    _ = render;
+    _ = line_cache;
 }
 
 pub const LineBreakStrictness = unicode.LineBreakStrictness;

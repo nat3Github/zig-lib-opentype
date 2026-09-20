@@ -22,6 +22,10 @@ test {
     _ = fontconfig;
     _ = android;
     _ = stack;
+    _ = manifest;
+    _ = web_fallback;
+    _ = core_text;
+    _ = directwrite;
 }
 
 /// Index of the face in collection `file` whose `name` table PostScript

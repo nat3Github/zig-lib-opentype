@@ -658,7 +658,8 @@ pub const Table = struct {
                 return switch (self.format) {
                     0 => lookupFormat0(self.sub, codepoint),
                     4 => lookupFormat4(self.sub, codepoint),
-                    12 => lookupFormat12(self.sub, codepoint),
+                    12 => lookupSegmented(self.sub, codepoint, false),
+                    13 => lookupSegmented(self.sub, codepoint, true),
                     else => null,
                 };
             }
@@ -727,7 +728,10 @@ pub const Table = struct {
             return switch (sel.format) {
                 0 => coverageRangesFormat0(sub, alloc),
                 4 => coverageRangesFormat4(sub, alloc),
-                12 => coverageRangesFormat12(sub, alloc),
+                // Format 13 shares format 12's header and group layout; only
+                // the glyph a group resolves to differs, which coverage
+                // ranges do not record.
+                12, 13 => coverageRangesFormat12(sub, alloc),
                 else => &.{},
             };
         }
@@ -931,7 +935,10 @@ pub const Table = struct {
             return @truncate(@as(u32, @bitCast(@as(i32, glyph) + id_delta)));
         }
 
-        fn lookupFormat12(sub: []const u8, codepoint: u21) ?u16 {
+        /// Format 12 (SegmentedCoverage) and 13 (ManyToOneRangeMappings):
+        /// same groups, but a format-13 group maps its whole range to the
+        /// one `glyphID` instead of counting up from `startGlyphID`.
+        fn lookupSegmented(sub: []const u8, codepoint: u21, many_to_one: bool) ?u16 {
             if (sub.len < 16) return null;
             const declared_groups = std.mem.readInt(u32, sub[12..][0..4], .big);
             const usable_groups = @min(declared_groups, (sub.len - 16) / 12);
@@ -953,7 +960,7 @@ pub const Table = struct {
                     lo = mid + 1;
                 } else {
                     const start_glyph = std.mem.readInt(u32, sub[pos + 8 ..][0..4], .big);
-                    const glyph = start_glyph + (codepoint - start_char);
+                    const glyph = if (many_to_one) start_glyph else start_glyph + (codepoint - start_char);
                     if (glyph > 0xFFFF) return null;
                     return @intCast(glyph);
                 }
