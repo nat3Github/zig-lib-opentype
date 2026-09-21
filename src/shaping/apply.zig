@@ -71,9 +71,6 @@ const table_tag_gpos = map_mod.table_tag_gpos;
 //     phase-1 scope per this component's complex-shaper deferral. PairPos's
 //     *second* glyph lookup does use lookup-flag skipping (via GDEF glyph
 //     class, when present) since that's the common "kern past a mark" case.
-//   - AlternateSubst's random-alternate path (`c->random`) is not ported:
-//     it only triggers for the 'rand' feature, which the default feature
-//     set below never enables.
 const gsub_tag_single = 1;
 const gsub_tag_multiple = 2;
 const gsub_tag_alternate = 3;
@@ -95,6 +92,10 @@ const gpos_tag_extension = 9;
 /// hb's `HB_MAX_CONTEXT_LENGTH`, the cap its `match_input` puts on a
 /// LigatureSubst's componentCount.
 const max_ligature_components = 64;
+
+/// HB_OT_MAP_MAX_VALUE: the value the 'rand' feature is registered with,
+/// and AlternateSubst's signal to pick an alternate at random.
+pub const map_max_feature_value: u32 = 255;
 
 /// Nested-lookup recursion cap for Contextual/Chaining Context lookups
 /// (`applyLookupOnce`), mirroring hb's `HB_MAX_NESTING_LEVEL`.
@@ -150,14 +151,51 @@ fn shouldSkipClass(class: u16, lookup_flags: u32) bool {
     };
 }
 
-/// hb's skip iterator also consults per-lookup auto_zwnj/auto_zwj flags
-/// (hb-ot-layout-gsubgpos.hh's `ignore_zwnj`/`ignore_zwj`) gated by whether
-/// a complex shaper asked for manual joiner handling. This port has no
-/// complex shapers (phase-1 scope, see shaping.zig's top doc comment), so
-/// those flags are always true - joiners are unconditionally skippable
-/// during lookup matching, independent of `lookup_flags`.
-fn shouldSkipGlyph(info: GlyphInfo, gdef: Gdef, lookup_flags: u32) bool {
-    if (info.is_zwj or info.is_zwnj) return true;
+/// Which joiners a skip iterator may step over - hb's
+/// `matcher_t::ignore_zwnj`/`ignore_zwj`.
+const Skip = struct { zwnj: bool, zwj: bool };
+
+/// hb's per-lookup `auto_zwnj`/`auto_zwj`: a complex shaper that handles
+/// joiners itself (Indic, Khmer, Myanmar, USE) clears them so its own
+/// features stop stepping over a joiner the text put there to block them.
+const Joiners = struct {
+    auto_zwnj: bool = true,
+    auto_zwj: bool = true,
+
+    /// hb's `skippy_iter::init(context_match = false)`. Matching a
+    /// ligature's own components never steps over a ZWNJ in GSUB - that is
+    /// what makes "f, ZWNJ, i" come out unligated.
+    fn direct(self: Joiners, table_index: u1) Skip {
+        return .{ .zwnj = table_index == 1, .zwj = self.auto_zwj };
+    }
+
+    /// hb's `skippy_iter::init(context_match = true)`. Context/ChainContext
+    /// (and ReverseChainSingle) matching always steps over a ZWJ, and over a
+    /// ZWNJ unless the shaper asked to see it.
+    fn contextual(self: Joiners, table_index: u1) Skip {
+        return .{ .zwnj = table_index == 1 or self.auto_zwnj, .zwj = true };
+    }
+};
+
+/// GPOS never sees a joiner it must respect in this port: every feature it
+/// maps is registered with automatic joiner handling, for which both
+/// `Joiners` rules above collapse to "step over both".
+const skip_all_joiners = Skip{ .zwnj = true, .zwj = true };
+
+fn shouldSkipGlyph(info: GlyphInfo, gdef: Gdef, lookup_flags: u32, skip: Skip) bool {
+    if ((info.is_zwnj and skip.zwnj) or (info.is_zwj and skip.zwj)) return true;
+    return !matchesLookupProps(info, gdef, lookup_flags);
+}
+
+/// hb's `check_glyph_property`: the lookup-flag half of the skip predicate,
+/// without the joiner handling. `applyLookup` gates each glyph it steps
+/// over on this rather than on `shouldSkipGlyph`, because a lookup does
+/// apply at a ZWJ/ZWNJ even though matching steps over one.
+fn matchesLookupProps(info: GlyphInfo, gdef: Gdef, lookup_flags: u32) bool {
+    return !filteredByLookupProps(info, gdef, lookup_flags);
+}
+
+fn filteredByLookupProps(info: GlyphInfo, gdef: Gdef, lookup_flags: u32) bool {
     const class = glyphClass(gdef, info.codepoint);
     if (shouldSkipClass(class, lookup_flags)) return true;
     if (class != 3 or info.codepoint > std.math.maxInt(u16)) return false;
@@ -181,27 +219,91 @@ fn shouldSkipGlyph(info: GlyphInfo, gdef: Gdef, lookup_flags: u32) bool {
 /// Context/ChainContext matching (src/shaping.zig's `applyContextCore`) can
 /// reuse it against either `buffer.info` (GSUB "input"/"lookahead", GPOS
 /// everything) without duplicating the skip logic.
-fn nextUnskippedIn(infos: []const GlyphInfo, gdef: Gdef, lookup_flags: u32, start: usize) ?usize {
+fn nextUnskippedIn(infos: []const GlyphInfo, gdef: Gdef, lookup_flags: u32, skip: Skip, start: usize) ?usize {
     var i = start;
     while (i < infos.len) : (i += 1) {
-        if (!shouldSkipGlyph(infos[i], gdef, lookup_flags)) return i;
+        if (!shouldSkipGlyph(infos[i], gdef, lookup_flags, skip)) return i;
     }
     return null;
 }
 
 /// Searches backward from `start - 1` down to 0 in `infos` for the first
 /// glyph not filtered by `lookup_flags`. See `nextUnskippedIn`.
-fn prevUnskippedIn(infos: []const GlyphInfo, gdef: Gdef, lookup_flags: u32, start: usize) ?usize {
+fn prevUnskippedIn(infos: []const GlyphInfo, gdef: Gdef, lookup_flags: u32, skip: Skip, start: usize) ?usize {
     var i = start;
     while (i > 0) {
         i -= 1;
-        if (!shouldSkipGlyph(infos[i], gdef, lookup_flags)) return i;
+        if (!shouldSkipGlyph(infos[i], gdef, lookup_flags, skip)) return i;
     }
     return null;
 }
 
-fn nextUnskipped(buffer: *const Buffer, gdef: Gdef, lookup_flags: u32, start: usize) ?usize {
-    return nextUnskippedIn(buffer.info.items, gdef, lookup_flags, start);
+fn nextUnskipped(buffer: *const Buffer, gdef: Gdef, lookup_flags: u32, skip: Skip, start: usize) ?usize {
+    return nextUnskippedIn(buffer.info.items, gdef, lookup_flags, skip, start);
+}
+
+/// hb's `may_skip` returning SKIP_MAYBE: a default ignorable is stepped over
+/// only when it isn't the glyph being looked for. A glyph a ligature already
+/// swallowed is no longer ignorable.
+fn maybeSkippable(info: GlyphInfo, skip: Skip) bool {
+    if (info.is_zwnj and !skip.zwnj) return false;
+    if (info.is_zwj and !skip.zwj) return false;
+    return info.is_default_ignorable and info.lig_num_comps <= 1;
+}
+
+/// hb's `skippy_iter` with a match function, which the plain
+/// `nextUnskippedIn`/`prevUnskippedIn` above (hb's matcher-less iterator)
+/// can't express: a default ignorable is only SKIP_MAYBE, so it is stepped
+/// over when it isn't the glyph being looked for and *matched* when it is.
+/// Emoji ZWJ sequences depend on that - their ligatures list the joiner as a
+/// real component. Any other glyph that doesn't match ends the search.
+/// `matcher` is duck-typed: anything with `matches(GlyphInfo) !bool`.
+fn matchForward(infos: []const GlyphInfo, gdef: Gdef, lookup_flags: u32, skip: Skip, start: usize, matcher: anytype) !?usize {
+    var i = start;
+    while (i < infos.len) : (i += 1) {
+        const info = infos[i];
+        if (!matchesLookupProps(info, gdef, lookup_flags)) continue;
+        if (try matcher.matches(info)) return i;
+        if (!maybeSkippable(info, skip)) return null;
+    }
+    return null;
+}
+
+const ComponentMatcher = struct {
+    glyph: u16,
+    lookup_mask: u32,
+    syllable: u8,
+
+    fn matches(self: ComponentMatcher, info: GlyphInfo) error{}!bool {
+        if (info.mask & self.lookup_mask == 0) return false;
+        if (self.syllable != 0 and info.indic_syllable != self.syllable) return false;
+        return info.codepoint == self.glyph;
+    }
+};
+
+/// Wraps `matchAt` for `matchForward`/`matchBackward`.
+const SlotMatcher = struct {
+    reader: parsing.Table.Layout.SubtableReader,
+    mode: MatchMode,
+    off: usize,
+
+    fn matches(self: SlotMatcher, info: GlyphInfo) parsing.Font.ParseError!bool {
+        if (info.codepoint > std.math.maxInt(u16)) return false;
+        return matchAt(self.reader, self.mode, self.off, @intCast(info.codepoint));
+    }
+};
+
+/// `matchForward` walking backwards from `start - 1`.
+fn matchBackward(infos: []const GlyphInfo, gdef: Gdef, lookup_flags: u32, skip: Skip, start: usize, matcher: anytype) !?usize {
+    var i = start;
+    while (i > 0) {
+        i -= 1;
+        const info = infos[i];
+        if (!matchesLookupProps(info, gdef, lookup_flags)) continue;
+        if (try matcher.matches(info)) return i;
+        if (!maybeSkippable(info, skip)) return null;
+    }
+    return null;
 }
 
 /// Searches backward from `start - 1` down to 0 for the first glyph not
@@ -211,11 +313,17 @@ fn nextUnskipped(buffer: *const Buffer, gdef: Gdef, lookup_flags: u32, start: us
 /// GPOS Context/ChainContext backtrack matching (which, unlike GSUB, has no
 /// out_info side - GPOS never replaces glyphs, so `buffer.info` before `idx`
 /// is still the real left context).
-fn prevUnskipped(buffer: *const Buffer, gdef: Gdef, lookup_flags: u32, start: usize) ?usize {
-    return prevUnskippedIn(buffer.info.items, gdef, lookup_flags, start);
+fn prevUnskipped(buffer: *const Buffer, gdef: Gdef, lookup_flags: u32, skip: Skip, start: usize) ?usize {
+    return prevUnskippedIn(buffer.info.items, gdef, lookup_flags, skip, start);
 }
 
 const lookup_flag_ignore_marks: u32 = 0x0008;
+
+/// GPOS never tests a candidate glyph against the feature mask while
+/// matching (only GSUB's ligature components and AlternateSubst read one),
+/// and a GPOS Context rule can only recurse into GPOS, so there is nothing
+/// for its nested lookups to carry.
+const gpos_lookup_mask: u32 = 0;
 
 fn isMarkGlyph(gdef: Gdef, glyph: u32) bool {
     return glyphClass(gdef, glyph) == 3;
@@ -329,7 +437,7 @@ fn applyGposMarkToBase(
     const mark_cov = try reader.coverageAt(2);
     const mark_index = try mark_cov.get(gid) orelse return false;
 
-    const base_pos = prevUnskipped(buffer, gdef, lookup_flag_ignore_marks, buffer.idx) orelse return false;
+    const base_pos = prevUnskipped(buffer, gdef, lookup_flag_ignore_marks, skip_all_joiners, buffer.idx) orelse return false;
     const base_glyph = buffer.info.items[base_pos].codepoint;
     if (base_glyph > std.math.maxInt(u16)) return false;
     const base_cov = try reader.coverageAt(4);
@@ -343,17 +451,10 @@ fn applyGposMarkToBase(
 }
 
 /// Ports MarkLigPos (MarkLigPosFormat1.hh): attaches the current mark to a
-/// component of the nearest preceding ligature glyph. hb picks the
-/// component via the mark's and ligature's tracked `lig_id`/`lig_comp`
-/// (set when GSUB's LigatureSubst produced the ligature); this port's GSUB
-/// apply engine never sets those (see gsub_tag_ligature's doc comment), so
-/// `lig_id` here is always the GlyphInfo default (0) for both sides, which
-/// is exactly hb's own "IDs don't match" fallback condition - always
-/// attaching to the ligature's *last* component. That's correct for the
-/// common case (a single mark after a ligature) and only wrong for marks
-/// meant to land mid-ligature on a non-final component (Arabic/Indic-style
-/// shaping, already out of phase-1 scope per this component's complex-
-/// shaper deferral).
+/// component of the nearest preceding ligature glyph, picked from the
+/// `lig_id`/`lig_comp` that GSUB's LigatureSubst stamped on both. A mark
+/// with no matching ligature id falls back to the last component, which is
+/// right for the common "one mark after a ligature" case.
 fn applyGposMarkToLigature(
     reader: parsing.Table.Layout.SubtableReader,
     gid: u16,
@@ -364,7 +465,7 @@ fn applyGposMarkToLigature(
     const mark_cov = try reader.coverageAt(2);
     const mark_index = try mark_cov.get(gid) orelse return false;
 
-    const lig_pos = prevUnskipped(buffer, gdef, lookup_flag_ignore_marks, buffer.idx) orelse return false;
+    const lig_pos = prevUnskipped(buffer, gdef, lookup_flag_ignore_marks, skip_all_joiners, buffer.idx) orelse return false;
     const lig_glyph = buffer.info.items[lig_pos].codepoint;
     if (lig_glyph > std.math.maxInt(u16)) return false;
     const lig_cov = try reader.coverageAt(4);
@@ -380,7 +481,12 @@ fn applyGposMarkToLigature(
 
     const comp_count = try lig_attach.u16At(0);
     if (comp_count == 0) return false;
-    const comp_index = comp_count - 1;
+    const mark_info = buffer.info.items[buffer.idx];
+    const lig_info = buffer.info.items[lig_pos];
+    const comp_index = if (lig_info.lig_id != 0 and lig_info.lig_id == mark_info.lig_id and mark_info.lig_comp > 0)
+        @min(comp_count, mark_info.lig_comp) - 1
+    else
+        comp_count - 1;
 
     return applyMarkAttach(mark_array, mark_index, lig_attach, class_count, comp_index, lig_pos, buffer, direction);
 }
@@ -389,10 +495,16 @@ fn applyGposMarkToLigature(
 /// the immediately preceding glyph, if that glyph is itself a mark (GDEF
 /// class 3). hb's `set_lookup_props(lookup_props & ~IgnoreFlags)` search
 /// clears all class-based skipping, so this is a plain idx-1 lookback, no
-/// `prevUnskipped` needed. The `lig_id`/`lig_comp` same-ligature-component
-/// disambiguation (for stacking marks mid-ligature) again always takes the
-/// "same base" (both 0) fallback path per the untracked-lig_id note on
-/// `applyGposMarkToLigature`.
+/// `prevUnskipped` needed. Two marks only stack if they sit on the same
+/// base or on the same component of the same ligature.
+/// hb's MarkMarkPosFormat1 "good" test: same base (neither is part of a
+/// ligature), same component of the same ligature, or one of the two marks
+/// is itself a ligature.
+fn sameLigatureComponent(a: GlyphInfo, b: GlyphInfo) bool {
+    if (a.lig_id == b.lig_id) return a.lig_id == 0 or a.lig_comp == b.lig_comp;
+    return (a.lig_id > 0 and a.lig_comp == 0) or (b.lig_id > 0 and b.lig_comp == 0);
+}
+
 fn applyGposMarkToMark(
     reader: parsing.Table.Layout.SubtableReader,
     gid: u16,
@@ -405,6 +517,7 @@ fn applyGposMarkToMark(
     if (buffer.idx == 0) return false;
     const j = buffer.idx - 1;
     if (!isMarkGlyph(gdef, buffer.info.items[j].codepoint)) return false;
+    if (!sameLigatureComponent(buffer.info.items[buffer.idx], buffer.info.items[j])) return false;
 
     const mark2_glyph = buffer.info.items[j].codepoint;
     if (mark2_glyph > std.math.maxInt(u16)) return false;
@@ -477,7 +590,7 @@ fn applyGposCursive(
     if (this_index >= record_count) return false;
     const entry_anchor = try readAnchor(reader, 6 + @as(usize, this_index) * 4) orelse return false;
 
-    const i = prevUnskipped(buffer, gdef, lookup_flags, buffer.idx) orelse return false;
+    const i = prevUnskipped(buffer, gdef, lookup_flags, skip_all_joiners, buffer.idx) orelse return false;
     const prev_glyph = buffer.info.items[i].codepoint;
     if (prev_glyph > std.math.maxInt(u16)) return false;
     const prev_index = try cov.get(@intCast(prev_glyph)) orelse return false;
@@ -772,14 +885,18 @@ fn readChainRuleOffsets(
 /// nesting budget; each hop through here consumes one level, guaranteeing
 /// termination within `max_nesting_level` steps regardless of cyclic
 /// LookupRecord references (CLAUDE.md's shaping attack-surface guidance).
-/// No feature mask check (hb's recursion doesn't consult one either - masks
-/// gate the top-level per-feature driving loop, not nested application),
-/// and GSUB's AlternateSubst (the one subtable type that reads the current
-/// glyph's mask) gets `lookup_mask = 0` here, which is its existing
-/// "feature not enabled" no-op path.
+/// No feature mask check on the nested lookup itself (hb's recursion
+/// doesn't consult one either - masks gate the top-level per-feature
+/// driving loop, not nested application), but `lookup_mask` still carries
+/// the *outer* lookup's mask down, because hb leaves `c->lookup_mask`
+/// untouched across `recurse` and the input matchers test candidate glyphs
+/// against it.
 fn applyLookupOnce(
     layout: parsing.Table.Layout,
     lookup_index: u16,
+    lookup_mask: u32,
+    random: bool,
+    joiners: Joiners,
     gdef: Gdef,
     buffer: *Buffer,
     table_index: u1,
@@ -802,7 +919,7 @@ fn applyLookupOnce(
     while (si < sub_count) : (si += 1) {
         const sub_off = try lk.subtableOffset(si);
         const applied = if (table_index == 0)
-            try applyGsubSubtable(layout, lookup_type, sub_off, 0, buffer, gdef, lookup_flags, depth - 1)
+            try applyGsubSubtable(layout, lookup_type, sub_off, lookup_mask, random, joiners, buffer, gdef, lookup_flags, depth - 1)
         else
             try applyGposSubtable(layout, lookup_type, sub_off, gdef, lookup_flags, buffer, direction, depth - 1);
         if (applied) return true;
@@ -839,6 +956,9 @@ fn applyContextCore(
     reader: parsing.Table.Layout.SubtableReader,
     offs: ContextOffsets,
     lookup_flags: u32,
+    lookup_mask: u32,
+    random: bool,
+    joiners: Joiners,
     gdef: Gdef,
     buffer: *Buffer,
     table_index: u1,
@@ -860,10 +980,8 @@ fn applyContextCore(
         var i: u16 = 1;
         var prev = buffer.idx;
         while (i < offs.input_count) : (i += 1) {
-            const next = nextUnskippedIn(buffer.info.items, gdef, lookup_flags, prev + 1) orelse return false;
-            const g = buffer.info.items[next].codepoint;
-            if (g > std.math.maxInt(u16)) return false;
-            if (!try matchAt(reader, offs.input_mode, offs.input_base + @as(usize, i) * 2, @intCast(g))) return false;
+            const slot = SlotMatcher{ .reader = reader, .mode = offs.input_mode, .off = offs.input_base + @as(usize, i) * 2 };
+            const next = try matchForward(buffer.info.items, gdef, lookup_flags, joiners.contextual(table_index), prev + 1, slot) orelse return false;
             positions[i] = next;
             prev = next;
         }
@@ -874,10 +992,8 @@ fn applyContextCore(
         var i: u16 = 0;
         var pos = end_pos;
         while (i < offs.lookahead_count) : (i += 1) {
-            const next = nextUnskippedIn(buffer.info.items, gdef, lookup_flags, pos) orelse return false;
-            const g = buffer.info.items[next].codepoint;
-            if (g > std.math.maxInt(u16)) return false;
-            if (!try matchAt(reader, offs.lookahead_mode, offs.lookahead_base + @as(usize, i) * 2, @intCast(g))) return false;
+            const slot = SlotMatcher{ .reader = reader, .mode = offs.lookahead_mode, .off = offs.lookahead_base + @as(usize, i) * 2 };
+            const next = try matchForward(buffer.info.items, gdef, lookup_flags, joiners.contextual(table_index), pos, slot) orelse return false;
             pos = next + 1;
         }
     }
@@ -887,14 +1003,11 @@ fn applyContextCore(
         var out_prev = buffer.out_info.items.len;
         var in_prev = buffer.idx;
         while (i < offs.backtrack_count) : (i += 1) {
-            const found = if (table_index == 0)
-                prevUnskippedIn(buffer.out_info.items, gdef, lookup_flags, out_prev)
+            const slot = SlotMatcher{ .reader = reader, .mode = offs.backtrack_mode, .off = offs.backtrack_base + @as(usize, i) * 2 };
+            const pos = if (table_index == 0)
+                try matchBackward(buffer.out_info.items, gdef, lookup_flags, joiners.contextual(table_index), out_prev, slot) orelse return false
             else
-                prevUnskippedIn(buffer.info.items, gdef, lookup_flags, in_prev);
-            const pos = found orelse return false;
-            const g = (if (table_index == 0) buffer.out_info.items[pos] else buffer.info.items[pos]).codepoint;
-            if (g > std.math.maxInt(u16)) return false;
-            if (!try matchAt(reader, offs.backtrack_mode, offs.backtrack_base + @as(usize, i) * 2, @intCast(g))) return false;
+                try matchBackward(buffer.info.items, gdef, lookup_flags, joiners.contextual(table_index), in_prev, slot) orelse return false;
             if (table_index == 0) out_prev = pos else in_prev = pos;
         }
     }
@@ -935,7 +1048,7 @@ fn applyContextCore(
         if (!buffer.successful) break;
         if (buffer.max_ops <= 0) break;
 
-        const applied = try applyLookupOnce(layout, lookup_list_index, gdef, buffer, table_index, direction, depth);
+        const applied = try applyLookupOnce(layout, lookup_list_index, lookup_mask, random, joiners, gdef, buffer, table_index, direction, depth);
         if (!applied) continue;
 
         const new_len: i64 = @intCast(buffer.backtrackLen() + buffer.lookaheadLen());
@@ -1000,6 +1113,9 @@ fn applyRuleBasedContext(
     layout: parsing.Table.Layout,
     reader: parsing.Table.Layout.SubtableReader,
     lookup_flags: u32,
+    lookup_mask: u32,
+    random: bool,
+    joiners: Joiners,
     gdef: Gdef,
     buffer: *Buffer,
     table_index: u1,
@@ -1056,7 +1172,7 @@ fn applyRuleBasedContext(
             try readChainRuleOffsets(rule, backtrack_mode, input_mode, lookahead_mode)
         else
             try readRuleOffsets(rule, input_mode);
-        if (try applyContextCore(layout, rule, offs, lookup_flags, gdef, buffer, table_index, direction, depth)) return true;
+        if (try applyContextCore(layout, rule, offs, lookup_flags, lookup_mask, random, joiners, gdef, buffer, table_index, direction, depth)) return true;
     }
     return false;
 }
@@ -1076,6 +1192,7 @@ fn applyReverseChainSingleSubst(
     reader: parsing.Table.Layout.SubtableReader,
     gid: u16,
     lookup_flags: u32,
+    joiners: Joiners,
     gdef: Gdef,
     buffer: *Buffer,
 ) parsing.Font.ParseError!bool {
@@ -1102,31 +1219,40 @@ fn applyReverseChainSingleSubst(
         var i: u16 = 0;
         var prev = buffer.idx;
         while (i < backtrack_count) : (i += 1) {
-            const pos = prevUnskippedIn(buffer.info.items, gdef, lookup_flags, prev) orelse return false;
-            const g = buffer.info.items[pos].codepoint;
-            if (g > std.math.maxInt(u16)) return false;
-            const cov_i = try reader.coverageAt(backtrack_base + @as(usize, i) * 2);
-            if (try cov_i.get(@intCast(g)) == null) return false;
-            prev = pos;
+            const slot = SlotMatcher{ .reader = reader, .mode = .coverage, .off = backtrack_base + @as(usize, i) * 2 };
+            prev = try matchBackward(buffer.info.items, gdef, lookup_flags, joiners.contextual(0), prev, slot) orelse return false;
         }
     }
     {
         var i: u16 = 0;
         var pos = buffer.idx + 1;
         while (i < lookahead_count) : (i += 1) {
-            const next = nextUnskippedIn(buffer.info.items, gdef, lookup_flags, pos) orelse return false;
-            const g = buffer.info.items[next].codepoint;
-            if (g > std.math.maxInt(u16)) return false;
-            const cov_i = try reader.coverageAt(lookahead_base + @as(usize, i) * 2);
-            if (try cov_i.get(@intCast(g)) == null) return false;
-            pos = next + 1;
+            const slot = SlotMatcher{ .reader = reader, .mode = .coverage, .off = lookahead_base + @as(usize, i) * 2 };
+            pos = (try matchForward(buffer.info.items, gdef, lookup_flags, joiners.contextual(0), pos, slot) orelse return false) + 1;
         }
     }
 
     const new_gid = try reader.u16At(sub_base + @as(usize, index) * 2);
     buffer.info.items[buffer.idx].codepoint = new_gid;
+    buffer.info.items[buffer.idx].is_substituted = true;
     buffer.digest.add(new_gid);
     return true;
+}
+
+/// hb's `hb_ot_apply_context_t::_set_glyph_props`: stamps the glyphs a GSUB
+/// lookup just appended to the output. `count` is how many it appended.
+fn setGlyphProps(buffer: *Buffer, count: usize, ligature: bool, component: bool) void {
+    const out = buffer.out_info.items;
+    for (out[out.len - count ..]) |*glyph_info| {
+        glyph_info.is_substituted = true;
+        // hb: only the *last* Ligature/Multiple transformation counts, so a
+        // ligature forgives an earlier multiplication.
+        if (ligature) {
+            glyph_info.is_ligated = true;
+            glyph_info.is_multiplied = false;
+        }
+        if (component) glyph_info.is_multiplied = true;
+    }
 }
 
 fn applyGsubSubtable(
@@ -1134,6 +1260,8 @@ fn applyGsubSubtable(
     lookup_type: u16,
     sub_off: usize,
     lookup_mask: u32,
+    random: bool,
+    joiners: Joiners,
     buffer: *Buffer,
     gdef: Gdef,
     lookup_flags: u32,
@@ -1154,6 +1282,7 @@ fn applyGsubSubtable(
                     const delta = try reader.i16At(4);
                     const new_gid: u16 = @truncate(@as(u32, @bitCast(@as(i32, gid) +% @as(i32, delta))));
                     try buffer.replaceGlyph(new_gid);
+                    setGlyphProps(buffer, 1, false, false);
                     return true;
                 },
                 2 => {
@@ -1161,6 +1290,7 @@ fn applyGsubSubtable(
                     if (idx >= count) return false;
                     const new_gid = try reader.u16At(6 + @as(usize, idx) * 2);
                     try buffer.replaceGlyph(new_gid);
+                    setGlyphProps(buffer, 1, false, false);
                     return true;
                 },
                 else => return false,
@@ -1174,10 +1304,12 @@ fn applyGsubSubtable(
             if (idx >= seq_count) return false;
             const seq = try reader.subReaderAt(6 + @as(usize, idx) * 2);
             const gcount = try seq.u16At(0);
-            // An empty Sequence is a no-op in hb, not a glyph deletion —
-            // `replaceGlyphs(1, &.{})` would consume the glyph and emit
-            // nothing.
-            if (gcount == 0) return false;
+            // The spec disallows an empty Sequence, but Uniscribe (and so
+            // hb) reads it as a glyph deletion.
+            if (gcount == 0) {
+                buffer.deleteGlyph();
+                return true;
+            }
             // Sequence length is a u16 with no spec cap; the stack path
             // covers every real font, the heap path keeps a long one correct
             // instead of silently dropping the substitution.
@@ -1190,6 +1322,7 @@ fn applyGsubSubtable(
             var gi: usize = 0;
             while (gi < gcount) : (gi += 1) out[gi] = try seq.u16At(2 + gi * 2);
             try buffer.replaceGlyphs(1, out);
+            setGlyphProps(buffer, gcount, false, true);
             return true;
         },
         gsub_tag_alternate => {
@@ -1203,10 +1336,17 @@ fn applyGsubSubtable(
             if (count == 0 or lookup_mask == 0) return false;
             const shift: u5 = @intCast(@ctz(lookup_mask));
             const glyph_mask = buffer.info.items[buffer.idx].mask;
-            const alt_index = (lookup_mask & glyph_mask) >> shift;
+            var alt_index = (lookup_mask & glyph_mask) >> shift;
+            // hb: a feature asking for the maximum value means "surprise
+            // me", which only the 'rand' feature ever does.
+            if (alt_index == map_max_feature_value and random) {
+                buffer.unsafeToBreak(0, buffer.len());
+                alt_index = buffer.randomNumber() % count + 1;
+            }
             if (alt_index == 0 or alt_index > count) return false;
             const new_gid = try aset.u16At(2 + @as(usize, alt_index - 1) * 2);
             try buffer.replaceGlyph(new_gid);
+            setGlyphProps(buffer, 1, false, false);
             return true;
         },
         gsub_tag_ligature => {
@@ -1242,22 +1382,18 @@ fn applyGsubSubtable(
                 var matched = true;
                 var ci: usize = 0;
                 while (ci < comp_count_m1) : (ci += 1) {
-                    const next = nextUnskipped(buffer, gdef, lookup_flags, match_positions[ci] + 1) orelse {
+                    // hb's `may_match`: a component outside this lookup's
+                    // mask, or outside the starting glyph's syllable, is a
+                    // non-match, same as the wrong glyph id.
+                    const component = ComponentMatcher{
+                        .glyph = try lig.u16At(4 + ci * 2),
+                        .lookup_mask = lookup_mask,
+                        .syllable = syllable,
+                    };
+                    const next = try matchForward(buffer.info.items, gdef, lookup_flags, joiners.direct(0), match_positions[ci] + 1, component) orelse {
                         matched = false;
                         break;
                     };
-                    const comp_glyph = try lig.u16At(4 + ci * 2);
-                    // hb's `may_match`: a component outside this lookup's
-                    // mask, or outside the starting glyph's syllable, is a
-                    // hard non-match — not another glyph to skip over.
-                    const cand = buffer.info.items[next];
-                    if (cand.mask & lookup_mask == 0 or
-                        (syllable != 0 and cand.indic_syllable != syllable) or
-                        cand.codepoint != comp_glyph)
-                    {
-                        matched = false;
-                        break;
-                    }
                     match_positions[ci + 1] = next;
                 }
                 if (!matched) continue;
@@ -1267,11 +1403,61 @@ fn applyGsubSubtable(
                 // after it), and the remaining components are deleted.
                 const end = match_positions[comp_count_m1] + 1;
                 buffer.mergeClusters(buffer.idx, end);
+
+                // A base (or a mark) that swallowed nothing but marks stays
+                // a base (or a mark), so later marks can still attach to it;
+                // anything else is a real ligature worth tracking.
+                var is_base_ligature = glyphClass(gdef, buffer.info.items[match_positions[0]].codepoint) == 1;
+                var is_mark_ligature = isMarkGlyph(gdef, buffer.info.items[match_positions[0]].codepoint);
+                for (match_positions[1..component_count]) |mp| {
+                    if (!isMarkGlyph(gdef, buffer.info.items[mp].codepoint)) {
+                        is_base_ligature = false;
+                        is_mark_ligature = false;
+                        break;
+                    }
+                }
+                const is_ligature = !is_base_ligature and !is_mark_ligature;
+
+                const lig_id: u8 = if (is_ligature) buffer.allocateLigId() else 0;
+                var last_lig_id = buffer.info.items[buffer.idx].lig_id;
+                var last_num_components: u16 = buffer.info.items[buffer.idx].lig_num_comps;
+                var components_so_far: u16 = last_num_components;
+                if (is_ligature) {
+                    buffer.info.items[buffer.idx].lig_id = lig_id;
+                    buffer.info.items[buffer.idx].lig_comp = 0;
+                    buffer.info.items[buffer.idx].lig_num_comps = @truncate(component_count);
+                }
+
                 try buffer.replaceGlyph(lig_glyph);
+                setGlyphProps(buffer, 1, true, false);
                 var k: usize = 1;
                 while (k < component_count) : (k += 1) {
-                    while (buffer.idx < match_positions[k]) try buffer.nextGlyph();
+                    while (buffer.idx < match_positions[k]) {
+                        if (is_ligature) {
+                            const cur = &buffer.info.items[buffer.idx];
+                            const this_comp: u16 = if (cur.lig_comp == 0) last_num_components else cur.lig_comp;
+                            cur.lig_id = lig_id;
+                            cur.lig_comp = @truncate(components_so_far - last_num_components + @min(this_comp, last_num_components));
+                            cur.lig_num_comps = 1;
+                        }
+                        try buffer.nextGlyph();
+                    }
+                    last_lig_id = buffer.info.items[buffer.idx].lig_id;
+                    last_num_components = buffer.info.items[buffer.idx].lig_num_comps;
+                    components_so_far += last_num_components;
                     buffer.skipGlyph();
+                }
+
+                // Marks that trailed the *last* component are still numbered
+                // against that component's own former ligature; renumber them
+                // into this one.
+                if (!is_mark_ligature and last_lig_id != 0) {
+                    for (buffer.info.items[buffer.idx..]) |*following| {
+                        if (following.lig_id != last_lig_id) break;
+                        if (following.lig_comp == 0) break;
+                        following.lig_id = lig_id;
+                        following.lig_comp = @truncate(components_so_far - last_num_components + @min(following.lig_comp, last_num_components));
+                    }
                 }
                 return true;
             }
@@ -1282,22 +1468,22 @@ fn applyGsubSubtable(
         // is itself GSUB, which never reads it.
         gsub_tag_context => {
             switch (format) {
-                1 => return applyRuleBasedContext(layout, reader, lookup_flags, gdef, buffer, 0, .left_to_right, depth, false, false),
-                2 => return applyRuleBasedContext(layout, reader, lookup_flags, gdef, buffer, 0, .left_to_right, depth, false, true),
+                1 => return applyRuleBasedContext(layout, reader, lookup_flags, lookup_mask, random, joiners, gdef, buffer, 0, .left_to_right, depth, false, false),
+                2 => return applyRuleBasedContext(layout, reader, lookup_flags, lookup_mask, random, joiners, gdef, buffer, 0, .left_to_right, depth, false, true),
                 3 => {
                     const offs = try readContextFormat3Offsets(reader);
-                    return applyContextCore(layout, reader, offs, lookup_flags, gdef, buffer, 0, .left_to_right, depth);
+                    return applyContextCore(layout, reader, offs, lookup_flags, lookup_mask, random, joiners, gdef, buffer, 0, .left_to_right, depth);
                 },
                 else => return false,
             }
         },
         gsub_tag_chain_context => {
             switch (format) {
-                1 => return applyRuleBasedContext(layout, reader, lookup_flags, gdef, buffer, 0, .left_to_right, depth, true, false),
-                2 => return applyRuleBasedContext(layout, reader, lookup_flags, gdef, buffer, 0, .left_to_right, depth, true, true),
+                1 => return applyRuleBasedContext(layout, reader, lookup_flags, lookup_mask, random, joiners, gdef, buffer, 0, .left_to_right, depth, true, false),
+                2 => return applyRuleBasedContext(layout, reader, lookup_flags, lookup_mask, random, joiners, gdef, buffer, 0, .left_to_right, depth, true, true),
                 3 => {
                     const offs = try readChainContextFormat3Offsets(reader);
-                    return applyContextCore(layout, reader, offs, lookup_flags, gdef, buffer, 0, .left_to_right, depth);
+                    return applyContextCore(layout, reader, offs, lookup_flags, lookup_mask, random, joiners, gdef, buffer, 0, .left_to_right, depth);
                 },
                 else => return false,
             }
@@ -1305,11 +1491,11 @@ fn applyGsubSubtable(
         gsub_tag_reverse_chain_single => {
             if (format != 1) return false;
             if (depth != max_nesting_level) return false;
-            return applyReverseChainSingleSubst(reader, gid, lookup_flags, gdef, buffer);
+            return applyReverseChainSingleSubst(reader, gid, lookup_flags, joiners, gdef, buffer);
         },
         gsub_tag_extension => {
             const unwrapped = try unwrapExtension(reader, gsub_tag_extension) orelse return false;
-            return applyGsubSubtable(layout, unwrapped.lookup_type, unwrapped.sub_off, lookup_mask, buffer, gdef, lookup_flags, depth);
+            return applyGsubSubtable(layout, unwrapped.lookup_type, unwrapped.sub_off, lookup_mask, random, joiners, buffer, gdef, lookup_flags, depth);
         },
         else => return false,
     }
@@ -1358,7 +1544,7 @@ fn applyGposSubtable(
             if (format != 1 and format != 2) return false;
             const cov = try reader.coverageAt(2);
             const idx = try cov.get(gid) orelse return false;
-            const next = nextUnskipped(buffer, gdef, lookup_flags, buffer.idx + 1) orelse return false;
+            const next = nextUnskipped(buffer, gdef, lookup_flags, skip_all_joiners, buffer.idx + 1) orelse return false;
             const second_glyph = buffer.info.items[next].codepoint;
             if (second_glyph > std.math.maxInt(u16)) return false;
             const second_gid: u16 = @intCast(second_glyph);
@@ -1431,22 +1617,22 @@ fn applyGposSubtable(
         },
         gpos_tag_context => {
             switch (format) {
-                1 => return applyRuleBasedContext(layout, reader, lookup_flags, gdef, buffer, 1, direction, depth, false, false),
-                2 => return applyRuleBasedContext(layout, reader, lookup_flags, gdef, buffer, 1, direction, depth, false, true),
+                1 => return applyRuleBasedContext(layout, reader, lookup_flags, gpos_lookup_mask, false, .{}, gdef, buffer, 1, direction, depth, false, false),
+                2 => return applyRuleBasedContext(layout, reader, lookup_flags, gpos_lookup_mask, false, .{}, gdef, buffer, 1, direction, depth, false, true),
                 3 => {
                     const offs = try readContextFormat3Offsets(reader);
-                    return applyContextCore(layout, reader, offs, lookup_flags, gdef, buffer, 1, direction, depth);
+                    return applyContextCore(layout, reader, offs, lookup_flags, gpos_lookup_mask, false, .{}, gdef, buffer, 1, direction, depth);
                 },
                 else => return false,
             }
         },
         gpos_tag_chain_context => {
             switch (format) {
-                1 => return applyRuleBasedContext(layout, reader, lookup_flags, gdef, buffer, 1, direction, depth, true, false),
-                2 => return applyRuleBasedContext(layout, reader, lookup_flags, gdef, buffer, 1, direction, depth, true, true),
+                1 => return applyRuleBasedContext(layout, reader, lookup_flags, gpos_lookup_mask, false, .{}, gdef, buffer, 1, direction, depth, true, false),
+                2 => return applyRuleBasedContext(layout, reader, lookup_flags, gpos_lookup_mask, false, .{}, gdef, buffer, 1, direction, depth, true, true),
                 3 => {
                     const offs = try readChainContextFormat3Offsets(reader);
-                    return applyContextCore(layout, reader, offs, lookup_flags, gdef, buffer, 1, direction, depth);
+                    return applyContextCore(layout, reader, offs, lookup_flags, gpos_lookup_mask, false, .{}, gdef, buffer, 1, direction, depth);
                 },
                 else => return false,
             }
@@ -1529,6 +1715,7 @@ fn applyLookup(
     const lk = try layout.lookupAt(entry.index);
     const lookup_type = try lk.lookupType();
     const lookup_flags = try lookupProps(lk);
+    const joiners = Joiners{ .auto_zwnj = entry.auto_zwnj, .auto_zwj = entry.auto_zwj };
     const sub_count = try lk.subtableCount();
 
     if (table_index == 0 and try isReverseLookup(layout, lk, lookup_type)) {
@@ -1536,11 +1723,14 @@ fn applyLookup(
         var idx = buffer.len() - 1;
         while (true) {
             buffer.idx = idx;
-            if (buffer.info.items[idx].mask & entry.mask != 0 and entry.digest.mayHave(buffer.info.items[idx].codepoint)) {
+            if (buffer.info.items[idx].mask & entry.mask != 0 and
+                entry.digest.mayHave(buffer.info.items[idx].codepoint) and
+                matchesLookupProps(buffer.info.items[idx], gdef, lookup_flags))
+            {
                 var si: u16 = 0;
                 while (si < sub_count) : (si += 1) {
                     const sub_off = try lk.subtableOffset(si);
-                    if (try applyGsubSubtable(layout, lookup_type, sub_off, entry.mask, buffer, gdef, lookup_flags, max_nesting_level)) break;
+                    if (try applyGsubSubtable(layout, lookup_type, sub_off, entry.mask, entry.random, joiners, buffer, gdef, lookup_flags, max_nesting_level)) break;
                 }
             }
             if (idx == 0) break;
@@ -1553,12 +1743,15 @@ fn applyLookup(
     if (table_index == 0) buffer.clearOutput();
     while (buffer.idx < buffer.len()) {
         var applied = false;
-        if (buffer.info.items[buffer.idx].mask & entry.mask != 0 and entry.digest.mayHave(buffer.info.items[buffer.idx].codepoint)) {
+        if (buffer.info.items[buffer.idx].mask & entry.mask != 0 and
+            entry.digest.mayHave(buffer.info.items[buffer.idx].codepoint) and
+            matchesLookupProps(buffer.info.items[buffer.idx], gdef, lookup_flags))
+        {
             var si: u16 = 0;
             while (si < sub_count) : (si += 1) {
                 const sub_off = try lk.subtableOffset(si);
                 applied = if (table_index == 0)
-                    try applyGsubSubtable(layout, lookup_type, sub_off, entry.mask, buffer, gdef, lookup_flags, max_nesting_level)
+                    try applyGsubSubtable(layout, lookup_type, sub_off, entry.mask, entry.random, joiners, buffer, gdef, lookup_flags, max_nesting_level)
                 else
                     try applyGposSubtable(layout, lookup_type, sub_off, gdef, lookup_flags, buffer, direction, max_nesting_level);
                 if (applied) break;
@@ -1569,25 +1762,109 @@ fn applyLookup(
     if (table_index == 0) try buffer.sync() else buffer.idx = 0;
 }
 
-pub fn applyTable(
+pub fn applyStage(
     font: parsing.Font,
     map: Map,
     table_index: u1,
     gdef: Gdef,
     buffer: *Buffer,
     direction: Direction,
+    stage: u32,
 ) (parsing.Font.ParseError || error{OutOfMemory})!void {
     const tag = if (table_index == 0) table_tag_gsub else table_tag_gpos;
     const data = font.tableData(tag) orelse return;
     const layout = parsing.Table.Layout{ .data = data };
     buffer.updateDigest();
-    for (map.getStageLookups(table_index, 0)) |entry| {
+    for (map.getStageLookups(table_index, stage)) |entry| {
         // Substitutions during this pass only ever add glyphs to the buffer
         // digest, so a lookup skipped here could not have matched earlier in
         // the pass either.
         if (!entry.digest.mayIntersect(buffer.digest)) continue;
         try applyLookup(layout, entry, gdef, buffer, table_index, direction);
     }
+}
+
+/// Zero-context `hb_ot_layout_lookup_would_substitute`: does this GSUB
+/// lookup substitute exactly this glyph sequence, standalone? The Indic
+/// shaper asks this of a font's blwf/pstf/pref/vatu/rphf lookups to decide
+/// where the base consonant and the reph are, before any lookup has run.
+///
+/// ponytail: only the four direct substitution types (plus Extension) are
+/// answered; a context lookup reports "no". Real Indic fonts put these
+/// features in Single/Ligature lookups, and a false "no" only costs the
+/// syntactic fallback this function replaced.
+fn lookupWouldSubstitute(
+    layout: parsing.Table.Layout,
+    lookup_index: u16,
+    glyphs: []const u32,
+) parsing.Font.ParseError!bool {
+    if (glyphs.len == 0) return false;
+    const lk = layout.lookupAt(lookup_index) catch return false;
+    const lookup_type = try lk.lookupType();
+    const sub_count = try lk.subtableCount();
+    var si: u16 = 0;
+    while (si < sub_count) : (si += 1) {
+        if (try subtableWouldSubstitute(layout, lookup_type, try lk.subtableOffset(si), glyphs)) return true;
+    }
+    return false;
+}
+
+fn subtableWouldSubstitute(
+    layout: parsing.Table.Layout,
+    lookup_type: u16,
+    sub_off: usize,
+    glyphs: []const u32,
+) parsing.Font.ParseError!bool {
+    if (glyphs[0] > std.math.maxInt(u16)) return false;
+    const gid: u16 = @intCast(glyphs[0]);
+    const reader = parsing.Table.Layout.SubtableReader{ .data = layout.data, .offset = sub_off };
+    switch (lookup_type) {
+        gsub_tag_single, gsub_tag_multiple, gsub_tag_alternate => {
+            if (glyphs.len != 1) return false;
+            const cov = try reader.coverageAt(2);
+            return try cov.get(gid) != null;
+        },
+        gsub_tag_ligature => {
+            if (try reader.u16At(0) != 1) return false;
+            const cov = try reader.coverageAt(2);
+            const idx = try cov.get(gid) orelse return false;
+            if (idx >= try reader.u16At(4)) return false;
+            const ligset = try reader.subReaderAt(6 + @as(usize, idx) * 2);
+            const lig_count = try ligset.u16At(0);
+            var li: usize = 0;
+            while (li < lig_count) : (li += 1) {
+                const lig = try ligset.subReaderAt(2 + li * 2);
+                if (try lig.u16At(2) != glyphs.len) continue;
+                var ci: usize = 1;
+                while (ci < glyphs.len) : (ci += 1) {
+                    if (try lig.u16At(4 + (ci - 1) * 2) != glyphs[ci]) break;
+                } else return true;
+            }
+            return false;
+        },
+        gsub_tag_extension => {
+            const unwrapped = try unwrapExtension(reader, gsub_tag_extension) orelse return false;
+            return subtableWouldSubstitute(layout, unwrapped.lookup_type, unwrapped.sub_off, glyphs);
+        },
+        else => return false,
+    }
+}
+
+/// hb's `hb_indic_would_substitute_feature_t`: would any lookup of this
+/// feature's own GSUB stage substitute `glyphs`?
+pub fn featureWouldSubstitute(
+    font: parsing.Font,
+    map: Map,
+    tag: Tag,
+    glyphs: []const u32,
+) parsing.Font.ParseError!bool {
+    const stage = map.getFeatureStage(0, tag) orelse return false;
+    const data = font.tableData(table_tag_gsub) orelse return false;
+    const layout = parsing.Table.Layout{ .data = data };
+    for (map.getStageLookups(0, stage)) |entry| {
+        if (try lookupWouldSubstitute(layout, entry.index, glyphs)) return true;
+    }
+    return false;
 }
 
 /// Ported from hb-ot-shape.cc's `hb_ot_hide_default_ignorables`: runs after
@@ -1649,11 +1926,12 @@ pub const table_tag_hvar = Tag{ 'H', 'V', 'A', 'R' };
 /// exists in this port yet, so vertical text's y_advance stays 0 (same
 /// "vertical writing mode not supported" gap already flagged elsewhere in
 /// this component).
-pub fn applyDefaultHorizontalAdvances(font: parsing.Font, buffer: *Buffer, normalized_coords: []const f32) void {
+pub fn applyDefaultHorizontalAdvances(font: parsing.Font, buffer: *Buffer, cmap: ?Cmap, normalized_coords: []const f32) void {
     const hhea_data = font.tableData(table_tag_hhea) orelse return;
     const hmtx_data = font.tableData(table_tag_hmtx) orelse return;
     const hhea = parsing.Table.hhea.parse(hhea_data) catch return;
     const hvar_data = if (normalized_coords.len != 0) font.tableData(table_tag_hvar) else null;
+    var has_space_fallback = false;
     for (buffer.info.items, buffer.pos.items) |glyph_info, *pos| {
         const glyph_id: u16 = @intCast(glyph_info.codepoint & 0xFFFF);
         const advance_width = parsing.Table.hmtx.metricForGlyph(hmtx_data, glyph_id, hhea.number_of_h_metrics).advance_width;
@@ -1663,6 +1941,66 @@ pub fn applyDefaultHorizontalAdvances(font: parsing.Font, buffer: *Buffer, norma
         } else {
             pos.x_advance = advance_width;
         }
+        if (glyph_info.space_fallback != .not_space) has_space_fallback = true;
+    }
+    if (has_space_fallback) applySpaceFallbackAdvances(font, buffer, cmap, hmtx_data, hhea.number_of_h_metrics);
+}
+
+/// Ported from hb-ot-shape-fallback.cc's `_hb_ot_shape_fallback_spaces`: the
+/// normalizer borrowed the plain space glyph for a Unicode space the font
+/// has no glyph for, so its advance is the plain space's - resize it to what
+/// that space character is actually worth. Horizontal only, matching
+/// `applyDefaultHorizontalAdvances` above.
+fn applySpaceFallbackAdvances(
+    font: parsing.Font,
+    buffer: *Buffer,
+    cmap: ?Cmap,
+    hmtx_data: []const u8,
+    number_of_h_metrics: u16,
+) void {
+    const head_data = font.tableData(Tag{ 'h', 'e', 'a', 'd' }) orelse return;
+    const units_per_em: i32 = (parsing.Table.head.parse(head_data) catch return).units_per_em;
+
+    const advanceOf = struct {
+        fn f(mtx: []const u8, n: u16, glyph_id: u32) i32 {
+            return parsing.Table.hmtx.metricForGlyph(mtx, @intCast(glyph_id & 0xFFFF), n).advance_width;
+        }
+    }.f;
+
+    for (buffer.info.items, buffer.pos.items) |glyph_info, *pos| {
+        // A ligature that swallowed the space is no longer a space glyph.
+        if (glyph_info.lig_num_comps > 1) continue;
+        const divisor: i32 = switch (glyph_info.space_fallback) {
+            .not_space, .space => continue,
+            .em, .em_2, .em_3, .em_4, .em_5, .em_6, .em_16 => |t| @intFromEnum(t),
+            .four_em_18 => {
+                pos.x_advance = @intCast(@divTrunc(@as(i64, units_per_em) * 4, 18));
+                continue;
+            },
+            .figure => {
+                var digit: u21 = '0';
+                while (digit <= '9') : (digit += 1) {
+                    if (cmap) |c| if (c.lookup(digit)) |g| {
+                        pos.x_advance = advanceOf(hmtx_data, number_of_h_metrics, g);
+                        break;
+                    };
+                }
+                continue;
+            },
+            .punctuation => {
+                if (cmap) |c| if (c.lookup('.') orelse c.lookup(',')) |g| {
+                    pos.x_advance = advanceOf(hmtx_data, number_of_h_metrics, g);
+                };
+                continue;
+            },
+            // Unicode says ~1/4-1/5 em, but plenty of fonts already have a
+            // space about that wide; hb takes half the space instead.
+            .narrow => {
+                pos.x_advance = @divTrunc(pos.x_advance, 2);
+                continue;
+            },
+        };
+        pos.x_advance = @divTrunc(units_per_em + @divTrunc(divisor, 2), divisor);
     }
 }
 
@@ -1808,11 +2146,9 @@ pub fn finishGposOffsets(buffer: *Buffer, direction: Direction) void {
 //   this port has no "hidden but not ignorable" glyph-flag infrastructure
 //   for the skip iterator to consult (see hb-ot-layout.hh's UPROPS_MASK_HIDDEN),
 //   which is what that special case exists to protect.
-// - hb_set_unicode_props/hb_form_clusters/hb_ensure_native_direction (the
-//   grapheme-continuation tracking and buffer-reversal machinery that keeps
-//   RTL/reversed-direction shaping from splitting graphemes) are not ported
-//   because this port doesn't reverse the buffer for RTL at all yet - that's
-//   a separate, larger gap than normalization/joiners.
+// - hb_ensure_native_direction is not ported; hb_set_unicode_props's
+//   grapheme-continuation tracking and hb_form_clusters are, as
+//   normalize.zig's `formClusters`.
 //
 // Joiner (ZWJ/ZWNJ) handling: hb's skip iterator ignores ZWJ/ZWNJ during
 // lookup-flag glyph matching based on per-lookup `auto_zwnj`/`auto_zwj` flags

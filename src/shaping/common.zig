@@ -46,6 +46,18 @@ pub const GlyphInfo = struct {
     /// `codepoint` to a real glyph id before any GSUB/GPOS lookup runs).
     var1: i32 = 0,
     var2: i32 = 0,
+    /// hb's `lig_props`, unpacked. A LigatureSubst that fires stamps the
+    /// ligature and every mark it swallowed with one fresh `lig_id`, gives
+    /// the ligature its component count and each mark the 1-based component
+    /// it belongs to; GPOS's MarkToLigature then attaches a mark to *that*
+    /// component rather than always the last, and MarkToMark only stacks
+    /// two marks sitting on the same component. Zero `lig_id` means "not
+    /// part of a ligature", which is also hb's "ids don't match" fallback.
+    lig_id: u8 = 0,
+    /// 1-based component index, marks only; 0 on a ligature base.
+    lig_comp: u8 = 0,
+    /// Components a ligature base swallowed; 1 for everything else.
+    lig_num_comps: u8 = 1,
     /// Set once by `setJoinerFlags` from the original Unicode codepoint
     /// (0x200D/0x200C), before `codepoint` is overwritten with a glyph id -
     /// see `shouldSkipGlyph`.
@@ -74,7 +86,58 @@ pub const GlyphInfo = struct {
     indic_category: u8 = 0,
     indic_position: u8 = 0,
     indic_syllable: u8 = 0,
+    /// hb's `glyph_props` SUBSTITUTED/LIGATED/MULTIPLIED bits, set by the
+    /// GSUB lookups that produce a glyph. The Indic shaper's final
+    /// reordering reads them to tell a reph/pref candidate that actually
+    /// ligated from one the font declined to substitute.
+    is_substituted: bool = false,
+    is_ligated: bool = false,
+    is_multiplied: bool = false,
+    /// Set by the normalizer when the font had no glyph for a Unicode space
+    /// character and it substituted the plain space glyph instead; read back
+    /// after default positioning to widen/narrow that borrowed advance.
+    space_fallback: SpaceFallback = .not_space,
 };
+
+/// hb-unicode.hh's `space_t`. The `em_*` values double as the divisor of an
+/// em that the space is worth, which is why they are numbered rather than
+/// sequential.
+pub const SpaceFallback = enum(u8) {
+    not_space = 0,
+    em = 1,
+    em_2 = 2,
+    em_3 = 3,
+    em_4 = 4,
+    em_5 = 5,
+    em_6 = 6,
+    em_16 = 16,
+    four_em_18 = 17,
+    space = 18,
+    figure = 19,
+    punctuation = 20,
+    narrow = 21,
+};
+
+/// Ported from hb-unicode.hh's `space_fallback_type`: every GC=Zs codepoint
+/// that has a sensible fallback width. U+1680 OGHAM SPACE MARK is absent on
+/// purpose - it is a visible mark, not blank space.
+pub fn spaceFallbackType(codepoint: u21) SpaceFallback {
+    return switch (codepoint) {
+        0x0020, 0x00A0 => .space,
+        0x2000, 0x2002 => .em_2,
+        0x2001, 0x2003, 0x3000 => .em,
+        0x2004 => .em_3,
+        0x2005 => .em_4,
+        0x2006 => .em_6,
+        0x2007 => .figure,
+        0x2008 => .punctuation,
+        0x2009 => .em_5,
+        0x200A => .em_16,
+        0x202F => .narrow,
+        0x205F => .four_em_18,
+        else => .not_space,
+    };
+}
 
 /// Same order as hb-ot-shaper-arabic.cc's `arabic_features`/`arabic_action_t`.
 pub const ArabicAction = enum(u8) { isol, fina, fin2, fin3, medi, med2, init, none };
@@ -200,6 +263,23 @@ pub const Buffer = struct {
     /// hb's max_ops guard against O(n^2)-ish blowup on adversarial buffers.
     max_ops: i64 = std.math.maxInt(i64),
     successful: bool = true,
+    /// hb's `random_state`: the minstd_rand stream the 'rand' feature draws
+    /// alternates from. Seeded like hb so a buffer shapes identically.
+    random_state: u32 = 1,
+    /// Rolling source of `GlyphInfo.lig_id`s (hb's `_hb_allocate_lig_id`).
+    /// Wraps within 1..7 like hb's 3-bit field; a collision only costs a
+    /// mark the component disambiguation it would otherwise have got.
+    lig_serial: u8 = 0,
+
+    pub fn randomNumber(self: *Buffer) u32 {
+        self.random_state = @intCast(@as(u64, self.random_state) * 48271 % 2147483647);
+        return self.random_state;
+    }
+
+    pub fn allocateLigId(self: *Buffer) u8 {
+        self.lig_serial = self.lig_serial % 7 + 1;
+        return self.lig_serial;
+    }
 
     pub fn init(allocator: std.mem.Allocator) Buffer {
         return .{ .allocator = allocator };
@@ -332,6 +412,31 @@ pub const Buffer = struct {
     /// Advances idx without copying to output.
     pub fn skipGlyph(self: *Buffer) void {
         self.idx += 1;
+    }
+
+    /// Ported from hb_buffer_t::delete_glyph: drops the glyph at idx without
+    /// emitting it, first folding its cluster into a neighbour so the
+    /// cluster itself doesn't vanish from the output.
+    pub fn deleteGlyph(self: *Buffer) void {
+        const cluster = self.info.items[self.idx].cluster;
+        const out_len = self.out_info.items.len;
+        const cluster_survives = (self.idx + 1 < self.info.items.len and cluster == self.info.items[self.idx + 1].cluster) or
+            (out_len != 0 and cluster == self.out_info.items[out_len - 1].cluster);
+        if (!cluster_survives) {
+            if (out_len != 0) {
+                if (cluster < self.out_info.items[out_len - 1].cluster) {
+                    const mask = self.info.items[self.idx].mask;
+                    const old_cluster = self.out_info.items[out_len - 1].cluster;
+                    var i = out_len;
+                    while (i != 0 and self.out_info.items[i - 1].cluster == old_cluster) : (i -= 1) {
+                        setCluster(&self.out_info.items[i - 1], cluster, mask);
+                    }
+                }
+            } else if (self.idx + 1 < self.info.items.len) {
+                self.mergeClusters(self.idx, self.idx + 2);
+            }
+        }
+        self.skipGlyph();
     }
 
     pub fn resetMasks(self: *Buffer, mask: u32) void {

@@ -1,5 +1,7 @@
 const std = @import("std");
+const parsing = @import("../parsing.zig");
 const common = @import("common.zig");
+const apply_mod = @import("apply.zig");
 const map_mod = @import("map.zig");
 const Buffer = common.Buffer;
 const GlyphInfo = common.GlyphInfo;
@@ -29,32 +31,22 @@ const MapFeatureFlags = map_mod.MapFeatureFlags;
 // "longest match across rules, first-listed wins ties" reproduces the
 // scanner semantics.
 //
-// Reordering (`reorderIndicSyllable`) merges hb's initial_reordering +
-// final_reordering into one pre-GSUB pass, since this port's MapBuilder has
-// no GSUB-pause machinery (see its module doc comment) to interleave
-// reordering with per-feature lookup application the way hb does. Three
-// consequences, all documented inline at their call sites:
-//   - `consonant_position_from_face`, the rphf/pref candidate detection,
-//     and the reph/pref "did it actually ligate" checks all use
-//     `hb_ot_layout_lookup_would_substitute` (a GSUB dry-run against the
-//     font) to confirm a lookup exists/fired before repositioning. This
-//     port approximates all of those with pure Unicode-category syntax
-//     (e.g. "Ra immediately after Halant" is always a pref candidate,
-//     without checking the font actually has a pref lookup for it). Real
-//     Indic fonts overwhelmingly follow the spec's syntactic patterns, so
-//     this produces correct shaping for well-formed text against
-//     conformant fonts; it can over-fire a reorder for a font that ships
-//     the categories but not the matching GSUB feature.
-//   - the pre-base-reordering Ra ("pref") physical move is dropped
-//     entirely (mask-only): without post-substitution ligation state,
-//     safely relocating a not-yet-ligated 2-glyph Halant+Ra span is
-//     index-arithmetic-heavy for a narrow win (this affects only a few
-//     conjunct patterns in Kannada/Malayalam/Telugu-style scripts); the
-//     'pref' GSUB feature still gets masked on and fires in place.
-//   - dotted-circle insertion for broken (malformed) syllables runs via
-//     `common.insertDottedCircles` right after syllabification, since this
-//     port has no GSUB-pause machinery to run it mid-pipeline like hb does
-//     - see that function's doc comment.
+// Reordering follows hb's two-phase shape: `initialReorderingIndic` runs as
+// a GSUB pause after 'locl'/'ccmp' and `finalReorderingIndic` as one after
+// the basic-forms features, each basic feature getting a stage of its own
+// (see collectFeaturesIndic). That staging is what makes the font dry-runs
+// (`IndicPlan.wouldSubstitute`, hb's `hb_ot_layout_lookup_would_substitute`)
+// and the "did this candidate actually ligate" checks possible: the first
+// needs a feature's lookups in isolation, the second needs them already
+// applied.
+//
+// Two deliberate differences from hb remain:
+//   - dotted-circle insertion for broken (malformed) syllables runs with
+//     syllabification, before glyph mapping, rather than inside the
+//     initial-reordering pause - see `setupMasksIndic`.
+//   - the post-sort cluster merge in initial reordering always takes hb's
+//     own old-spec/long-syllable shortcut of merging the whole post-base
+//     run, rather than reconstructing which glyphs the sort moved.
 
 const deva_tag = Tag{ 'd', 'e', 'v', 'a' };
 const dev2_tag = Tag{ 'd', 'e', 'v', '2' };
@@ -533,28 +525,27 @@ const IndicBlwfMode = enum(u8) { pre_and_post, post_only };
 pub const IndicScriptConfig = struct {
     tag1: Tag,
     tag2: Tag,
+    virama: u21,
     reph_pos: IndicRephPosition,
     reph_mode: IndicRephMode,
     blwf_mode: IndicBlwfMode,
     is_devanagari: bool,
     is_kannada: bool,
     is_malayalam: bool,
+    is_tamil: bool,
 };
 
-/// Ported from `indic_configs` (virama codepoints dropped - this port
-/// doesn't need the font virama-glyph recovery `final_reordering_indic`
-/// uses, since it isn't tracking post-ligation glyph identity; see this
-/// section's top doc comment).
+/// Ported from `indic_configs`.
 const indic_script_configs = [9]IndicScriptConfig{
-    .{ .tag1 = deva_tag, .tag2 = dev2_tag, .reph_pos = .before_post, .reph_mode = .implicit, .blwf_mode = .pre_and_post, .is_devanagari = true, .is_kannada = false, .is_malayalam = false },
-    .{ .tag1 = beng_tag, .tag2 = bng2_tag, .reph_pos = .after_sub, .reph_mode = .implicit, .blwf_mode = .pre_and_post, .is_devanagari = false, .is_kannada = false, .is_malayalam = false },
-    .{ .tag1 = guru_tag, .tag2 = gur2_tag, .reph_pos = .before_sub, .reph_mode = .implicit, .blwf_mode = .pre_and_post, .is_devanagari = false, .is_kannada = false, .is_malayalam = false },
-    .{ .tag1 = gujr_tag, .tag2 = gjr2_tag, .reph_pos = .before_post, .reph_mode = .implicit, .blwf_mode = .pre_and_post, .is_devanagari = false, .is_kannada = false, .is_malayalam = false },
-    .{ .tag1 = orya_tag, .tag2 = ory2_tag, .reph_pos = .after_main, .reph_mode = .implicit, .blwf_mode = .pre_and_post, .is_devanagari = false, .is_kannada = false, .is_malayalam = false },
-    .{ .tag1 = taml_tag, .tag2 = tml2_tag, .reph_pos = .after_post, .reph_mode = .implicit, .blwf_mode = .pre_and_post, .is_devanagari = false, .is_kannada = false, .is_malayalam = false },
-    .{ .tag1 = telu_tag, .tag2 = tel2_tag, .reph_pos = .after_post, .reph_mode = .explicit, .blwf_mode = .post_only, .is_devanagari = false, .is_kannada = false, .is_malayalam = false },
-    .{ .tag1 = knda_tag, .tag2 = knd2_tag, .reph_pos = .after_post, .reph_mode = .implicit, .blwf_mode = .post_only, .is_devanagari = false, .is_kannada = true, .is_malayalam = false },
-    .{ .tag1 = mlym_tag, .tag2 = mlm2_tag, .reph_pos = .after_main, .reph_mode = .log_repha, .blwf_mode = .pre_and_post, .is_devanagari = false, .is_kannada = false, .is_malayalam = true },
+    .{ .tag1 = deva_tag, .virama = 0x094D, .tag2 = dev2_tag, .reph_pos = .before_post, .reph_mode = .implicit, .blwf_mode = .pre_and_post, .is_devanagari = true, .is_kannada = false, .is_malayalam = false, .is_tamil = false },
+    .{ .tag1 = beng_tag, .virama = 0x09CD, .tag2 = bng2_tag, .reph_pos = .after_sub, .reph_mode = .implicit, .blwf_mode = .pre_and_post, .is_devanagari = false, .is_kannada = false, .is_malayalam = false, .is_tamil = false },
+    .{ .tag1 = guru_tag, .virama = 0x0A4D, .tag2 = gur2_tag, .reph_pos = .before_sub, .reph_mode = .implicit, .blwf_mode = .pre_and_post, .is_devanagari = false, .is_kannada = false, .is_malayalam = false, .is_tamil = false },
+    .{ .tag1 = gujr_tag, .virama = 0x0ACD, .tag2 = gjr2_tag, .reph_pos = .before_post, .reph_mode = .implicit, .blwf_mode = .pre_and_post, .is_devanagari = false, .is_kannada = false, .is_malayalam = false, .is_tamil = false },
+    .{ .tag1 = orya_tag, .virama = 0x0B4D, .tag2 = ory2_tag, .reph_pos = .after_main, .reph_mode = .implicit, .blwf_mode = .pre_and_post, .is_devanagari = false, .is_kannada = false, .is_malayalam = false, .is_tamil = false },
+    .{ .tag1 = taml_tag, .virama = 0x0BCD, .tag2 = tml2_tag, .reph_pos = .after_post, .reph_mode = .implicit, .blwf_mode = .pre_and_post, .is_devanagari = false, .is_kannada = false, .is_malayalam = false, .is_tamil = true },
+    .{ .tag1 = telu_tag, .virama = 0x0C4D, .tag2 = tel2_tag, .reph_pos = .after_post, .reph_mode = .explicit, .blwf_mode = .post_only, .is_devanagari = false, .is_kannada = false, .is_malayalam = false, .is_tamil = false },
+    .{ .tag1 = knda_tag, .virama = 0x0CCD, .tag2 = knd2_tag, .reph_pos = .after_post, .reph_mode = .implicit, .blwf_mode = .post_only, .is_devanagari = false, .is_kannada = true, .is_malayalam = false, .is_tamil = false },
+    .{ .tag1 = mlym_tag, .virama = 0x0D4D, .tag2 = mlm2_tag, .reph_pos = .after_main, .reph_mode = .log_repha, .blwf_mode = .pre_and_post, .is_devanagari = false, .is_kannada = false, .is_malayalam = true, .is_tamil = false },
 };
 
 pub fn findIndicConfig(script_tags: []const Tag) ?*const IndicScriptConfig {
@@ -572,26 +563,29 @@ fn indicIsOldSpec(map: Map) bool {
     return tag[3] != '2';
 }
 
-/// Ported from `collect_features_indic`, minus the `loc`l/`ccmp` enables
+/// Ported from `collect_features_indic`, minus the `locl`/`ccmp` enables
 /// (already unconditionally enabled by `shape()`'s `default_features`, see
-/// its doc comment) and the pause registrations (no pause machinery in this
-/// port, see the module doc comment). `rphf`/`pref`/`blwf`/`abvf`/`half`/
-/// `pstf`/`init` are added non-globally (`addFeature`, not `enableFeature`)
-/// so `MapBuilder.compile` allocates real mask bits `reorderIndicSyllable`
-/// can assign per-glyph via `map.get1Mask`.
+/// its doc comment). `rphf`/`pref`/`blwf`/`abvf`/`half`/`pstf`/`init` are
+/// added non-globally (`addFeature`, not `enableFeature`) so
+/// `MapBuilder.compile` allocates real mask bits the reordering passes can
+/// assign per-glyph via `map.get1Mask`.
+///
+/// Every basic-forms feature gets a stage to itself, as in hb: a font is
+/// free to give 'blwf' a lower lookup index than 'rphf', and merging them
+/// into one stage would then apply them in the font's index order instead
+/// of the spec's feature order (blwf eating the Ra+Halant that rphf was
+/// supposed to ligate). The pause boundaries are also what let
+/// `wouldSubstitute` probe one feature's lookups in isolation.
 pub fn collectFeaturesIndic(map_builder: *MapBuilder) !void {
     const manual_joiners = MapFeatureFlags{ .manual_zwnj = true, .manual_zwj = true };
-    try map_builder.enableFeature(tag_nukt, manual_joiners, 1);
-    try map_builder.enableFeature(tag_akhn, manual_joiners, 1);
-    try map_builder.addFeature(tag_rphf, manual_joiners, 1);
-    try map_builder.enableFeature(tag_rkrf, manual_joiners, 1);
-    try map_builder.addFeature(tag_pref, manual_joiners, 1);
-    try map_builder.addFeature(tag_blwf, manual_joiners, 1);
-    try map_builder.addFeature(tag_abvf, manual_joiners, 1);
-    try map_builder.addFeature(tag_half, manual_joiners, 1);
-    try map_builder.addFeature(tag_pstf, manual_joiners, 1);
-    try map_builder.enableFeature(tag_vatu, manual_joiners, 1);
-    try map_builder.enableFeature(tag_cjct, manual_joiners, 1);
+    try map_builder.addGsubPause(.indic_initial_reorder);
+    const basic_features = [_]Tag{ tag_nukt, tag_akhn, tag_rphf, tag_rkrf, tag_pref, tag_blwf, tag_abvf, tag_half, tag_pstf, tag_vatu, tag_cjct };
+    const basic_global = [_]bool{ true, true, false, true, false, false, false, false, false, true, true };
+    for (basic_features, basic_global) |tag, is_global| {
+        if (is_global) try map_builder.enableFeature(tag, manual_joiners, 1) else try map_builder.addFeature(tag, manual_joiners, 1);
+        try map_builder.addGsubPause(.none);
+    }
+    try map_builder.addGsubPause(.indic_final_reorder);
     try map_builder.addFeature(tag_init, manual_joiners, 1);
     try map_builder.enableFeature(tag_pres, manual_joiners, 1);
     try map_builder.enableFeature(tag_abvs, manual_joiners, 1);
@@ -676,15 +670,52 @@ fn indicRephTargetPosition(info: []const GlyphInfo, reph_pos: IndicRephPosition,
     return p;
 }
 
-/// Ported from `initial_reordering_consonant_syllable` +
-/// `final_reordering_syllable_indic`, merged into one pre-GSUB pass - see
-/// this section's top doc comment for what that drops relative to hb.
-/// Runs on `consonant_syllable`/`vowel_syllable`/`standalone_cluster`/
-/// `broken_cluster` syllables only (`symbol_cluster`/`non_indic_cluster`
-/// are passed through unchanged, matching
-/// `initial_reordering_syllable_indic`'s switch).
-fn reorderIndicSyllable(buffer: *Buffer, map: Map, config: IndicScriptConfig, is_old_spec: bool, start: usize, end: usize) void {
+/// Per-segment state `initialReorderingIndic`/`finalReorderingIndic` need
+/// beyond the buffer: the font (for the GSUB dry-runs), the compiled map
+/// (feature masks and the per-feature lookup stages those dry-runs probe)
+/// and the resolved virama glyph.
+const IndicPlan = struct {
+    font: parsing.Font,
+    map: Map,
+    config: IndicScriptConfig,
+    is_old_spec: bool,
+    /// hb's `load_virama_glyph`; 0 when the font has no virama, which
+    /// switches off both the consonant-position probes and the halant
+    /// recovery, exactly as in hb.
+    virama_glyph: u32,
+
+    /// hb's `hb_indic_would_substitute_feature_t::would_substitute`. A
+    /// malformed lookup answers "no" rather than failing the shape - the
+    /// caller only uses this to pick between two legal reorderings.
+    fn wouldSubstitute(self: IndicPlan, tag: Tag, glyphs: []const u32) bool {
+        return apply_mod.featureWouldSubstitute(self.font, self.map, tag, glyphs) catch false;
+    }
+};
+
+fn ligatedAndDidntMultiply(glyph_info: GlyphInfo) bool {
+    return glyph_info.is_ligated and !glyph_info.is_multiplied;
+}
+
+/// Ported from `consonant_position_from_face`: asks the font whether it has
+/// a below-/post-/pre-base form for this consonant, so the base-consonant
+/// search can skip it. Old-spec fonts order the pair Consonant,Virama and
+/// new-spec ones Virama,Consonant, and some new-spec fonts shipped the
+/// old-spec lookups unchanged - hb matches both orders, so this does too.
+fn consonantPositionFromFace(plan: IndicPlan, consonant: u32) u8 {
+    const glyphs = [3]u32{ plan.virama_glyph, consonant, plan.virama_glyph };
+    if (plan.wouldSubstitute(tag_blwf, glyphs[0..2]) or plan.wouldSubstitute(tag_blwf, glyphs[1..3]) or
+        plan.wouldSubstitute(tag_vatu, glyphs[0..2]) or plan.wouldSubstitute(tag_vatu, glyphs[1..3])) return ip_below_c;
+    if (plan.wouldSubstitute(tag_pstf, glyphs[0..2]) or plan.wouldSubstitute(tag_pstf, glyphs[1..3])) return ip_post_c;
+    if (plan.wouldSubstitute(tag_pref, glyphs[0..2]) or plan.wouldSubstitute(tag_pref, glyphs[1..3])) return ip_post_c;
+    return ip_base_c;
+}
+
+/// Ported from `initial_reordering_consonant_syllable`, which
+/// `initial_reordering_standalone_cluster` also delegates to.
+fn initialReorderingSyllable(plan: IndicPlan, buffer: *Buffer, start: usize, end: usize) void {
     const info = buffer.info.items;
+    const map = plan.map;
+    const config = plan.config;
 
     if (config.is_kannada and start + 3 <= end and
         info[start].indic_category == ic_ra and info[start + 1].indic_category == ic_h and info[start + 2].indic_category == ic_zwj)
@@ -699,14 +730,23 @@ fn reorderIndicSyllable(buffer: *Buffer, map: Map, config: IndicScriptConfig, is
     var has_reph = false;
     {
         var limit = start;
-        if (start + 3 <= end and info[start].indic_category == ic_ra and info[start + 1].indic_category == ic_h and
+        if (map.get1Mask(tag_rphf) != 0 and start + 3 <= end and
             ((config.reph_mode == .implicit and !isIndicJoiner(info[start + 2].indic_category)) or
                 (config.reph_mode == .explicit and info[start + 2].indic_category == ic_zwj)))
         {
-            limit = start + 2;
-            while (limit < end and isIndicJoiner(info[limit].indic_category)) limit += 1;
-            base = start;
-            has_reph = true;
+            const glyphs = [3]u32{
+                info[start].codepoint,
+                info[start + 1].codepoint,
+                if (config.reph_mode == .explicit) info[start + 2].codepoint else 0,
+            };
+            if (plan.wouldSubstitute(tag_rphf, glyphs[0..2]) or
+                (config.reph_mode == .explicit and plan.wouldSubstitute(tag_rphf, glyphs[0..3])))
+            {
+                limit = start + 2;
+                while (limit < end and isIndicJoiner(info[limit].indic_category)) limit += 1;
+                base = start;
+                has_reph = true;
+            }
         } else if (config.reph_mode == .log_repha and info[start].indic_category == ic_repha) {
             limit = start + 1;
             while (limit < end and isIndicJoiner(info[limit].indic_category)) limit += 1;
@@ -719,17 +759,9 @@ fn reorderIndicSyllable(buffer: *Buffer, map: Map, config: IndicScriptConfig, is
         while (i > limit) {
             i -= 1;
             if (isIndicConsonant(info[i].indic_category)) {
-                // hb's `consonant_position_from_face` reclassifies a
-                // mid-syllable Ra to POS_BELOW_C/POS_POST_C when the font's
-                // blwf/vatu/pstf/pref lookups would actually substitute it
-                // there (approximated away, see this section's top doc
-                // comment); a non-final Ra directly followed by another
-                // Halant is syntactically always such a conjunct-forming Ra
-                // (vattu/rakar/pref) across these scripts regardless of the
-                // specific font, so skip it as a base candidate the same
-                // way a real below/post form would be skipped.
-                const is_reordering_ra = info[i].indic_category == ic_ra and i + 1 < end and info[i + 1].indic_category == ic_h;
-                if (!is_reordering_ra and info[i].indic_position != ip_below_c and (info[i].indic_position != ip_post_c or seen_below)) {
+                // A pre-base-reordering Ra was already given POS_POST_C by
+                // `updateConsonantPositions`, so it is skipped here too.
+                if (info[i].indic_position != ip_below_c and (info[i].indic_position != ip_post_c or seen_below)) {
                     base = i;
                     break;
                 }
@@ -747,7 +779,7 @@ fn reorderIndicSyllable(buffer: *Buffer, map: Map, config: IndicScriptConfig, is
     if (base < end) info[base].indic_position = ip_base_c;
     if (has_reph) info[start].indic_position = ip_ra_to_become_reph;
 
-    if (is_old_spec) {
+    if (plan.is_old_spec) {
         const disallow_double_halants = config.is_kannada;
         var i = base + 1;
         while (i < end) : (i += 1) {
@@ -829,14 +861,10 @@ fn reorderIndicSyllable(buffer: *Buffer, map: Map, config: IndicScriptConfig, is
                 }
             }
         }
-        // hb merges pre-base matra clusters into the base as part of the
-        // matra-repositioning search this port doesn't do (see this
-        // section's top doc comment); approximate by merging the whole
-        // pre-base run into the base's cluster whenever a left matra moved
-        // there, so the reordered matra keeps the base's cluster/cursor
-        // position instead of its own original one.
-        if (first_left_matra < end) buffer.mergeClusters(start, @min(end, base + 1));
     }
+    // hb only merges the post-base run when the sort actually moved things
+    // across the base; this port takes hb's own old-spec/long-syllable
+    // shortcut of merging it unconditionally.
     buffer.mergeClusters(base, end);
 
     {
@@ -845,7 +873,7 @@ fn reorderIndicSyllable(buffer: *Buffer, map: Map, config: IndicScriptConfig, is
     }
     {
         var mask = map.get1Mask(tag_half);
-        if (!is_old_spec and config.blwf_mode == .pre_and_post) mask |= map.get1Mask(tag_blwf);
+        if (!plan.is_old_spec and config.blwf_mode == .pre_and_post) mask |= map.get1Mask(tag_blwf);
         for (info[start..base]) |*g| g.mask |= mask;
     }
     if (base < end) {
@@ -853,7 +881,7 @@ fn reorderIndicSyllable(buffer: *Buffer, map: Map, config: IndicScriptConfig, is
         for (info[base + 1 .. end]) |*g| g.mask |= mask;
     }
 
-    if (is_old_spec and config.is_devanagari) {
+    if (plan.is_old_spec and config.is_devanagari) {
         var i = start;
         while (i + 1 < base) : (i += 1) {
             if (info[i].indic_category == ic_ra and info[i + 1].indic_category == ic_h and
@@ -865,12 +893,14 @@ fn reorderIndicSyllable(buffer: *Buffer, map: Map, config: IndicScriptConfig, is
         }
     }
 
-    if (map.get1Mask(tag_pref) != 0 and base + 2 <= end) {
+    const pref_mask = map.get1Mask(tag_pref);
+    if (pref_mask != 0 and base + 2 < end) {
         var i = base + 1;
         while (i + 1 < end) : (i += 1) {
-            if (info[i].indic_category == ic_h and info[i + 1].indic_category == ic_ra) {
-                info[i].mask |= map.get1Mask(tag_pref);
-                info[i + 1].mask |= map.get1Mask(tag_pref);
+            const glyphs = [2]u32{ info[i].codepoint, info[i + 1].codepoint };
+            if (plan.wouldSubstitute(tag_pref, &glyphs)) {
+                info[i].mask |= pref_mask;
+                info[i + 1].mask |= pref_mask;
                 break;
             }
         }
@@ -890,12 +920,157 @@ fn reorderIndicSyllable(buffer: *Buffer, map: Map, config: IndicScriptConfig, is
             }
         }
     }
+}
 
-    if (start + 1 < end and info[start].indic_position == ip_ra_to_become_reph) {
+/// Ported from `final_reordering_syllable_indic`: runs after the basic-forms
+/// GSUB features, so it can tell a reph/pref candidate that actually ligated
+/// from one the font declined to substitute.
+fn finalReorderingSyllable(plan: IndicPlan, buffer: *Buffer, start: usize, end: usize) void {
+    const info = buffer.info.items;
+    const map = plan.map;
+    const config = plan.config;
+    const pref_mask = map.get1Mask(tag_pref);
+
+    // Ligation may have destroyed the halant categories this function runs
+    // on; recover the ones that are still literally the virama glyph.
+    if (plan.virama_glyph != 0) {
+        for (info[start..end]) |*g| {
+            if (g.codepoint == plan.virama_glyph and g.is_ligated and g.is_multiplied) {
+                g.indic_category = ic_h;
+                g.is_ligated = false;
+                g.is_multiplied = false;
+            }
+        }
+    }
+
+    var try_pref = pref_mask != 0;
+
+    var base = start;
+    while (base < end) : (base += 1) {
+        if (info[base].indic_position < ip_base_c) continue;
+        if (try_pref and base + 1 < end) {
+            var i = base + 1;
+            while (i < end) : (i += 1) {
+                if (info[i].mask & pref_mask != 0) {
+                    if (!(info[i].is_substituted and ligatedAndDidntMultiply(info[i]))) {
+                        // A 'pref' candidate the font didn't form: the base
+                        // is around here instead.
+                        base = i;
+                        while (base < end and info[base].indic_category == ic_h) base += 1;
+                        if (base < end) info[base].indic_position = ip_base_c;
+                        try_pref = false;
+                    }
+                    break;
+                }
+            }
+            if (base == end) break;
+        }
+        if (config.is_malayalam) {
+            var i = base + 1;
+            while (i < end) : (i += 1) {
+                while (i < end and isIndicJoiner(info[i].indic_category)) i += 1;
+                if (i == end or info[i].indic_category != ic_h) break;
+                i += 1;
+                while (i < end and isIndicJoiner(info[i].indic_category)) i += 1;
+                if (i < end and isIndicConsonant(info[i].indic_category) and info[i].indic_position == ip_below_c) {
+                    base = i;
+                    info[base].indic_position = ip_base_c;
+                }
+            }
+        }
+        if (start < base and info[base].indic_position > ip_base_c) base -= 1;
+        break;
+    }
+    if (base == end and start < base and info[base - 1].indic_category == ic_zwj) base -= 1;
+    if (base < end) {
+        while (start < base and (info[base].indic_category == ic_n or info[base].indic_category == ic_h)) base -= 1;
+    }
+
+    if (start + 1 < end and start < base) {
+        // If we lost track of base, position before the last thing instead.
+        var new_pos = if (base == end) base - 2 else base - 1;
+
+        // Malayalam/Tamil have no half or explicit-virama forms - what
+        // 'half' produces there is a chillu or a ligated virama, and the
+        // matra belongs after it.
+        if (!config.is_malayalam and !config.is_tamil) {
+            while (true) {
+                while (new_pos > start and !(info[new_pos].indic_category == ic_m or
+                    info[new_pos].indic_category == ic_mpst or info[new_pos].indic_category == ic_h)) new_pos -= 1;
+
+                if (info[new_pos].indic_category == ic_h and info[new_pos].indic_position != ip_pre_m) {
+                    // Uniscribe keeps the matra left of a Halant,ZWJ, so
+                    // keep searching past it; a Halant,ZWNJ never gets here
+                    // (the syllable machine ends the syllable at it).
+                    if (new_pos + 1 < end and info[new_pos + 1].indic_category == ic_zwj and new_pos > start) {
+                        new_pos -= 1;
+                        continue;
+                    }
+                } else {
+                    new_pos = start;
+                }
+                break;
+            }
+        }
+
+        if (start < new_pos and info[new_pos].indic_position != ip_pre_m) {
+            var i = new_pos;
+            while (i > start) : (i -= 1) {
+                if (info[i - 1].indic_position == ip_pre_m) {
+                    const old_pos = i - 1;
+                    if (old_pos < base and base <= new_pos) base -= 1;
+                    moveIndicGlyph(info, old_pos, new_pos);
+                    // Intentionally after the move: Indic matra reordering
+                    // owns the cluster of everything it passed over.
+                    buffer.mergeClusters(new_pos, @min(end, base + 1));
+                    new_pos -= 1;
+                }
+            }
+        } else {
+            var i = start;
+            while (i < base) : (i += 1) {
+                if (info[i].indic_position == ip_pre_m) {
+                    buffer.mergeClusters(i, @min(end, base + 1));
+                    break;
+                }
+            }
+        }
+    }
+
+    // A reph spelled Ra,H (or Ra,H,ZWJ) moves only if it ligated into the
+    // reph form; a Repha encoded as its own character moves only if it
+    // did *not* ligate (a font that ligated it is doing the job itself).
+    if (start + 1 < end and info[start].indic_position == ip_ra_to_become_reph and
+        ((info[start].indic_category == ic_repha) != ligatedAndDidntMultiply(info[start])))
+    {
         const new_reph_pos = indicRephTargetPosition(info, config.reph_pos, start, base, end);
         buffer.mergeClusters(start, new_reph_pos + 1);
         moveIndicGlyph(info, start, new_reph_pos);
         if (start < base and base <= new_reph_pos) base -= 1;
+    }
+
+    if (try_pref and base + 1 < end) {
+        var i = base + 1;
+        while (i < end) : (i += 1) {
+            if (info[i].mask & pref_mask != 0) {
+                // Only a glyph the font actually produced gets reordered.
+                if (ligatedAndDidntMultiply(info[i])) {
+                    var new_pos = base;
+                    if (!config.is_malayalam and !config.is_tamil) {
+                        while (new_pos > start and !(info[new_pos - 1].indic_category == ic_m or
+                            info[new_pos - 1].indic_category == ic_mpst or info[new_pos - 1].indic_category == ic_h)) new_pos -= 1;
+                    }
+                    if (new_pos > start and info[new_pos - 1].indic_category == ic_h) {
+                        if (new_pos < end and isIndicJoiner(info[new_pos].indic_category)) new_pos += 1;
+                    }
+                    const old_pos = i;
+                    buffer.mergeClusters(new_pos, old_pos + 1);
+                    moveIndicGlyph(info, old_pos, new_pos);
+                    if (new_pos <= base and base < old_pos) base += 1;
+                }
+                break;
+            }
+        }
     }
 
     if (info[start].indic_position == ip_pre_m) {
@@ -907,32 +1082,69 @@ fn reorderIndicSyllable(buffer: *Buffer, map: Map, config: IndicScriptConfig, is
     }
 }
 
-/// Ported from `setup_masks_indic` + `setup_syllables_indic` +
-/// `initial_reordering_indic` + `final_reordering_indic`, collapsed into
-/// one pre-GSUB pass at the same call site `setupMasksHangul`/
-/// `setupMasksArabic` use (see the module doc comment on why this port has
-/// no GSUB-pause machinery to run these as separate stages). Must run
+fn forEachIndicSyllable(buffer: *Buffer, plan: IndicPlan, comptime reorder: fn (IndicPlan, *Buffer, usize, usize) void) void {
+    var start: usize = 0;
+    while (start < buffer.info.items.len) {
+        const syl = buffer.info.items[start].indic_syllable;
+        var end = start + 1;
+        while (end < buffer.info.items.len and buffer.info.items[end].indic_syllable == syl) end += 1;
+
+        const stype = syl & 0x0F;
+        if (stype == indic_syllable_consonant or stype == indic_syllable_vowel or
+            stype == indic_syllable_standalone or stype == indic_syllable_broken)
+        {
+            reorder(plan, buffer, start, end);
+        }
+        start = end;
+    }
+}
+
+fn indicPlan(font: parsing.Font, map: Map, config: IndicScriptConfig, cmap: ?Cmap) IndicPlan {
+    return .{
+        .font = font,
+        .map = map,
+        .config = config,
+        .is_old_spec = indicIsOldSpec(map),
+        .virama_glyph = if (cmap) |c| (c.lookup(config.virama) orelse 0) else 0,
+    };
+}
+
+/// Ported from `setup_masks_indic` + `setup_syllables_indic`. Must run
 /// before `mapGlyphsFast` overwrites `codepoint` with a glyph id -
-/// `setIndicProperties` needs the original Unicode codepoint.
-pub fn setupMasksIndic(buffer: *Buffer, map: Map, config: IndicScriptConfig, cmap: ?Cmap) !void {
+/// `setIndicProperties` needs the original Unicode codepoint, and
+/// `insertDottedCircles` inserts one. hb runs syllabification as the
+/// shaper's first GSUB pause instead, i.e. after 'locl'/'ccmp'; nothing in
+/// those two features feeds the syllable machine, which reads categories,
+/// not glyphs.
+pub fn setupMasksIndic(buffer: *Buffer, cmap: ?Cmap) !void {
     for (buffer.info.items) |*info| setIndicProperties(info);
     findSyllablesIndic(buffer);
     _ = try common.insertDottedCircles(buffer, cmap, indic_syllable_broken, ic_dottedcircle, ic_repha, ip_end);
 
-    const is_old_spec = indicIsOldSpec(map);
     var start: usize = 0;
     while (start < buffer.info.items.len) {
         const syl = buffer.info.items[start].indic_syllable;
         var end = start + 1;
         while (end < buffer.info.items.len and buffer.info.items[end].indic_syllable == syl) end += 1;
         buffer.unsafeToBreak(start, end);
-
-        const stype = syl & 0x0F;
-        if (stype == indic_syllable_consonant or stype == indic_syllable_vowel or
-            stype == indic_syllable_standalone or stype == indic_syllable_broken)
-        {
-            reorderIndicSyllable(buffer, map, config, is_old_spec, start, end);
-        }
         start = end;
     }
+}
+
+/// Ported from `initial_reordering_indic`: the GSUB pause after
+/// 'locl'/'ccmp' and before the basic-forms features.
+pub fn initialReorderingIndic(font: parsing.Font, buffer: *Buffer, map: Map, config: IndicScriptConfig, cmap: ?Cmap) void {
+    const plan = indicPlan(font, map, config, cmap);
+    if (plan.virama_glyph != 0) {
+        for (buffer.info.items) |*info| {
+            if (info.indic_position == ip_base_c) info.indic_position = consonantPositionFromFace(plan, info.codepoint);
+        }
+    }
+    forEachIndicSyllable(buffer, plan, initialReorderingSyllable);
+}
+
+/// Ported from `final_reordering_indic`: the GSUB pause after the
+/// basic-forms features and before the presentation-forms ones.
+pub fn finalReorderingIndic(font: parsing.Font, buffer: *Buffer, map: Map, config: IndicScriptConfig, cmap: ?Cmap) void {
+    forEachIndicSyllable(buffer, indicPlan(font, map, config, cmap), finalReorderingSyllable);
 }

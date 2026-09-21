@@ -9,14 +9,11 @@
 //   fallback table, ~1000 lines in hb-ot-tag.cc) is not ported: per
 //   requirements.md's Shaping section, "caller supplies the tag" — callers
 //   pass already-resolved OT script/language tag candidates directly.
-// - Pause callbacks (hb_ot_map_t::pause_func_t / add_gsub_pause /
-//   add_gpos_pause) are not ported. hb's compile() always ends with
-//   add_gsub_pause(nullptr); add_gpos_pause(nullptr) after any shaper-added
-//   pauses, so with no complex shaper registering mid-stream callbacks
-//   there is exactly one stage per table — MapBuilder hardcodes that,
-//   rather than building the general N-stage/pause-callback machinery no
-//   caller can drive yet. Add stages/pauses when a complex shaper needs a
-//   mid-run callback between lookup groups.
+// - Pause callbacks are ported as a `StagePause` enum on each stage
+//   instead of hb's `pause_func_t` function pointers: the set of callbacks
+//   is closed (one complex shaper per buffer, each with a fixed script of
+//   pauses) so the caller that drives the stage loop switches on the tag,
+//   keeping map.zig free of any dependency on the shapers.
 // - FeatureVariations (variable-font per-instance feature substitution) is
 //   unsupported at the parsing layer (Table.Layout) it depends on; see that
 //   type's doc comment.
@@ -90,9 +87,19 @@ pub const LookupMapEntry = struct {
     feature_tag: Tag = .{ ' ', ' ', ' ', ' ' },
 };
 
+/// hb registers a `pause_func_t` per stage; this port tags the stage
+/// instead and lets the stage-loop driver (shaping.zig) dispatch, so map.zig
+/// stays independent of the shapers.
+pub const StagePause = enum(u8) {
+    none,
+    indic_initial_reorder,
+    indic_final_reorder,
+};
+
 pub const StageMapEntry = struct {
     /// Cumulative count of lookups (in table order) through this stage.
     last_lookup: u32,
+    pause: StagePause = .none,
 };
 
 pub const Map = struct {
@@ -149,8 +156,16 @@ pub const Map = struct {
         return f.stage[table_index];
     }
 
-    /// hb only ever builds one stage per table in the default (non-complex)
-    /// shaper; see the module doc comment. stage must be 0.
+    pub fn stageCount(self: Map, table_index: u1) u32 {
+        return @intCast(self.stages[table_index].items.len);
+    }
+
+    pub fn stagePause(self: Map, table_index: u1, stage: u32) StagePause {
+        const stages = self.stages[table_index].items;
+        if (stage >= stages.len) return .none;
+        return stages[stage].pause;
+    }
+
     pub fn getStageLookups(self: Map, table_index: u1, stage: u32) []const LookupMapEntry {
         const stages = self.stages[table_index].items;
         if (stage >= stages.len) return &.{};
@@ -158,6 +173,11 @@ pub const Map = struct {
         const end = stages[stage].last_lookup;
         return self.lookups[table_index].items[start..end];
     }
+};
+
+const PauseInfo = struct {
+    index: u32,
+    pause: StagePause,
 };
 
 const FeatureInfo = struct {
@@ -191,6 +211,8 @@ pub const MapBuilder = struct {
     chosen_script: [2]?Tag = .{ null, null },
     found_script: [2]bool = .{ false, false },
     feature_infos: std.ArrayList(FeatureInfo) = .empty,
+    current_stage: [2]u32 = .{ 0, 0 },
+    pauses: [2]std.ArrayList(PauseInfo) = .{ .empty, .empty },
 
     pub fn init(allocator: std.mem.Allocator, font: parsing.Font, script_tags: []const Tag, language_tags: []const Tag) (parsing.Font.ParseError || error{OutOfMemory})!MapBuilder {
         var self = MapBuilder{ .allocator = allocator };
@@ -236,6 +258,7 @@ pub const MapBuilder = struct {
 
     pub fn deinit(self: *MapBuilder) void {
         self.feature_infos.deinit(self.allocator);
+        for (&self.pauses) |*p| p.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -246,8 +269,20 @@ pub const MapBuilder = struct {
             .max_value = value,
             .flags = flags,
             .default_value = if (flags.global) value else 0,
-            .stage = .{ 0, 0 },
+            .stage = self.current_stage,
         });
+    }
+
+    /// Ported from `hb_ot_map_builder_t::add_pause`: closes the current
+    /// stage, so lookups of features added after it are applied only once
+    /// every lookup of every earlier stage has run over the whole buffer.
+    pub fn addPause(self: *MapBuilder, table_index: u1, pause: StagePause) !void {
+        try self.pauses[table_index].append(self.allocator, .{ .index = self.current_stage[table_index], .pause = pause });
+        self.current_stage[table_index] += 1;
+    }
+
+    pub fn addGsubPause(self: *MapBuilder, pause: StagePause) !void {
+        try self.addPause(0, pause);
     }
 
     pub fn enableFeature(self: *MapBuilder, tag: Tag, flags: MapFeatureFlags, value: u32) !void {
@@ -312,11 +347,15 @@ pub const MapBuilder = struct {
         }
     }
 
-    fn sortMergeLookups(list: *std.ArrayList(LookupMapEntry)) void {
-        common.insertionSort(LookupMapEntry, list.items, {}, lookupLessThan);
-        if (list.items.len == 0) return;
-        var j: usize = 0;
-        for (list.items[1..]) |entry| {
+    /// Sorts and dedups only the lookups this stage appended (`from`
+    /// onwards): earlier stages are already closed and must keep their
+    /// application order.
+    fn sortMergeLookups(list: *std.ArrayList(LookupMapEntry), from: usize) void {
+        if (list.items.len <= from + 1) return;
+        const tail = list.items[from..];
+        common.insertionSort(LookupMapEntry, tail, {}, lookupLessThan);
+        var j: usize = from;
+        for (list.items[from + 1 ..]) |entry| {
             if (entry.index != list.items[j].index) {
                 j += 1;
                 list.items[j] = entry;
@@ -442,19 +481,38 @@ pub const MapBuilder = struct {
             try m.features.append(allocator, entry);
         }
 
+        // hb's compile() closes both tables with a final pause, so there is
+        // always at least one stage even with no shaper-registered pauses.
+        try self.addPause(0, .none);
+        try self.addPause(1, .none);
+
         inline for (0..2) |table_index| {
-            if (required_feature_index[table_index]) |req_idx| {
-                if (required_feature_stage[table_index] == 0) {
-                    try self.addLookups(&m, table_index, req_idx, global_bit_mask, true, true, false, false, .{ ' ', ' ', ' ', ' ' });
+            var pause_index: usize = 0;
+            var last_lookup_count: usize = 0;
+            var stage: u32 = 0;
+            while (stage < self.current_stage[table_index]) : (stage += 1) {
+                if (required_feature_index[table_index]) |req_idx| {
+                    if (required_feature_stage[table_index] == stage) {
+                        try self.addLookups(&m, table_index, req_idx, global_bit_mask, true, true, false, false, .{ ' ', ' ', ' ', ' ' });
+                    }
+                }
+                for (m.features.items) |feature| {
+                    if (feature.stage[table_index] == stage) {
+                        try self.addLookups(&m, table_index, feature.index[table_index], feature.mask, feature.auto_zwnj, feature.auto_zwj, feature.random, feature.per_syllable, feature.tag);
+                    }
+                }
+                sortMergeLookups(&m.lookups[table_index], last_lookup_count);
+                last_lookup_count = m.lookups[table_index].items.len;
+
+                const pauses = self.pauses[table_index].items;
+                if (pause_index < pauses.len and pauses[pause_index].index == stage) {
+                    try m.stages[table_index].append(allocator, .{
+                        .last_lookup = @intCast(last_lookup_count),
+                        .pause = pauses[pause_index].pause,
+                    });
+                    pause_index += 1;
                 }
             }
-            for (m.features.items) |feature| {
-                if (feature.stage[table_index] == 0) {
-                    try self.addLookups(&m, table_index, feature.index[table_index], feature.mask, feature.auto_zwnj, feature.auto_zwj, feature.random, feature.per_syllable, feature.tag);
-                }
-            }
-            sortMergeLookups(&m.lookups[table_index]);
-            try m.stages[table_index].append(allocator, .{ .last_lookup = @intCast(m.lookups[table_index].items.len) });
         }
 
         return m;

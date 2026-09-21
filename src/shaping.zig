@@ -39,7 +39,7 @@ pub const LookupMapEntry = map_mod.LookupMapEntry;
 pub const StageMapEntry = map_mod.StageMapEntry;
 
 const containsTag = common.containsTag;
-const applyTable = apply_mod.applyTable;
+const applyStage = apply_mod.applyStage;
 const applyDefaultHorizontalAdvances = apply_mod.applyDefaultHorizontalAdvances;
 const zeroMarkWidthsByGdef = apply_mod.zeroMarkWidthsByGdef;
 const hideDefaultIgnorables = apply_mod.hideDefaultIgnorables;
@@ -48,6 +48,7 @@ const finishGposOffsets = apply_mod.finishGposOffsets;
 const table_tag_gdef = apply_mod.table_tag_gdef;
 const normalize = normalize_mod.normalize;
 const setJoinerFlags = normalize_mod.setJoinerFlags;
+const formClusters = normalize_mod.formClusters;
 const mapGlyphsFast = normalize_mod.mapGlyphsFast;
 const hang_script_tag = hangul_mod.hang_script_tag;
 const collectFeaturesHangul = hangul_mod.collectFeaturesHangul;
@@ -65,6 +66,8 @@ const preprocessTextThai = thai_lao_mod.preprocessTextThai;
 const findIndicConfig = indic_mod.findIndicConfig;
 const collectFeaturesIndic = indic_mod.collectFeaturesIndic;
 const setupMasksIndic = indic_mod.setupMasksIndic;
+const initialReorderingIndic = indic_mod.initialReorderingIndic;
+const finalReorderingIndic = indic_mod.finalReorderingIndic;
 const khmr_script_tag = khmer_myanmar_mod.khmr_script_tag;
 const mym2_script_tag = khmer_myanmar_mod.mym2_script_tag;
 const collectFeaturesKhmer = khmer_myanmar_mod.collectFeaturesKhmer;
@@ -276,6 +279,10 @@ pub const Plan = struct {
         if (is_myanmar) try collectFeaturesMyanmar(&map_builder);
         if (is_use) try collectFeaturesUse(&map_builder);
         for (default_features) |tag| try map_builder.enableFeature(tag, .{ .global = true }, 1);
+        // 'rand' is registered at the maximum feature value, which is what
+        // tells AlternateSubst to draw an alternate at random; a caller
+        // passing rand=N in `extra_features` overrides that to a fixed N.
+        try map_builder.enableFeature(.{ 'r', 'a', 'n', 'd' }, .{ .global = true, .random = true }, apply_mod.map_max_feature_value);
         for (extra_features) |feature| try map_builder.enableFeature(feature.tag, .{}, feature.value);
         if (is_hangul) try overrideFeaturesHangul(&map_builder);
         if (is_khmer) try overrideFeaturesKhmer(&map_builder);
@@ -400,6 +407,7 @@ fn shapeImpl(
     try buffer.out_info.ensureTotalCapacityPrecise(allocator, codepoints.len);
 
     for (codepoints, 0..) |cp, i| try buffer.add(cp, @intCast(i));
+    formClusters(&buffer);
 
     // The plan only depends on font+tags, not on buffer glyph content, so it
     // is built before any shaper preprocessing (vs. a naive
@@ -441,12 +449,12 @@ fn shapeImpl(
     // doc comment for why these four complex shapers need it.
     const might_short_circuit = !(indic_config != null or is_khmer or is_myanmar or is_use);
     const block_mark_recompose = indic_config != null or is_khmer or is_use;
-    try normalize(&buffer, cmap, might_short_circuit, block_mark_recompose);
+    try normalize(&buffer, cmap, might_short_circuit, block_mark_recompose, indic_config != null);
 
     buffer.resetMasks(map.global_mask);
     if (is_hangul) setupMasksHangul(&buffer, map);
     if (is_arabic) setupMasksArabic(&buffer, map);
-    if (indic_config) |cfg| try setupMasksIndic(&buffer, map, cfg.*, cmap);
+    if (indic_config != null) try setupMasksIndic(&buffer, cmap);
     if (is_khmer) try setupMasksKhmer(&buffer, map, cmap);
     if (is_myanmar) try setupMasksMyanmar(&buffer, cmap);
     if (is_use) try setupMasksUse(&buffer, map, cmap, is_use_arabic_joining);
@@ -461,10 +469,10 @@ fn shapeImpl(
         .mark_sets = parsing.Table.Gdef.markGlyphSets(d) catch null,
     } else .{};
 
-    try applyTable(font, map, 0, gdef_classdef, &buffer, direction);
+    try applyGsub(font, map, gdef_classdef, &buffer, direction, indic_config, cmap);
     hideDefaultIgnorables(&buffer, cmap);
     try buffer.clearPositions();
-    applyDefaultHorizontalAdvances(font, &buffer, normalized_coords);
+    applyDefaultHorizontalAdvances(font, &buffer, cmap, normalized_coords);
     // hb-ot-shape.cc's `zero_width_marks` shaper property: the Indic,
     // Khmer and Hangul shapers never zero mark advances (their fonts carry
     // real advances on marks that GPOS 'dist'/abvm/blwm then positions),
@@ -472,7 +480,12 @@ fn shapeImpl(
     const zero_marks_early = is_use or is_myanmar;
     const zero_marks_late = !(zero_marks_early or is_hangul or is_khmer or indic_config != null);
     if (zero_marks_early) zeroMarkWidthsByGdef(&buffer, gdef_classdef);
-    try applyTable(font, map, 1, gdef_classdef, &buffer, direction);
+    {
+        var stage: u32 = 0;
+        while (stage < map.stageCount(1)) : (stage += 1) {
+            try applyStage(font, map, 1, gdef_classdef, &buffer, direction, stage);
+        }
+    }
     if (zero_marks_late) zeroMarkWidthsByGdef(&buffer, gdef_classdef);
     finishGposOffsets(&buffer, direction);
     zeroDefaultIgnorableAdvances(&buffer, direction);
@@ -484,6 +497,30 @@ fn shapeImpl(
     if (item) |it| retainItemGlyphs(&buffer, it);
 
     return buffer;
+}
+
+/// Runs GSUB stage by stage, handing control back to the complex shaper at
+/// each stage's pause - hb's `hb_ot_map_t::substitute` loop with its
+/// `pause_func` callbacks, dispatched off `StagePause` rather than a stored
+/// function pointer (see map.zig).
+fn applyGsub(
+    font: parsing.Font,
+    map: Map,
+    gdef_classdef: apply_mod.Gdef,
+    buffer: *Buffer,
+    direction: Direction,
+    indic_config: ?*const indic_mod.IndicScriptConfig,
+    cmap: ?parsing.Table.cmap.Resolved,
+) (parsing.Font.ParseError || error{OutOfMemory})!void {
+    var stage: u32 = 0;
+    while (stage < map.stageCount(0)) : (stage += 1) {
+        try applyStage(font, map, 0, gdef_classdef, buffer, direction, stage);
+        switch (map.stagePause(0, stage)) {
+            .none => {},
+            .indic_initial_reorder => initialReorderingIndic(font, buffer, map, indic_config.?.*, cmap),
+            .indic_final_reorder => finalReorderingIndic(font, buffer, map, indic_config.?.*, cmap),
+        }
+    }
 }
 
 /// Drops glyphs whose cluster lies outside `item`, keeping `info`/`pos`

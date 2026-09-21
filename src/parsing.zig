@@ -654,23 +654,89 @@ pub const Table = struct {
             sub: []const u8,
             format: u16,
 
+            /// A Macintosh-platform subtable is indexed by a byte in a
+            /// legacy encoding, not by codepoint, so a Unicode request has
+            /// to be translated first. Only ever `.none` unless the font
+            /// has no Unicode subtable at all.
+            legacy: Legacy = .none,
+
+            pub const Legacy = enum { none, ascii, mac_roman };
+
             pub fn lookup(self: Resolved, codepoint: u21) ?u16 {
+                const index: u21 = switch (self.legacy) {
+                    .none => codepoint,
+                    .ascii => if (codepoint < 0x80) codepoint else return null,
+                    .mac_roman => if (codepoint < 0x80) codepoint else (unicodeToMacRoman(codepoint) orelse return null),
+                };
                 return switch (self.format) {
-                    0 => lookupFormat0(self.sub, codepoint),
-                    4 => lookupFormat4(self.sub, codepoint),
-                    12 => lookupSegmented(self.sub, codepoint, false),
-                    13 => lookupSegmented(self.sub, codepoint, true),
+                    0 => lookupFormat0(self.sub, index),
+                    4 => lookupFormat4(self.sub, index),
+                    6 => lookupTrimmed(self.sub, index, false),
+                    10 => lookupTrimmed(self.sub, index, true),
+                    12 => lookupSegmented(self.sub, index, false),
+                    13 => lookupSegmented(self.sub, index, true),
                     else => null,
                 };
             }
         };
 
-        pub fn resolve(data: []const u8) ?Resolved {
-            const sel = selectSubtable(data) orelse return null;
-            return .{ .sub = data[sel.offset..], .format = sel.format };
+        /// Ported from hb-ot-cmap-table.hh's `unicode_to_macroman`: the
+        /// non-ASCII half of Mac OS Roman, sorted by codepoint.
+        const mac_roman_from_unicode = [_]struct { u16, u8 }{
+            .{ 0x00A0, 0xCA }, .{ 0x00A1, 0xC1 }, .{ 0x00A2, 0xA2 }, .{ 0x00A3, 0xA3 },
+            .{ 0x00A5, 0xB4 }, .{ 0x00A7, 0xA4 }, .{ 0x00A8, 0xAC }, .{ 0x00A9, 0xA9 },
+            .{ 0x00AA, 0xBB }, .{ 0x00AB, 0xC7 }, .{ 0x00AC, 0xC2 }, .{ 0x00AE, 0xA8 },
+            .{ 0x00AF, 0xF8 }, .{ 0x00B0, 0xA1 }, .{ 0x00B1, 0xB1 }, .{ 0x00B4, 0xAB },
+            .{ 0x00B5, 0xB5 }, .{ 0x00B6, 0xA6 }, .{ 0x00B7, 0xE1 }, .{ 0x00B8, 0xFC },
+            .{ 0x00BA, 0xBC }, .{ 0x00BB, 0xC8 }, .{ 0x00BF, 0xC0 }, .{ 0x00C0, 0xCB },
+            .{ 0x00C1, 0xE7 }, .{ 0x00C2, 0xE5 }, .{ 0x00C3, 0xCC }, .{ 0x00C4, 0x80 },
+            .{ 0x00C5, 0x81 }, .{ 0x00C6, 0xAE }, .{ 0x00C7, 0x82 }, .{ 0x00C8, 0xE9 },
+            .{ 0x00C9, 0x83 }, .{ 0x00CA, 0xE6 }, .{ 0x00CB, 0xE8 }, .{ 0x00CC, 0xED },
+            .{ 0x00CD, 0xEA }, .{ 0x00CE, 0xEB }, .{ 0x00CF, 0xEC }, .{ 0x00D1, 0x84 },
+            .{ 0x00D2, 0xF1 }, .{ 0x00D3, 0xEE }, .{ 0x00D4, 0xEF }, .{ 0x00D5, 0xCD },
+            .{ 0x00D6, 0x85 }, .{ 0x00D8, 0xAF }, .{ 0x00D9, 0xF4 }, .{ 0x00DA, 0xF2 },
+            .{ 0x00DB, 0xF3 }, .{ 0x00DC, 0x86 }, .{ 0x00DF, 0xA7 }, .{ 0x00E0, 0x88 },
+            .{ 0x00E1, 0x87 }, .{ 0x00E2, 0x89 }, .{ 0x00E3, 0x8B }, .{ 0x00E4, 0x8A },
+            .{ 0x00E5, 0x8C }, .{ 0x00E6, 0xBE }, .{ 0x00E7, 0x8D }, .{ 0x00E8, 0x8F },
+            .{ 0x00E9, 0x8E }, .{ 0x00EA, 0x90 }, .{ 0x00EB, 0x91 }, .{ 0x00EC, 0x93 },
+            .{ 0x00ED, 0x92 }, .{ 0x00EE, 0x94 }, .{ 0x00EF, 0x95 }, .{ 0x00F1, 0x96 },
+            .{ 0x00F2, 0x98 }, .{ 0x00F3, 0x97 }, .{ 0x00F4, 0x99 }, .{ 0x00F5, 0x9B },
+            .{ 0x00F6, 0x9A }, .{ 0x00F7, 0xD6 }, .{ 0x00F8, 0xBF }, .{ 0x00F9, 0x9D },
+            .{ 0x00FA, 0x9C }, .{ 0x00FB, 0x9E }, .{ 0x00FC, 0x9F }, .{ 0x00FF, 0xD8 },
+            .{ 0x0131, 0xF5 }, .{ 0x0152, 0xCE }, .{ 0x0153, 0xCF }, .{ 0x0178, 0xD9 },
+            .{ 0x0192, 0xC4 }, .{ 0x02C6, 0xF6 }, .{ 0x02C7, 0xFF }, .{ 0x02D8, 0xF9 },
+            .{ 0x02D9, 0xFA }, .{ 0x02DA, 0xFB }, .{ 0x02DB, 0xFE }, .{ 0x02DC, 0xF7 },
+            .{ 0x02DD, 0xFD }, .{ 0x03A9, 0xBD }, .{ 0x03C0, 0xB9 }, .{ 0x2013, 0xD0 },
+            .{ 0x2014, 0xD1 }, .{ 0x2018, 0xD4 }, .{ 0x2019, 0xD5 }, .{ 0x201A, 0xE2 },
+            .{ 0x201C, 0xD2 }, .{ 0x201D, 0xD3 }, .{ 0x201E, 0xE3 }, .{ 0x2020, 0xA0 },
+            .{ 0x2021, 0xE0 }, .{ 0x2022, 0xA5 }, .{ 0x2026, 0xC9 }, .{ 0x2030, 0xE4 },
+            .{ 0x2039, 0xDC }, .{ 0x203A, 0xDD }, .{ 0x2044, 0xDA }, .{ 0x20AC, 0xDB },
+            .{ 0x2122, 0xAA }, .{ 0x2202, 0xB6 }, .{ 0x2206, 0xC6 }, .{ 0x220F, 0xB8 },
+            .{ 0x2211, 0xB7 }, .{ 0x221A, 0xC3 }, .{ 0x221E, 0xB0 }, .{ 0x222B, 0xBA },
+            .{ 0x2248, 0xC5 }, .{ 0x2260, 0xAD }, .{ 0x2264, 0xB2 }, .{ 0x2265, 0xB3 },
+            .{ 0x25CA, 0xD7 }, .{ 0xF8FF, 0xF0 }, .{ 0xFB01, 0xDE }, .{ 0xFB02, 0xDF },
+        };
+
+        fn unicodeToMacRoman(codepoint: u21) ?u8 {
+            if (codepoint > 0xFFFF) return null;
+            const needle: u16 = @intCast(codepoint);
+            var lo: usize = 0;
+            var hi: usize = mac_roman_from_unicode.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                const entry = mac_roman_from_unicode[mid];
+                if (entry[0] == needle) return entry[1];
+                if (entry[0] < needle) lo = mid + 1 else hi = mid;
+            }
+            return null;
         }
 
-        const Subtable = struct { offset: u32, format: u16 };
+        pub fn resolve(data: []const u8) ?Resolved {
+            const sel = selectSubtable(data) orelse return null;
+            return .{ .sub = data[sel.offset..], .format = sel.format, .legacy = sel.legacy };
+        }
+
+        const Subtable = struct { offset: u32, format: u16, legacy: Resolved.Legacy };
 
         fn selectSubtable(data: []const u8) ?Subtable {
             if (data.len < 4) return null;
@@ -679,6 +745,7 @@ pub const Table = struct {
 
             var best_offset: ?u32 = null;
             var best_score: i32 = -1;
+            var best_legacy: Resolved.Legacy = .none;
             var i: usize = 0;
             while (i < num_tables) : (i += 1) {
                 const rec_pos = 4 + i * 8;
@@ -694,7 +761,9 @@ pub const Table = struct {
                     0 => switch (encoding_id) {
                         4, 6 => 5,
                         3 => 3,
-                        else => 1,
+                        // Above the Macintosh platform below, which is only
+                        // ever a last resort.
+                        else => 2,
                     },
                     1 => 1,
                     else => 0,
@@ -702,12 +771,18 @@ pub const Table = struct {
                 if (score > best_score and offset < data.len) {
                     best_score = score;
                     best_offset = offset;
+                    best_legacy = if (platform_id != 1)
+                        .none
+                    else if (encoding_id == 0)
+                        .mac_roman
+                    else
+                        .ascii;
                 }
             }
             const subtable_offset = best_offset orelse return null;
             if (subtable_offset + 2 > data.len) return null;
             const format = std.mem.readInt(u16, data[subtable_offset..][0..2], .big);
-            return .{ .offset = subtable_offset, .format = format };
+            return .{ .offset = subtable_offset, .format = format, .legacy = best_legacy };
         }
 
         /// An inclusive codepoint range with a non-.notdef glyph somewhere
@@ -728,6 +803,8 @@ pub const Table = struct {
             return switch (sel.format) {
                 0 => coverageRangesFormat0(sub, alloc),
                 4 => coverageRangesFormat4(sub, alloc),
+                6 => coverageRangesTrimmed(sub, alloc, false),
+                10 => coverageRangesTrimmed(sub, alloc, true),
                 // Format 13 shares format 12's header and group layout; only
                 // the glyph a group resolves to differs, which coverage
                 // ranges do not record.
@@ -874,6 +951,14 @@ pub const Table = struct {
             return ranges.toOwnedSlice(alloc);
         }
 
+        fn coverageRangesTrimmed(sub: []const u8, alloc: Allocator, wide: bool) Allocator.Error![]Range {
+            const t = trimmedHeader(sub, wide) orelse return &.{};
+            if (t.count == 0) return &.{};
+            const last = @min(@as(u64, t.first) + t.count - 1, 0x10FFFF);
+            if (t.first > last) return &.{};
+            return alloc.dupe(Range, &.{.{ .start = @intCast(t.first), .end = @intCast(last) }});
+        }
+
         fn coverageRangesFormat12(sub: []const u8, alloc: Allocator) Allocator.Error![]Range {
             if (sub.len < 16) return &.{};
             const declared_groups = std.mem.readInt(u32, sub[12..][0..4], .big);
@@ -933,6 +1018,40 @@ pub const Table = struct {
             const glyph = std.mem.readInt(u16, sub[glyph_pos..][0..2], .big);
             if (glyph == 0) return null;
             return @truncate(@as(u32, @bitCast(@as(i32, glyph) + id_delta)));
+        }
+
+        const TrimmedHeader = struct { first: u32, count: u32, glyphs: usize };
+
+        /// Format 6 (TrimmedTableMapping) and 10 (TrimmedArray): a first
+        /// codepoint, an entry count and a dense glyphId array. Same shape
+        /// either way; format 10 widens first/count to 32 bits and pads the
+        /// header out to 20 bytes.
+        fn trimmedHeader(sub: []const u8, wide: bool) ?TrimmedHeader {
+            if (wide) {
+                if (sub.len < 20) return null;
+                return .{
+                    .first = std.mem.readInt(u32, sub[12..][0..4], .big),
+                    .count = std.mem.readInt(u32, sub[16..][0..4], .big),
+                    .glyphs = 20,
+                };
+            }
+            if (sub.len < 10) return null;
+            return .{
+                .first = std.mem.readInt(u16, sub[6..][0..2], .big),
+                .count = std.mem.readInt(u16, sub[8..][0..2], .big),
+                .glyphs = 10,
+            };
+        }
+
+        fn lookupTrimmed(sub: []const u8, codepoint: u21, wide: bool) ?u16 {
+            const t = trimmedHeader(sub, wide) orelse return null;
+            if (codepoint < t.first) return null;
+            const index = @as(u32, codepoint) - t.first;
+            if (index >= t.count) return null;
+            const pos = t.glyphs + @as(usize, index) * 2;
+            if (pos + 2 > sub.len) return null;
+            const glyph = std.mem.readInt(u16, sub[pos..][0..2], .big);
+            return if (glyph == 0) null else glyph;
         }
 
         /// Format 12 (SegmentedCoverage) and 13 (ManyToOneRangeMappings):
@@ -3652,6 +3771,11 @@ pub const Table = struct {
         /// their OT-spec byte layout by the caller, keeping the
         /// attacker-controlled-bytes boundary (this type) free of
         /// substitution/positioning semantics.
+        /// Backing bytes for NULL Offset16s (hb's `_hb_NullPool`). Every
+        /// count field reads as zero; a read past the end is bounds-checked
+        /// like any other.
+        const null_table: [64]u8 = @splat(0);
+
         pub const SubtableReader = struct {
             data: []const u8,
             offset: usize,
@@ -3674,8 +3798,14 @@ pub const Table = struct {
             /// Follows an Offset16 field at `rel` (relative to this
             /// subtable's own start, per OT convention) into a fresh reader
             /// based at the target.
+            ///
+            /// A NULL (zero) offset means "absent", not "the parent": hb
+            /// resolves these to its all-zero Null pool, so an omitted
+            /// RuleSet reads as zero rules rather than as the subtable
+            /// header reinterpreted as one.
             pub fn subReaderAt(self: SubtableReader, rel: usize) Font.ParseError!SubtableReader {
                 const off = try self.u16At(rel);
+                if (off == 0) return .{ .data = &null_table, .offset = 0 };
                 return .{ .data = self.data, .offset = self.offset + off };
             }
 

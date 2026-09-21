@@ -8,6 +8,23 @@ const combiningClassOf = common.combiningClassOf;
 
 const NormalizeContext = struct {
     cmap: ?Cmap,
+    /// hb's per-shaper `decompose` override; only the Indic shaper has one
+    /// (`decompose_indic`), and all it does is refuse four canonical
+    /// decompositions - see `blocksDecomposition`.
+    is_indic: bool = false,
+
+    /// Ported from `decompose_indic`'s explicit "don't decompose these"
+    /// cases: these four are letters in their own right, and splitting them
+    /// leaves the syllable machine looking at a consonant plus a stray
+    /// nukta/matra (a Tamil AU would shape as a broken cluster and take a
+    /// dotted circle).
+    fn blocksDecomposition(self: NormalizeContext, ab: u21) bool {
+        if (!self.is_indic) return false;
+        return switch (ab) {
+            0x0931, 0x09DC, 0x09DD, 0x0B94 => true,
+            else => false,
+        };
+    }
 
     fn nominalGlyph(self: NormalizeContext, codepoint: u21) ?u32 {
         const resolved = self.cmap orelse return null;
@@ -42,6 +59,7 @@ fn nextChar(buffer: *Buffer, glyph: u32) !void {
 /// nesting): the decomposition chain is fixed Unicode data, not
 /// attacker/font-controlled, and UAX #15 guarantees it's finite and short.
 fn decomposeChar(ctx: NormalizeContext, buffer: *Buffer, shortest: bool, ab: u21) (error{OutOfMemory})!usize {
+    if (ctx.blocksDecomposition(ab)) return 0;
     const dec = unicode.decomposeCanonical(ab) orelse return 0;
     const a = dec.first;
     const b = dec.second;
@@ -105,9 +123,26 @@ fn decomposeCurrentChar(ctx: NormalizeContext, buffer: *Buffer, shortest: bool) 
         }
     }
 
-    // Font can't render `u` and it has no usable decomposition; no
-    // space-fallback/U+2011 fallback (see section doc comment) - fall
-    // through with glyph 0 (.notdef), same as hb's own last resort here.
+    const space_type = common.spaceFallbackType(u);
+    if (space_type != .not_space) {
+        if (ctx.nominalGlyph(' ')) |space_glyph| {
+            buffer.curPtr(0).space_fallback = space_type;
+            try nextChar(buffer, space_glyph);
+            return;
+        }
+    }
+
+    // U+2011 is the only non-space no-break character worth falling back to
+    // its breaking counterpart; the space ones are handled just above.
+    if (u == 0x2011) {
+        if (ctx.nominalGlyph(0x2010)) |hyphen_glyph| {
+            try nextChar(buffer, hyphen_glyph);
+            return;
+        }
+    }
+
+    // Font can't render `u` and it has no usable decomposition or fallback;
+    // fall through with glyph 0 (.notdef), same as hb's own last resort.
     try nextChar(buffer, 0);
 }
 
@@ -214,9 +249,9 @@ fn normalizeRecomposeRound(ctx: NormalizeContext, buffer: *Buffer, block_mark_re
 /// classify as a broken syllable). The one indic-specific hardcoded
 /// exception (`0x09AF+0x09BC -> 0x09DF`) hb recomposes anyway isn't ported -
 /// narrow enough to defer.
-pub fn normalize(buffer: *Buffer, cmap: ?Cmap, might_short_circuit: bool, block_mark_recompose: bool) !void {
+pub fn normalize(buffer: *Buffer, cmap: ?Cmap, might_short_circuit: bool, block_mark_recompose: bool, is_indic: bool) !void {
     if (buffer.info.items.len == 0) return;
-    const ctx = NormalizeContext{ .cmap = cmap };
+    const ctx = NormalizeContext{ .cmap = cmap, .is_indic = is_indic };
 
     var all_simple = true;
     buffer.clearOutput();
@@ -256,9 +291,61 @@ pub fn normalize(buffer: *Buffer, cmap: ?Cmap, might_short_circuit: bool, block_
     try normalizeRecomposeRound(ctx, buffer, block_mark_recompose);
 }
 
-/// Ported from hb_set_unicode_props's ZWJ/ZWNJ half (the rest of that
-/// function - grapheme-continuation tracking - is out of scope, see this
-/// section's top doc comment). Must run after `normalize` (which may
+/// Ported from `hb_set_unicode_props` + `hb_form_clusters`: every codepoint
+/// hb considers a grapheme *continuation* is folded into the cluster of the
+/// character it extends, so a whole emoji sequence (base, skin-tone
+/// modifier, ZWJ-joined parts) reports one cluster instead of one per
+/// codepoint.
+///
+/// This is deliberately not UAX #29 - hb implements "enough of Unicode
+/// Graphemes" that reverse-direction shaping cannot split one, and nothing
+/// more, so Hangul syllables and prepend sequences are left alone.
+/// `unicode.GraphemeBreakIterator` is the full algorithm and would merge
+/// strictly more than hb does. Runs before `normalize`, matching hb's
+/// order, so decompositions inherit the already-merged cluster.
+pub fn formClusters(buffer: *Buffer) void {
+    const infos = buffer.info.items;
+    var start: usize = 0;
+    var prev_continuation = false;
+    var i: usize = 1;
+    while (i <= infos.len) : (i += 1) {
+        const continuation = i < infos.len and isGraphemeContinuation(infos, i, prev_continuation);
+        if (!continuation) {
+            buffer.mergeGraphemeClusters(start, i);
+            start = i;
+        }
+        prev_continuation = continuation;
+    }
+}
+
+fn isRegionalIndicator(cp: u32) bool {
+    return cp >= 0x1F1E6 and cp <= 0x1F1FF;
+}
+
+/// `prev_continuation` is whether `infos[i - 1]` itself continued something,
+/// which only the regional-indicator rule needs: flags pair up two at a
+/// time, so the second of a run joins the first but the third starts a new
+/// one.
+fn isGraphemeContinuation(infos: []const GlyphInfo, i: usize, prev_continuation: bool) bool {
+    const cp = infos[i].codepoint;
+    if (cp < 0x80) return false;
+    // Any mark, default-ignorable ones (VS15/VS16) included - hb sets this
+    // bit alongside the ignorable bit, not instead of it.
+    if (unicode.isUnicodeMark(@intCast(cp))) return true;
+    // Emoji_Modifier, i.e. the five skin tones.
+    if (cp >= 0x1F3FB and cp <= 0x1F3FF) return true;
+    if (isRegionalIndicator(cp)) return isRegionalIndicator(infos[i - 1].codepoint) and !prev_continuation;
+    if (cp == 0x200D) return true;
+    if (infos[i - 1].codepoint == 0x200D and
+        unicode.GraphemeClusterBreak.of(@intCast(cp)) == .extended_pictographic) return true;
+    // The Other_Grapheme_Extend characters that are not marks and that hb
+    // chose to merge: halfwidth katakana sound marks, and the tag
+    // characters that spell out sub-region flags. ZWNJ is left out on
+    // purpose - keeping it separate gives more granular clusters.
+    return (cp >= 0xFF9E and cp <= 0xFF9F) or (cp >= 0xE0020 and cp <= 0xE007F);
+}
+
+/// Ported from hb_set_unicode_props's ZWJ/ZWNJ half. Must run after `normalize` (which may
 /// insert/reorder/delete glyphs) and before `mapGlyphsFast` overwrites
 /// `codepoint` with a glyph id.
 pub fn setJoinerFlags(buffer: *Buffer) void {
