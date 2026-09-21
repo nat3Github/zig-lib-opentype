@@ -9,6 +9,7 @@ const normalize_mod = @import("shaping/normalize.zig");
 const hangul_mod = @import("shaping/hangul.zig");
 const arabic_mod = @import("shaping/arabic.zig");
 const thai_lao_mod = @import("shaping/thai_lao.zig");
+const preprocessVowelConstraints = @import("shaping/vowel_constraints.zig").preprocessVowelConstraints;
 const indic_mod = @import("shaping/indic.zig");
 const khmer_myanmar_mod = @import("shaping/khmer_myanmar.zig");
 const use_mod = @import("shaping/use.zig");
@@ -444,6 +445,7 @@ fn shapeImpl(
     // sections above) before normalize.
     if (is_hangul) try preprocessHangul(font, &buffer, cmap);
     if (is_thai or is_lao) try preprocessTextThai(&buffer, cmap, is_thai, map.found_script[0]);
+    if (indic_config != null or is_use) try preprocessVowelConstraints(&buffer, script_tags);
 
     // COMPOSED_DIACRITICS_NO_SHORT_CIRCUIT in hb's terms - see normalize()'s
     // doc comment for why these four complex shapers need it.
