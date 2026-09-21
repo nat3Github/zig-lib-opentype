@@ -3447,21 +3447,92 @@ pub const Table = struct {
     pub const Layout = struct {
         data: []const u8,
 
-        const Header = struct { script_list: usize, feature_list: usize, lookup_list: usize };
+        const Header = struct { script_list: usize, feature_list: usize, lookup_list: usize, feature_variations: usize };
 
-        // NOTE: FeatureVariations (table version 1.1, variable-font
-        // per-instance feature substitution) is not read here — ignored, not
-        // mis-parsed, since minorVersion is read and discarded. Add when a
-        // variable-font shaping test needs feature variation resolution.
         fn header(self: Layout) Font.ParseError!Header {
             var c = Cursor{ .data = self.data };
             _ = try c.readU16(); // majorVersion
-            _ = try c.readU16(); // minorVersion
+            const minor_version = try c.readU16();
             return .{
                 .script_list = try c.readU16(),
                 .feature_list = try c.readU16(),
                 .lookup_list = try c.readU16(),
+                .feature_variations = if (minor_version >= 1) try c.readU32() else 0,
             };
+        }
+
+        /// Caps condition evaluations per lookup: every record may point at
+        /// the same large ConditionSet, which would otherwise make the scan
+        /// quadratic in table size.
+        const max_condition_evaluations = 1 << 16;
+
+        /// hb's `FeatureVariations::find_index`: the first FeatureVariation
+        /// record whose ConditionSet matches `normalized_coords`, or null.
+        /// Only ConditionFormat1 (axis range) is evaluated; other formats
+        /// never match. Missing coords count as the default (0).
+        pub fn findFeatureVariationsIndex(self: Layout, normalized_coords: []const f32) Font.ParseError!?u32 {
+            const h = try self.header();
+            if (h.feature_variations == 0) return null;
+            const data = self.data;
+            var c = Cursor{ .data = data, .pos = offsetWithin(data, h.feature_variations, 8) orelse return error.UnexpectedEndOfData };
+            _ = try c.readU32(); // version
+            const record_count = try c.readU32();
+            if (@as(u64, record_count) * 8 > data.len - c.pos) return error.UnexpectedEndOfData;
+
+            var budget: usize = max_condition_evaluations;
+            var i: u32 = 0;
+            while (i < record_count) : (i += 1) {
+                const condition_set_offset = try c.readU32();
+                _ = try c.readU32(); // featureTableSubstitutionOffset
+                if (condition_set_offset == 0) return i;
+                const set_pos = offsetWithin(data, @as(u64, h.feature_variations) + condition_set_offset, 2) orelse return error.UnexpectedEndOfData;
+                var sc = Cursor{ .data = data, .pos = set_pos };
+                const condition_count = try sc.readU16();
+                if (@as(u64, condition_count) * 4 > data.len - sc.pos) return error.UnexpectedEndOfData;
+                if (condition_count > budget) return null;
+                budget -= condition_count;
+
+                const matched = for (0..condition_count) |_| {
+                    const condition_offset = try sc.readU32();
+                    const cond_pos = offsetWithin(data, @as(u64, set_pos) + condition_offset, 8) orelse break false;
+                    var cc = Cursor{ .data = data, .pos = cond_pos };
+                    if (try cc.readU16() != 1) break false;
+                    const axis_index = try cc.readU16();
+                    const filter_min = try cc.readI16();
+                    const filter_max = try cc.readI16();
+                    const coord_f: f32 = if (axis_index < normalized_coords.len) std.math.clamp(normalized_coords[axis_index], -1, 1) else 0;
+                    const coord: i32 = @intFromFloat(@round(coord_f * 16384));
+                    if (coord < filter_min or coord > filter_max) break false;
+                } else true;
+                if (matched) return i;
+            }
+            return null;
+        }
+
+        /// hb's `get_feature_variation`: absolute offset of the Feature table
+        /// that FeatureVariation record `variations_index` substitutes for
+        /// `feature_index`, or null to use the FeatureList's own.
+        fn substituteFeatureOffset(self: Layout, h: Header, variations_index: u32, feature_index: u16) Font.ParseError!?usize {
+            if (h.feature_variations == 0) return null;
+            const data = self.data;
+            var c = Cursor{ .data = data, .pos = offsetWithin(data, h.feature_variations, 8) orelse return error.UnexpectedEndOfData };
+            _ = try c.readU32(); // version
+            const record_count = try c.readU32();
+            if (variations_index >= record_count) return null;
+            c.pos = offsetWithin(data, @as(u64, c.pos) + @as(u64, variations_index) * 8 + 4, 4) orelse return error.UnexpectedEndOfData;
+            const substitution_offset = try c.readU32();
+            if (substitution_offset == 0) return null;
+            const table_pos = offsetWithin(data, @as(u64, h.feature_variations) + substitution_offset, 6) orelse return error.UnexpectedEndOfData;
+            var sc = Cursor{ .data = data, .pos = table_pos + 4 };
+            const substitution_count = try sc.readU16();
+            if (@as(u64, substitution_count) * 6 > data.len - sc.pos) return error.UnexpectedEndOfData;
+            for (0..substitution_count) |_| {
+                const substituted_index = try sc.readU16();
+                const feature_offset = try sc.readU32();
+                if (substituted_index != feature_index) continue;
+                return offsetWithin(data, @as(u64, table_pos) + feature_offset, 4) orelse return error.UnexpectedEndOfData;
+            }
+            return null;
         }
 
         /// Reads a `u16 count` + `(Tag, Offset16)[count]` record list at
@@ -3559,15 +3630,20 @@ pub const Table = struct {
         }
 
         /// Returns the caller-owned lookup-index list referenced by
-        /// FeatureList[feature_index].
-        pub fn featureLookups(self: Layout, alloc: Allocator, feature_index: u16) (Font.ParseError || error{OutOfMemory})![]const u16 {
+        /// FeatureList[feature_index], or by its substitute in FeatureVariation
+        /// record `variations_index` (see `findFeatureVariationsIndex`).
+        pub fn featureLookups(self: Layout, alloc: Allocator, feature_index: u16, variations_index: ?u32) (Font.ParseError || error{OutOfMemory})![]const u16 {
             const h = try self.header();
-            var c = Cursor{ .data = self.data, .pos = h.feature_list + 2 + @as(usize, feature_index) * 6 };
-            _ = try c.readBytes(4); // tag
-            const rec_offset = try c.readU16();
-            var fc = Cursor{ .data = self.data, .pos = h.feature_list + rec_offset };
+            const substitute = if (variations_index) |vi| try self.substituteFeatureOffset(h, vi, feature_index) else null;
+            const feature_pos = substitute orelse blk: {
+                var c = Cursor{ .data = self.data, .pos = h.feature_list + 2 + @as(usize, feature_index) * 6 };
+                _ = try c.readBytes(4); // tag
+                break :blk h.feature_list + try c.readU16();
+            };
+            var fc = Cursor{ .data = self.data, .pos = feature_pos };
             _ = try fc.readU16(); // featureParams offset
             const lookup_count = try fc.readU16();
+            if (@as(u64, lookup_count) * 2 > self.data.len - fc.pos) return error.UnexpectedEndOfData;
             const result = try alloc.alloc(u16, lookup_count);
             errdefer alloc.free(result);
             for (result) |*r| r.* = try fc.readU16();

@@ -14,9 +14,6 @@
 //   is closed (one complex shaper per buffer, each with a fixed script of
 //   pauses) so the caller that drives the stage loop switches on the tag,
 //   keeping map.zig free of any dependency on the shapers.
-// - FeatureVariations (variable-font per-instance feature substitution) is
-//   unsupported at the parsing layer (Table.Layout) it depends on; see that
-//   type's doc comment.
 const std = @import("std");
 const parsing = @import("../parsing.zig");
 const common = @import("common.zig");
@@ -201,6 +198,20 @@ fn lookupLessThan(_: void, a: LookupMapEntry, b: LookupMapEntry) bool {
     return a.index < b.index;
 }
 
+/// hb's `hb_ot_layout_table_find_feature_variations` for GSUB and GPOS: the
+/// FeatureVariation record each table applies at `normalized_coords` (no
+/// coords = the default instance). A malformed record list is treated as
+/// having none.
+pub fn findFeatureVariations(font: parsing.Font, normalized_coords: []const f32) [2]?u32 {
+    var result: [2]?u32 = .{ null, null };
+    for ([2]Tag{ table_tag_gsub, table_tag_gpos }, 0..) |table_tag, i| {
+        const data = font.tableData(table_tag) orelse continue;
+        const layout = parsing.Table.Layout{ .data = data };
+        result[i] = layout.findFeatureVariationsIndex(normalized_coords) catch null;
+    }
+    return result;
+}
+
 /// Builds a Map for one segment (font + candidate script/language tags),
 /// mirroring hb_ot_map_builder_t. Caller adds features with addFeature/
 /// enableFeature/disableFeature, then calls compile() once.
@@ -210,12 +221,13 @@ pub const MapBuilder = struct {
     language: [2]?parsing.Table.Layout.LangSys = .{ null, null },
     chosen_script: [2]?Tag = .{ null, null },
     found_script: [2]bool = .{ false, false },
+    variations_index: [2]?u32 = .{ null, null },
     feature_infos: std.ArrayList(FeatureInfo) = .empty,
     current_stage: [2]u32 = .{ 0, 0 },
     pauses: [2]std.ArrayList(PauseInfo) = .{ .empty, .empty },
 
-    pub fn init(allocator: std.mem.Allocator, font: parsing.Font, script_tags: []const Tag, language_tags: []const Tag) (parsing.Font.ParseError || error{OutOfMemory})!MapBuilder {
-        var self = MapBuilder{ .allocator = allocator };
+    pub fn init(allocator: std.mem.Allocator, font: parsing.Font, script_tags: []const Tag, language_tags: []const Tag, variations_index: [2]?u32) (parsing.Font.ParseError || error{OutOfMemory})!MapBuilder {
+        var self = MapBuilder{ .allocator = allocator, .variations_index = variations_index };
         const table_tags = [2]Tag{ table_tag_gsub, table_tag_gpos };
         for (table_tags, 0..) |table_tag, i| {
             const data = font.tableData(table_tag) orelse continue;
@@ -330,7 +342,7 @@ pub const MapBuilder = struct {
     ) !void {
         const idx = feature_index orelse return;
         const layout = self.layouts[table_index] orelse return;
-        const lookup_indices = try layout.featureLookups(self.allocator, idx);
+        const lookup_indices = try layout.featureLookups(self.allocator, idx, self.variations_index[table_index]);
         defer self.allocator.free(lookup_indices);
         const table_lookup_count = try layout.lookupCount();
         for (lookup_indices) |li| {

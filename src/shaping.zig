@@ -139,9 +139,10 @@ pub fn shape(
 
 /// Same as `shape`, but `normalized_coords` (per-axis values in [-1, 1],
 /// `fvar` axis order, already through `avar` remapping - see
-/// `render.Renderer`'s `normalizedCoords`) apply HVAR advance-width deltas
-/// on top of the default `hmtx` widths. Outline shape variation (`gvar`) is
-/// handled separately by the rasterizer; this only affects `x_advance`.
+/// `render.Renderer`'s `normalizedCoords`) pick the GSUB/GPOS
+/// FeatureVariations record and apply HVAR advance-width deltas on top of
+/// the default `hmtx` widths. Outline shape variation (`gvar`) is handled
+/// separately by the rasterizer.
 pub fn shapeVaried(
     allocator: std.mem.Allocator,
     font: parsing.Font,
@@ -222,6 +223,7 @@ pub const Plan = struct {
         script_tags: []const Tag,
         language_tags: []const Tag,
         extra_features: []const Feature,
+        variations_index: [2]?u32,
     ) (parsing.Font.ParseError || error{OutOfMemory})!Plan {
         const cmap: ?parsing.Table.cmap.Resolved = if (font.tableData(.{ 'c', 'm', 'a', 'p' })) |d| parsing.Table.cmap.resolve(d) else null;
 
@@ -231,7 +233,7 @@ pub const Plan = struct {
         const is_lao = containsTag(script_tags, lao_script_tag);
         const is_khmer = containsTag(script_tags, khmr_script_tag);
 
-        var map_builder = try MapBuilder.init(allocator, font, script_tags, language_tags);
+        var map_builder = try MapBuilder.init(allocator, font, script_tags, language_tags, variations_index);
         defer map_builder.deinit();
 
         // Ported from `hb_ot_shaper_categorize`: the old-spec Indic, Myanmar,
@@ -273,6 +275,10 @@ pub const Plan = struct {
                 break;
             }
         }
+        // hb_ot_shape_collect_features: rvrn gets a stage of its own ahead of
+        // every shaper feature, so FeatureVariations can swap glyphs first.
+        try map_builder.enableFeature(.{ 'r', 'v', 'r', 'n' }, .{}, 1);
+        try map_builder.addGsubPause(.none);
         if (is_hangul) try collectFeaturesHangul(&map_builder);
         if (is_arabic) try collectFeaturesArabic(&map_builder);
         if (indic_config != null) try collectFeaturesIndic(&map_builder);
@@ -341,8 +347,9 @@ pub const PlanCache = struct {
         self.plans.clearRetainingCapacity();
     }
 
-    fn key(font: parsing.Font, script_tags: []const Tag, language_tags: []const Tag, extra_features: []const Feature) u64 {
+    fn key(font: parsing.Font, script_tags: []const Tag, language_tags: []const Tag, extra_features: []const Feature, variations_index: [2]?u32) u64 {
         var hasher = std.hash.Wyhash.init(0);
+        hasher.update(std.mem.asBytes(&variations_index));
         hasher.update(std.mem.asBytes(&font.data.ptr));
         hasher.update(std.mem.asBytes(&font.data.len));
         for (script_tags) |tag| hasher.update(&tag);
@@ -366,12 +373,13 @@ pub const PlanCache = struct {
         script_tags: []const Tag,
         language_tags: []const Tag,
         extra_features: []const Feature,
+        variations_index: [2]?u32,
     ) (parsing.Font.ParseError || error{OutOfMemory})!*const Plan {
-        const k = key(font, script_tags, language_tags, extra_features);
+        const k = key(font, script_tags, language_tags, extra_features, variations_index);
         if (self.plans.getPtr(k)) |existing| return existing;
         if (self.plans.count() >= max_plans) self.clear(state_allocator);
 
-        var plan = try Plan.init(state_allocator, font, script_tags, language_tags, extra_features);
+        var plan = try Plan.init(state_allocator, font, script_tags, language_tags, extra_features, variations_index);
         errdefer plan.deinit(state_allocator);
         try self.plans.put(state_allocator, k, plan);
         return self.plans.getPtr(k).?;
@@ -421,10 +429,11 @@ fn shapeImpl(
     // even runs.
     var owned_plan: ?Plan = null;
     defer if (owned_plan) |*p| p.deinit(allocator);
+    const variations_index = map_mod.findFeatureVariations(font, normalized_coords);
     const plan: *const Plan = if (plans) |p|
-        try p.cache.getOrBuild(p.state_allocator, font, script_tags, language_tags, extra_features)
+        try p.cache.getOrBuild(p.state_allocator, font, script_tags, language_tags, extra_features, variations_index)
     else blk: {
-        owned_plan = try Plan.init(allocator, font, script_tags, language_tags, extra_features);
+        owned_plan = try Plan.init(allocator, font, script_tags, language_tags, extra_features, variations_index);
         break :blk &owned_plan.?;
     };
 
