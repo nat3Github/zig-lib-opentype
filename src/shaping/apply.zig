@@ -169,9 +169,9 @@ const Joiners = struct {
         return .{ .zwnj = table_index == 1, .zwj = self.auto_zwj };
     }
 
-    /// hb's `skippy_iter::init(context_match = true)`. Context/ChainContext
-    /// (and ReverseChainSingle) matching always steps over a ZWJ, and over a
-    /// ZWNJ unless the shaper asked to see it.
+    /// hb's `skippy_iter::init(context_match = true)`. Backtrack/lookahead
+    /// matching always steps over a ZWJ, and over a ZWNJ unless the shaper
+    /// asked to see it; a context's input glyphs match with `direct`.
     fn contextual(self: Joiners, table_index: u1) Skip {
         return .{ .zwnj = table_index == 1 or self.auto_zwnj, .zwj = true };
     }
@@ -981,7 +981,7 @@ fn applyContextCore(
         var prev = buffer.idx;
         while (i < offs.input_count) : (i += 1) {
             const slot = SlotMatcher{ .reader = reader, .mode = offs.input_mode, .off = offs.input_base + @as(usize, i) * 2 };
-            const next = try matchForward(buffer.info.items, gdef, lookup_flags, joiners.contextual(table_index), prev + 1, slot) orelse return false;
+            const next = try matchForward(buffer.info.items, gdef, lookup_flags, joiners.direct(table_index), prev + 1, slot) orelse return false;
             positions[i] = next;
             prev = next;
         }
