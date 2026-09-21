@@ -1,12 +1,10 @@
 const std = @import("std");
 
-/// Skia `SkMaskGamma` / Chromium-style coverage contrast: remaps linear
-/// rasterizer coverage so black-on-white AA looks darker once composited.
-/// Uses Skia's `apply_contrast` curve (the mid-coverage boost); size-
-/// independent; strongest below ~24 device ppem.
+/// Remaps linear rasterizer coverage so black-on-white AA looks darker once
+/// composited: a quadratic mid-coverage boost, strongest below ~24 device ppem.
 pub const CoverageContrast = struct {
     enabled: bool = true,
-    /// Artificial contrast in `[0, 1]`. Skia's usual default is ~0.5.
+    /// Artificial contrast in `[0, 1]`.
     contrast: f32 = 0.5,
     /// Device pixels per em; scales the effective contrast (stronger below
     /// ~24 ppem, gentler at Retina/display sizes).
@@ -45,7 +43,6 @@ fn identityLut() [256]u8 {
     return table;
 }
 
-/// Skia `SkMaskGamma.cpp` `apply_contrast`.
 fn applyContrast(raw_alpha: f32, contrast: f32) f32 {
     return raw_alpha + (1.0 - raw_alpha) * contrast * raw_alpha;
 }

@@ -1,3 +1,4 @@
+// Derived from FreeType (FTL); see THIRD_PARTY_LICENSES.
 const std = @import("std");
 const common = @import("common.zig");
 const IPoint = common.IPoint;

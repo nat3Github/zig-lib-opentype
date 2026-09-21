@@ -1,3 +1,4 @@
+// Derived from font-kit (MIT); see THIRD_PARTY_LICENSES.
 const std = @import("std");
 const discovery = @import("../discovery.zig");
 const unicode = @import("../unicode.zig");

@@ -1,3 +1,4 @@
+// Derived from HarfBuzz (Old MIT); see THIRD_PARTY_LICENSES.
 const std = @import("std");
 const parsing = @import("../parsing.zig");
 const common = @import("common.zig");

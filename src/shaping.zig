@@ -1,3 +1,4 @@
+// Derived from HarfBuzz (Old MIT); see THIRD_PARTY_LICENSES.
 const std = @import("std");
 const parsing = @import("parsing.zig");
 
@@ -223,6 +224,7 @@ pub const Plan = struct {
         script_tags: []const Tag,
         language_tags: []const Tag,
         extra_features: []const Feature,
+        direction: Direction,
         variations_index: [2]?u32,
     ) (parsing.Font.ParseError || error{OutOfMemory})!Plan {
         const cmap: ?parsing.Table.cmap.Resolved = if (font.tableData(.{ 'c', 'm', 'a', 'p' })) |d| parsing.Table.cmap.resolve(d) else null;
@@ -279,17 +281,32 @@ pub const Plan = struct {
         // every shaper feature, so FeatureVariations can swap glyphs first.
         try map_builder.enableFeature(.{ 'r', 'v', 'r', 'n' }, .{}, 1);
         try map_builder.addGsubPause(.none);
-        if (is_hangul) try collectFeaturesHangul(&map_builder);
-        if (is_arabic) try collectFeaturesArabic(&map_builder);
-        if (indic_config != null) try collectFeaturesIndic(&map_builder);
-        if (is_khmer) try collectFeaturesKhmer(&map_builder);
-        if (is_myanmar) try collectFeaturesMyanmar(&map_builder);
-        if (is_use) try collectFeaturesUse(&map_builder);
-        for (default_features) |tag| try map_builder.enableFeature(tag, .{ .global = true }, 1);
+        switch (direction) {
+            .left_to_right => {
+                try map_builder.enableFeature(.{ 'l', 't', 'r', 'a' }, .{}, 1);
+                try map_builder.enableFeature(.{ 'l', 't', 'r', 'm' }, .{}, 1);
+            },
+            .right_to_left => {
+                try map_builder.enableFeature(.{ 'r', 't', 'l', 'a' }, .{}, 1);
+                try map_builder.addFeature(tag_rtlm, .{}, 1);
+            },
+            .top_to_bottom, .bottom_to_top => {},
+        }
         // 'rand' is registered at the maximum feature value, which is what
         // tells AlternateSubst to draw an alternate at random; a caller
         // passing rand=N in `extra_features` overrides that to a fixed N.
         try map_builder.enableFeature(.{ 'r', 'a', 'n', 'd' }, .{ .global = true, .random = true }, apply_mod.map_max_feature_value);
+        if (is_hangul) try collectFeaturesHangul(&map_builder);
+        if (is_arabic) try collectFeaturesArabic(&map_builder, containsTag(script_tags, arab_script_tag));
+        if (indic_config != null) try collectFeaturesIndic(&map_builder);
+        if (is_khmer) try collectFeaturesKhmer(&map_builder);
+        if (is_myanmar) try collectFeaturesMyanmar(&map_builder);
+        if (is_use) try collectFeaturesUse(&map_builder);
+        for (default_features) |tag| {
+            // hb's common_features: mark attachment doesn't step over joiners.
+            const manual_joiners = std.mem.eql(u8, &tag, "mark") or std.mem.eql(u8, &tag, "mkmk");
+            try map_builder.enableFeature(tag, .{ .global = true, .manual_zwnj = manual_joiners, .manual_zwj = manual_joiners }, 1);
+        }
         for (extra_features) |feature| try map_builder.enableFeature(feature.tag, .{}, feature.value);
         if (is_hangul) try overrideFeaturesHangul(&map_builder);
         if (is_khmer) try overrideFeaturesKhmer(&map_builder);
@@ -347,8 +364,9 @@ pub const PlanCache = struct {
         self.plans.clearRetainingCapacity();
     }
 
-    fn key(font: parsing.Font, script_tags: []const Tag, language_tags: []const Tag, extra_features: []const Feature, variations_index: [2]?u32) u64 {
+    fn key(font: parsing.Font, script_tags: []const Tag, language_tags: []const Tag, extra_features: []const Feature, direction: Direction, variations_index: [2]?u32) u64 {
         var hasher = std.hash.Wyhash.init(0);
+        hasher.update(std.mem.asBytes(&direction));
         hasher.update(std.mem.asBytes(&variations_index));
         hasher.update(std.mem.asBytes(&font.data.ptr));
         hasher.update(std.mem.asBytes(&font.data.len));
@@ -373,13 +391,14 @@ pub const PlanCache = struct {
         script_tags: []const Tag,
         language_tags: []const Tag,
         extra_features: []const Feature,
+        direction: Direction,
         variations_index: [2]?u32,
     ) (parsing.Font.ParseError || error{OutOfMemory})!*const Plan {
-        const k = key(font, script_tags, language_tags, extra_features, variations_index);
+        const k = key(font, script_tags, language_tags, extra_features, direction, variations_index);
         if (self.plans.getPtr(k)) |existing| return existing;
         if (self.plans.count() >= max_plans) self.clear(state_allocator);
 
-        var plan = try Plan.init(state_allocator, font, script_tags, language_tags, extra_features, variations_index);
+        var plan = try Plan.init(state_allocator, font, script_tags, language_tags, extra_features, direction, variations_index);
         errdefer plan.deinit(state_allocator);
         try self.plans.put(state_allocator, k, plan);
         return self.plans.getPtr(k).?;
@@ -431,9 +450,9 @@ fn shapeImpl(
     defer if (owned_plan) |*p| p.deinit(allocator);
     const variations_index = map_mod.findFeatureVariations(font, normalized_coords);
     const plan: *const Plan = if (plans) |p|
-        try p.cache.getOrBuild(p.state_allocator, font, script_tags, language_tags, extra_features, variations_index)
+        try p.cache.getOrBuild(p.state_allocator, font, script_tags, language_tags, extra_features, direction, variations_index)
     else blk: {
-        owned_plan = try Plan.init(allocator, font, script_tags, language_tags, extra_features, variations_index);
+        owned_plan = try Plan.init(allocator, font, script_tags, language_tags, extra_features, direction, variations_index);
         break :blk &owned_plan.?;
     };
 
@@ -449,26 +468,30 @@ fn shapeImpl(
     const is_use = plan.is_use;
     const is_use_arabic_joining = plan.is_use_arabic_joining;
 
+    // hb initializes masks before any preprocessing, so glyphs inserted or
+    // decomposed later inherit them.
+    buffer.resetMasks(map.global_mask);
+
     // hb runs the shaper's preprocess_text (Hangul syllable decompose/
     // compose, Thai SARA AM reorder/PUA fallback - see those shapers'
     // sections above) before normalize.
     if (is_hangul) try preprocessHangul(font, &buffer, cmap);
     if (is_thai or is_lao) try preprocessTextThai(&buffer, cmap, is_thai, map.found_script[0]);
     if (indic_config != null or is_use) try preprocessVowelConstraints(&buffer, script_tags);
+    if (direction == .right_to_left or direction == .bottom_to_top) mirrorChars(&buffer, cmap, map.get1Mask(tag_rtlm));
 
     // COMPOSED_DIACRITICS_NO_SHORT_CIRCUIT in hb's terms - see normalize()'s
     // doc comment for why these four complex shapers need it.
     const might_short_circuit = !(indic_config != null or is_khmer or is_myanmar or is_use);
     const block_mark_recompose = indic_config != null or is_khmer or is_use;
-    try normalize(&buffer, cmap, might_short_circuit, block_mark_recompose, indic_config != null);
+    try normalize(&buffer, cmap, might_short_circuit, block_mark_recompose, if (indic_config != null) .indic else if (is_khmer) .khmer else .none, is_arabic);
 
-    buffer.resetMasks(map.global_mask);
     if (is_hangul) setupMasksHangul(&buffer, map);
     if (is_arabic) setupMasksArabic(&buffer, map);
     if (indic_config != null) try setupMasksIndic(&buffer, cmap);
     if (is_khmer) try setupMasksKhmer(&buffer, map, cmap);
-    if (is_myanmar) try setupMasksMyanmar(&buffer, cmap);
-    if (is_use) try setupMasksUse(&buffer, map, cmap, is_use_arabic_joining);
+    if (is_myanmar) setupMasksMyanmar(&buffer);
+    if (is_use) try setupMasksUse(&buffer, map, is_use_arabic_joining);
 
     setJoinerFlags(&buffer);
     mapGlyphsFast(&buffer);
@@ -481,7 +504,6 @@ fn shapeImpl(
     } else .{};
 
     try applyGsub(font, map, gdef_classdef, &buffer, direction, indic_config, cmap);
-    hideDefaultIgnorables(&buffer, cmap);
     try buffer.clearPositions();
     applyDefaultHorizontalAdvances(font, &buffer, cmap, normalized_coords);
     // hb-ot-shape.cc's `zero_width_marks` shaper property: the Indic,
@@ -505,9 +527,28 @@ fn shapeImpl(
     // logical order and flipped to visual order as the final position step.
     if (direction == .right_to_left or direction == .bottom_to_top) buffer.reverse();
 
+    // hb_ot_substitute_post: runs on the positioned, visual-order buffer.
+    hideDefaultIgnorables(&buffer, cmap);
+    if (is_arabic) if (apply_mod.HorizontalMetrics.init(font, normalized_coords)) |metrics| {
+        try arabic_mod.applyStch(&buffer, direction == .right_to_left, metrics);
+    };
+
     if (item) |it| retainItemGlyphs(&buffer, it);
 
     return buffer;
+}
+
+const tag_rtlm = Tag{ 'r', 't', 'l', 'm' };
+
+/// Ported from `hb_ot_rotate_chars`: in backward runs a character with a
+/// Bidi_Mirroring_Glyph the font covers is swapped for it; anything else is
+/// left to the font's 'rtlm' feature.
+fn mirrorChars(buffer: *Buffer, cmap: ?parsing.Table.cmap.Resolved, rtlm_mask: u32) void {
+    for (buffer.info.items) |*info| {
+        const mirrored = unicode.bidiMirror(@intCast(info.codepoint));
+        const covered = if (cmap) |resolved| resolved.lookup(mirrored) != null else false;
+        if (mirrored != info.codepoint and covered) info.codepoint = mirrored else info.mask |= rtlm_mask;
+    }
 }
 
 /// Runs GSUB stage by stage, handing control back to the complex shaper at
@@ -530,6 +571,14 @@ fn applyGsub(
             .none => {},
             .indic_initial_reorder => initialReorderingIndic(font, buffer, map, indic_config.?.*, cmap),
             .indic_final_reorder => finalReorderingIndic(font, buffer, map, indic_config.?.*, cmap),
+            .clear_substitution_flags => for (buffer.info.items) |*info| {
+                info.is_substituted = false;
+            },
+            .use_record_rphf => use_mod.recordRphfUse(buffer, map),
+            .use_record_pref => use_mod.recordPrefUse(buffer),
+            .use_reorder => try use_mod.reorderUse(buffer, cmap),
+            .myanmar_reorder => try khmer_myanmar_mod.reorderMyanmar(buffer, cmap),
+            .arabic_record_stch => arabic_mod.recordStch(buffer, map),
         }
     }
 }

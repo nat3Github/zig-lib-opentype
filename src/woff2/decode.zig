@@ -1,3 +1,4 @@
+// Derived from brotli-decompressor (BSD-3-Clause); see THIRD_PARTY_LICENSES.
 const std = @import("std");
 const bit_reader_mod = @import("bit_reader.zig");
 const huffman_mod = @import("huffman.zig");

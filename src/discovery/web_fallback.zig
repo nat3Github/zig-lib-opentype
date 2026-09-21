@@ -1,3 +1,4 @@
+// Derived from Flutter (BSD-3-Clause); see THIRD_PARTY_LICENSES.
 //! On-demand Noto font fallback for hosts with no system fonts to ask (web).
 //! Ported from Flutter web (engine/src/flutter/lib/web_ui/lib/src/engine/:
 //! font_fallbacks.dart, font_fallback_service.dart, noto_font.dart,

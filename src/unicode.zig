@@ -1,3 +1,4 @@
+// Derived from HarfBuzz (Old MIT), unicode-linebreak (Apache-2.0) and ICU4X (Unicode-3.0); see THIRD_PARTY_LICENSES.
 const std = @import("std");
 const tables = @import("unicode/tables.zig");
 
@@ -2110,6 +2111,32 @@ pub fn modifiedCombiningClass(codepoint: u21) u8 {
 /// General_Category is Mn, Mc, or Me.
 pub fn isUnicodeMark(codepoint: u21) bool {
     return packedContains(&tables.unicode_mark_ranges, codepoint);
+}
+
+/// Bidi_Mirroring_Glyph, or `codepoint` itself when it has none.
+pub fn bidiMirror(codepoint: u21) u21 {
+    const table = &tables.bidi_mirroring;
+    var lo: usize = 0;
+    var hi: usize = table.len;
+    while (lo < hi) {
+        const mid = (lo + hi) / 2;
+        const entry_codepoint = table[mid] >> 13;
+        if (entry_codepoint < codepoint) {
+            lo = mid + 1;
+        } else if (entry_codepoint > codepoint) {
+            hi = mid;
+        } else {
+            const delta = @as(i32, @intCast(table[mid] & 0x1FFF)) - 4096;
+            return @intCast(@as(i32, codepoint) + delta);
+        }
+    }
+    return codepoint;
+}
+
+/// hb's `HB_ARABIC_GENERAL_CATEGORY_IS_WORD`: letters other than cased
+/// ones, marks, numbers, symbols, and unassigned/private-use codepoints.
+pub fn isArabicWordCategory(codepoint: u21) bool {
+    return packedContains(&tables.arabic_word_ranges, codepoint);
 }
 
 /// Ported from hb-unicode.hh's `is_default_ignorable` - a hardcoded

@@ -1,3 +1,4 @@
+// Derived from HarfBuzz (Old MIT), FreeType (FTL) and swash (MIT); see THIRD_PARTY_LICENSES.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const build_options = @import("build_options");

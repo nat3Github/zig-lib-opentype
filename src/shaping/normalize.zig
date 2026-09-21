@@ -1,3 +1,5 @@
+// Derived from HarfBuzz (Old MIT); see THIRD_PARTY_LICENSES.
+const std = @import("std");
 const parsing = @import("../parsing.zig");
 const unicode = @import("../unicode.zig");
 const common = @import("common.zig");
@@ -6,12 +8,12 @@ const Cmap = common.Cmap;
 const GlyphInfo = common.GlyphInfo;
 const combiningClassOf = common.combiningClassOf;
 
+pub const DecomposeOverride = enum { none, indic, khmer };
+
 const NormalizeContext = struct {
     cmap: ?Cmap,
-    /// hb's per-shaper `decompose` override; only the Indic shaper has one
-    /// (`decompose_indic`), and all it does is refuse four canonical
-    /// decompositions - see `blocksDecomposition`.
-    is_indic: bool = false,
+    /// hb's per-shaper `decompose` override (`decompose_indic`/`decompose_khmer`).
+    decompose_override: DecomposeOverride = .none,
 
     /// Ported from `decompose_indic`'s explicit "don't decompose these"
     /// cases: these four are letters in their own right, and splitting them
@@ -19,11 +21,27 @@ const NormalizeContext = struct {
     /// nukta/matra (a Tamil AU would shape as a broken cluster and take a
     /// dotted circle).
     fn blocksDecomposition(self: NormalizeContext, ab: u21) bool {
-        if (!self.is_indic) return false;
+        if (self.decompose_override != .indic) return false;
         return switch (ab) {
             0x0931, 0x09DC, 0x09DD, 0x0B94 => true,
             else => false,
         };
+    }
+
+    /// Ported from `decompose_khmer`: split matras with no Unicode
+    /// decomposition still carry the pre-base 0x17C1 part.
+    fn decompose(self: NormalizeContext, ab: u21) ?unicode.Decomposition {
+        if (self.decompose_override == .khmer) switch (ab) {
+            0x17BE, 0x17BF, 0x17C0, 0x17C4, 0x17C5 => return .{ .first = 0x17C1, .second = ab },
+            else => {},
+        };
+        return unicode.decomposeCanonical(ab);
+    }
+
+    /// `compose_indic` recomposes this composition exclusion anyway.
+    fn compose(self: NormalizeContext, a: u21, b: u21) ?u21 {
+        if (self.decompose_override == .indic and a == 0x09AF and b == 0x09BC) return 0x09DF;
+        return unicode.composeCanonical(a, b);
     }
 
     fn nominalGlyph(self: NormalizeContext, codepoint: u21) ?u32 {
@@ -60,7 +78,7 @@ fn nextChar(buffer: *Buffer, glyph: u32) !void {
 /// attacker/font-controlled, and UAX #15 guarantees it's finite and short.
 fn decomposeChar(ctx: NormalizeContext, buffer: *Buffer, shortest: bool, ab: u21) (error{OutOfMemory})!usize {
     if (ctx.blocksDecomposition(ab)) return 0;
-    const dec = unicode.decomposeCanonical(ab) orelse return 0;
+    const dec = ctx.decompose(ab) orelse return 0;
     const a = dec.first;
     const b = dec.second;
     if (b != 0 and ctx.nominalGlyph(b) == null) return 0;
@@ -156,7 +174,7 @@ const max_reorder_combining_marks = 32; // HB_OT_SHAPE_MAX_COMBINING_MARKS
 /// maximal run of nonzero-combining-class glyphs into combining-class
 /// order (UAX #15's canonical ordering), skipping runs long enough that the
 /// O(n^2) insertion sort would be a real cost (matches hb's own bailout).
-fn normalizeReorderRound(buffer: *Buffer) void {
+fn normalizeReorderRound(buffer: *Buffer, reorder_marks_arabic: bool) void {
     const infos = buffer.info.items;
     var i: usize = 0;
     while (i < infos.len) {
@@ -171,7 +189,37 @@ fn normalizeReorderRound(buffer: *Buffer) void {
             continue;
         }
         buffer.sortByCombiningClass(i, end);
+        if (reorder_marks_arabic) reorderMarksArabic(buffer, i, end);
         i = end;
+    }
+}
+
+fn isModifierCombiningMark(codepoint: u32) bool {
+    return switch (codepoint) {
+        0x0654, 0x0655, 0x0658, 0x06DC, 0x06E3, 0x06E7, 0x06E8, 0x08CA, 0x08CB, 0x08CD, 0x08CE, 0x08CF, 0x08D3, 0x08F3 => true,
+        else => false,
+    };
+}
+
+/// Ported from `reorder_marks_arabic` (UAX #53): within a sorted mark run,
+/// modifier combining marks of class 220/230 move ahead of the other marks.
+fn reorderMarksArabic(buffer: *Buffer, run_start: usize, end: usize) void {
+    const info = buffer.info.items;
+    var start = run_start;
+    var i = start;
+    for ([_]u8{ 220, 230 }) |class| {
+        while (i < end and combiningClassOf(info[i]) < class) i += 1;
+        if (i == end) break;
+        if (combiningClassOf(info[i]) > class) continue;
+        var j = i;
+        while (j < end and combiningClassOf(info[j]) == class and isModifierCombiningMark(info[j].codepoint)) j += 1;
+        if (i == j) continue;
+
+        buffer.mergeClusters(start, j);
+        std.mem.rotate(GlyphInfo, info[start..j], i - start);
+        const new_start = start + j - i;
+        while (start < new_start) : (start += 1) info[start].arabic_mcm_moved = true;
+        i = j;
     }
 }
 
@@ -195,7 +243,7 @@ fn normalizeRecomposeRound(ctx: NormalizeContext, buffer: *Buffer, block_mark_re
             if (!(starter == out_len - 1 or prev_cc < cur_cc)) break :compose_check;
             const starter_codepoint: u21 = @intCast(buffer.out_info.items[starter].codepoint);
             if (block_mark_recompose and unicode.isUnicodeMark(starter_codepoint)) break :compose_check;
-            const composed = unicode.composeCanonical(starter_codepoint, cur_codepoint) orelse break :compose_check;
+            const composed = ctx.compose(starter_codepoint, cur_codepoint) orelse break :compose_check;
             const glyph = ctx.nominalGlyph(composed) orelse break :compose_check;
 
             try buffer.nextGlyph(); // Copy cur to out-buffer.
@@ -246,12 +294,10 @@ fn normalizeRecomposeRound(ctx: NormalizeContext, buffer: *Buffer, block_mark_re
 /// generic recompose round above silently undoes `decomposeCurrentChar`'s
 /// split the moment it runs, which is a real bug this port had until the
 /// dotted-circle work surfaced it (a still-composed split matra can never
-/// classify as a broken syllable). The one indic-specific hardcoded
-/// exception (`0x09AF+0x09BC -> 0x09DF`) hb recomposes anyway isn't ported -
-/// narrow enough to defer.
-pub fn normalize(buffer: *Buffer, cmap: ?Cmap, might_short_circuit: bool, block_mark_recompose: bool, is_indic: bool) !void {
+/// classify as a broken syllable).
+pub fn normalize(buffer: *Buffer, cmap: ?Cmap, might_short_circuit: bool, block_mark_recompose: bool, decompose_override: DecomposeOverride, reorder_marks_arabic: bool) !void {
     if (buffer.info.items.len == 0) return;
-    const ctx = NormalizeContext{ .cmap = cmap, .is_indic = is_indic };
+    const ctx = NormalizeContext{ .cmap = cmap, .decompose_override = decompose_override };
 
     var all_simple = true;
     buffer.clearOutput();
@@ -287,7 +333,7 @@ pub fn normalize(buffer: *Buffer, cmap: ?Cmap, might_short_circuit: bool, block_
 
     if (all_simple) return;
 
-    normalizeReorderRound(buffer);
+    normalizeReorderRound(buffer, reorder_marks_arabic);
     try normalizeRecomposeRound(ctx, buffer, block_mark_recompose);
 }
 
@@ -345,15 +391,27 @@ fn isGraphemeContinuation(infos: []const GlyphInfo, i: usize, prev_continuation:
     return (cp >= 0xFF9E and cp <= 0xFF9F) or (cp >= 0xE0020 and cp <= 0xE007F);
 }
 
-/// Ported from hb_set_unicode_props's ZWJ/ZWNJ half. Must run after `normalize` (which may
+/// Ported from hb_set_unicode_props's ignorable half. Must run after `normalize` (which may
 /// insert/reorder/delete glyphs) and before `mapGlyphsFast` overwrites
 /// `codepoint` with a glyph id.
 pub fn setJoinerFlags(buffer: *Buffer) void {
-    for (buffer.info.items) |*info| {
-        info.is_zwj = info.codepoint == 0x200D;
-        info.is_zwnj = info.codepoint == 0x200C;
-        info.is_default_ignorable = unicode.isDefaultIgnorable(@intCast(info.codepoint));
+    const infos = buffer.info.items;
+    for (infos, 0..) |*info, i| {
+        const cp = info.codepoint;
+        info.is_zwj = cp == 0x200D;
+        info.is_zwnj = cp == 0x200C;
+        info.is_default_ignorable = unicode.isDefaultIgnorable(@intCast(cp));
+        info.is_hidden = (cp >= 0x180B and cp <= 0x180D) or cp == 0x180F or (cp >= 0xE0020 and cp <= 0xE007F) or
+            (cp == 0x034F and !cgjUnblocksNothing(infos, i));
     }
+}
+
+/// hb's post-reorder CGJ check: a CGJ that kept no marks from reordering
+/// across it stays skippable.
+fn cgjUnblocksNothing(infos: []const GlyphInfo, i: usize) bool {
+    if (i == 0 or i + 1 >= infos.len) return false;
+    const next_class = combiningClassOf(infos[i + 1]);
+    return next_class == 0 or combiningClassOf(infos[i - 1]) <= next_class;
 }
 
 /// Ported from hb_ot_map_glyphs_fast: normalize() stashed each glyph's

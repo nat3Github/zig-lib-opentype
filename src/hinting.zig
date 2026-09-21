@@ -1,3 +1,4 @@
+// Derived from FreeType (FTL); see THIRD_PARTY_LICENSES.
 //! TrueType bytecode interpreter, ported from FreeType's `ttinterp.c`
 //! (v35/base interpreter; no ClearType/subpixel-hinting-minimal hacks).
 //!

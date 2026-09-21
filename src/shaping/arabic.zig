@@ -1,3 +1,4 @@
+// Derived from HarfBuzz (Old MIT); see THIRD_PARTY_LICENSES.
 const std = @import("std");
 const unicode = @import("../unicode.zig");
 const common = @import("common.zig");
@@ -8,7 +9,11 @@ const ArabicAction = common.ArabicAction;
 const Tag = common.Tag;
 const MapBuilder = map_mod.MapBuilder;
 const Map = map_mod.Map;
+const MapFeatureFlags = map_mod.MapFeatureFlags;
 const tag_calt = hangul_mod.tag_calt;
+const apply_mod = @import("apply.zig");
+const GlyphInfo = common.GlyphInfo;
+const tag_stch = Tag{ 's', 't', 'c', 'h' };
 
 // Ported from vendor/harfbuzz/src/hb-ot-shaper-arabic.cc (pinned 703e2d1441):
 // the Arabic complex shaper, scoped this session to its core - the
@@ -23,10 +28,6 @@ const tag_calt = hangul_mod.tag_calt;
 //   isol/fina/medi/init glyph substitution for fonts lacking Arabic OT
 //   features. Only matters for such fonts; real Arabic text fonts ship the
 //   GSUB features this port already applies.
-// - record_stch/apply_stch ("stch" stretch/Syriac abbreviation
-//   justification) - a separate, self-contained positioning feature.
-// - reorder_marks_arabic (UAX #53 modifier-combining-mark reordering by
-//   combining class) - affects diacritic visual order/position.
 // - mongolian_variation_selectors (copy shaping action from base to a
 //   following Mongolian variation selector) - Mongolian dispatch isn't
 //   wired in at all this session (see dispatch note below).
@@ -111,29 +112,32 @@ const arabic_feature_tags = [7]Tag{
     .{ 'i', 'n', 'i', 't' },
 };
 
-/// Ported from `collect_features_arabic`, minus the "stch" enable/pause
-/// (deferred, see this section's top doc comment) and the pause callbacks
-/// themselves (this port has no pause/stage machinery - see MapBuilder's
-/// module doc comment; harmless to drop since nothing here needs a
-/// mid-stream callback, only the final mask values matter).
-///
-/// Must run before `shape()`'s `default_features` loop: `ccmp`/`locl`/
-/// `rlig`/`calt` are also enabled there without `manual_zwj`, and
-/// `MapBuilder.compile`'s duplicate-tag merge keeps the *first* inserted
-/// entry's flags (only `.global`/`.has_fallback` get overwritten by a
-/// later duplicate - see `compile`'s dedup pass) - so registering these
-/// with `manual_zwj = true` here first is what makes the merged feature
-/// end up manual_zwj, same asymmetric-merge mechanism the Hangul shaper's
-/// `overrideFeaturesHangul` doc comment explains for `.global` instead.
-pub fn collectFeaturesArabic(map_builder: *MapBuilder) !void {
-    try map_builder.enableFeature(tag_ccmp, .{ .manual_zwj = true }, 1);
-    try map_builder.enableFeature(tag_locl, .{ .manual_zwj = true }, 1);
-    for (arabic_feature_tags) |tag| try map_builder.addFeature(tag, .{ .manual_zwj = true }, 1);
-    try map_builder.enableFeature(tag_rlig, .{ .manual_zwj = true }, 1);
-    try map_builder.enableFeature(tag_calt, .{ .manual_zwj = true }, 1);
-    try map_builder.enableFeature(tag_liga, .{ .manual_zwj = true }, 1);
-    try map_builder.enableFeature(tag_clig, .{ .manual_zwj = true }, 1);
-    try map_builder.enableFeature(tag_mset, .{ .manual_zwj = true }, 1);
+/// Ported from `collect_features_arabic`, minus the fallback-shaping pause
+/// (not ported, see this section's top doc comment). Each positional feature gets its own stage, and `ccmp`/`locl`
+/// run before all of them. `manual_zwj` sticks because `MapBuilder.compile`
+/// keeps the first registration's flags when `default_features` repeats a
+/// tag.
+pub fn collectFeaturesArabic(map_builder: *MapBuilder, is_arabic_script: bool) !void {
+    const manual_zwj = MapFeatureFlags{ .manual_zwj = true };
+    try map_builder.enableFeature(tag_stch, .{}, 1);
+    try map_builder.addGsubPause(.arabic_record_stch);
+    try map_builder.enableFeature(tag_ccmp, manual_zwj, 1);
+    try map_builder.enableFeature(tag_locl, manual_zwj, 1);
+    try map_builder.addGsubPause(.none);
+    for (arabic_feature_tags) |tag| {
+        try map_builder.addFeature(tag, manual_zwj, 1);
+        try map_builder.addGsubPause(.none);
+    }
+    try map_builder.addGsubPause(.none);
+    try map_builder.enableFeature(tag_rlig, manual_zwj, 1);
+    if (is_arabic_script) try map_builder.addGsubPause(.none);
+    try map_builder.enableFeature(tag_calt, manual_zwj, 1);
+    // hb pauses here unless 'rclt' was already registered, which it never
+    // is this early.
+    try map_builder.addGsubPause(.none);
+    try map_builder.enableFeature(tag_liga, manual_zwj, 1);
+    try map_builder.enableFeature(tag_clig, manual_zwj, 1);
+    try map_builder.enableFeature(tag_mset, manual_zwj, 1);
 }
 
 /// Ported from `setup_masks_arabic_plan`: runs `arabicJoining` then masks
@@ -145,5 +149,139 @@ pub fn setupMasksArabic(buffer: *Buffer, map: Map) void {
     for (buffer.info.items) |*info| {
         const action = info.arabic_shaping_action;
         if (action < arabic_feature_tags.len) info.mask |= map.get1Mask(arabic_feature_tags[action]);
+        info.is_arabic_word = unicode.isArabicWordCategory(@intCast(info.codepoint));
+    }
+}
+
+/// Ported from `record_stch`: the pause right after 'stch'. Whatever it
+/// multiplied alternates fixed and repeating tiles.
+pub fn recordStch(buffer: *Buffer, map: Map) void {
+    if (map.get1Mask(tag_stch) == 0) return;
+    for (buffer.info.items) |*info| {
+        if (!info.is_multiplied) continue;
+        const action: ArabicAction = if (info.lig_comp % 2 == 1) .stch_repeating else .stch_fixed;
+        info.arabic_shaping_action = @intFromEnum(action);
+    }
+}
+
+fn isStch(info: GlyphInfo) bool {
+    return info.arabic_shaping_action == @intFromEnum(ArabicAction.stch_fixed) or
+        info.arabic_shaping_action == @intFromEnum(ArabicAction.stch_repeating);
+}
+
+/// hb's per-stretch glyph cap (`STCH_MAX_GLYPHS`).
+const stch_max_glyphs = 256;
+
+/// Ported from `apply_stch`: repeats each stretch's repeating tiles until the
+/// stretch spans the rest of its word. Runs on the positioned, visual-order
+/// buffer. Two passes, as in hb: measure how many copies to add, then grow
+/// the buffer and copy glyphs toward its end.
+pub fn applyStch(buffer: *Buffer, rtl: bool, metrics: apply_mod.HorizontalMetrics) !void {
+    for (buffer.info.items) |info| {
+        if (isStch(info)) break;
+    } else return;
+
+    if (!rtl) buffer.reverse();
+    defer if (!rtl) buffer.reverse();
+
+    var extra_glyphs: usize = 0;
+    for ([_]bool{ false, true }) |cut| {
+        const count = buffer.info.items.len;
+        if (cut) {
+            try buffer.info.resize(buffer.allocator, count + extra_glyphs);
+            try buffer.pos.resize(buffer.allocator, count + extra_glyphs);
+        }
+        const info = buffer.info.items;
+        const pos = buffer.pos.items;
+        var j = count + extra_glyphs;
+        var i = count;
+        while (i > 0) {
+            if (!isStch(info[i - 1])) {
+                if (cut) {
+                    j -= 1;
+                    info[j] = info[i - 1];
+                    pos[j] = pos[i - 1];
+                }
+                i -= 1;
+                continue;
+            }
+
+            var w_fixed: i64 = 0;
+            var w_repeating: i64 = 0;
+            var n_fixed: usize = 0;
+            var n_repeating: usize = 0;
+            const end = i;
+            while (i > 0 and isStch(info[i - 1])) {
+                i -= 1;
+                const width = metrics.advance(info[i].codepoint);
+                if (info[i].arabic_shaping_action == @intFromEnum(ArabicAction.stch_fixed)) {
+                    w_fixed += width;
+                    n_fixed += 1;
+                } else {
+                    w_repeating += width;
+                    n_repeating += 1;
+                }
+            }
+            const start = i;
+            var w_total: i64 = 0;
+            var context = i;
+            while (context > 0 and !isStch(info[context - 1]) and
+                (common.isIgnorable(info[context - 1]) or info[context - 1].is_arabic_word))
+            {
+                context -= 1;
+                w_total += pos[context].x_advance;
+            }
+
+            var n_copies: i64 = 0;
+            const w_remaining_total = w_total - w_fixed;
+            var w_remaining = w_remaining_total;
+            if (w_remaining_total > w_repeating and w_repeating > 0) n_copies = @divTrunc(w_remaining_total, w_repeating) - 1;
+
+            // One more repeat squeezed together can fit better than a gap.
+            var extra_repeat_overlap: i64 = 0;
+            const shortfall = w_remaining_total - w_repeating * (n_copies + 1);
+            if (shortfall > 0 and n_repeating > 0) {
+                n_copies += 1;
+                const excess = (n_copies + 1) * w_repeating - w_remaining_total;
+                if (excess > 0) {
+                    extra_repeat_overlap = @divTrunc(excess, n_copies * @as(i64, @intCast(n_repeating)));
+                    w_remaining = 0;
+                }
+            }
+
+            var max_copies: i64 = 0;
+            if (n_repeating > 0 and n_fixed + n_repeating < stch_max_glyphs) {
+                max_copies = @intCast((stch_max_glyphs - n_fixed - n_repeating) / n_repeating);
+            }
+            n_copies = @min(n_copies, max_copies);
+
+            if (!cut) {
+                extra_glyphs += @as(usize, @intCast(n_copies)) * n_repeating;
+                continue;
+            }
+
+            buffer.unsafeToBreak(context, end);
+            var x_offset = @divTrunc(w_remaining, 2);
+            var k = end;
+            while (k > start) : (k -= 1) {
+                const width = metrics.advance(info[k - 1].codepoint);
+                const repeat: usize = if (info[k - 1].arabic_shaping_action == @intFromEnum(ArabicAction.stch_repeating)) 1 + @as(usize, @intCast(n_copies)) else 1;
+                pos[k - 1].x_advance = 0;
+                for (0..repeat) |n| {
+                    if (rtl) {
+                        x_offset -= width;
+                        if (n > 0) x_offset += extra_repeat_overlap;
+                    }
+                    pos[k - 1].x_offset = @intCast(std.math.clamp(x_offset, std.math.minInt(i32), std.math.maxInt(i32)));
+                    j -= 1;
+                    info[j] = info[k - 1];
+                    pos[j] = pos[k - 1];
+                    if (!rtl) {
+                        x_offset += width;
+                        if (n > 0) x_offset -= extra_repeat_overlap;
+                    }
+                }
+            }
+        }
     }
 }

@@ -1,3 +1,4 @@
+// Derived from HarfBuzz (Old MIT); see THIRD_PARTY_LICENSES.
 const common = @import("common.zig");
 const map_mod = @import("map.zig");
 const indic_mod = @import("indic.zig");
@@ -18,6 +19,8 @@ const ic_ra = indic_mod.ic_ra;
 const ic_cs = indic_mod.ic_cs;
 const ic_sm = indic_mod.ic_sm;
 const ic_smpst = indic_mod.ic_smpst;
+const ic_zwj = indic_mod.ic_zwj;
+const ic_zwnj = indic_mod.ic_zwnj;
 const ic_placeholder = indic_mod.ic_placeholder;
 const ic_dottedcircle = indic_mod.ic_dottedcircle;
 const indic_values = indic_mod.indic_values;
@@ -235,11 +238,14 @@ fn findSyllablesKhmer(buffer: *Buffer) void {
 pub fn collectFeaturesKhmer(map_builder: *MapBuilder) !void {
     const manual_joiners_syllable = MapFeatureFlags{ .manual_zwnj = true, .manual_zwj = true, .per_syllable = true };
     const manual_joiners = MapFeatureFlags{ .manual_zwnj = true, .manual_zwj = true };
+    try map_builder.enableFeature(.{ 'l', 'o', 'c', 'l' }, .{ .per_syllable = true }, 1);
+    try map_builder.enableFeature(.{ 'c', 'c', 'm', 'p' }, .{ .per_syllable = true }, 1);
     try map_builder.addFeature(tag_pref, manual_joiners_syllable, 1);
     try map_builder.addFeature(tag_blwf, manual_joiners_syllable, 1);
     try map_builder.addFeature(tag_abvf, manual_joiners_syllable, 1);
     try map_builder.addFeature(tag_pstf, manual_joiners_syllable, 1);
     try map_builder.addFeature(tag_cfar, manual_joiners_syllable, 1);
+    try map_builder.addGsubPause(.none);
     try map_builder.enableFeature(tag_pres, manual_joiners, 1);
     try map_builder.enableFeature(tag_abvs, manual_joiners, 1);
     try map_builder.enableFeature(tag_blws, manual_joiners, 1);
@@ -312,7 +318,7 @@ fn reorderKhmerSyllable(buffer: *Buffer, map: Map, start: usize, end: usize) voi
 pub fn setupMasksKhmer(buffer: *Buffer, map: Map, cmap: ?Cmap) !void {
     for (buffer.info.items) |*info| info.indic_category = @intCast(indicGetCategories(info.codepoint) & 0xFF);
     findSyllablesKhmer(buffer);
-    _ = try common.insertDottedCircles(buffer, cmap, khmer_syllable_broken, ic_dottedcircle, null, null);
+    _ = try common.insertDottedCircles(buffer, cmap, khmer_syllable_broken, ic_dottedcircle, null, null, false);
 
     var start: usize = 0;
     while (start < buffer.info.items.len) {
@@ -467,10 +473,7 @@ const myanmar_syllable_consonant: u8 = 0;
 const myanmar_syllable_broken: u8 = 1;
 const myanmar_syllable_non_myanmar: u8 = 2;
 
-/// Ported from `find_syllables_myanmar`. The grammar's separate `j | SMPst`
-/// top-level alternative is not ported as its own case since it always
-/// produces the exact same result (1-glyph `non_myanmar_cluster`) as the
-/// `other` fallback below.
+/// Ported from `find_syllables_myanmar`.
 fn findSyllablesMyanmar(buffer: *Buffer) void {
     const info = buffer.info.items;
     const count = info.len;
@@ -489,6 +492,10 @@ fn findSyllablesMyanmar(buffer: *Buffer) void {
                 best_type = myanmar_syllable_consonant;
             }
         }
+        // `j | SMPst` is listed before broken_cluster, so it wins the
+        // 1-glyph tie a lone joiner or SMPst would otherwise lose.
+        const cat = info[p].indic_category;
+        if (best_len == 0 and (cat == ic_zwj or cat == ic_zwnj or cat == ic_smpst)) best_len = 1;
         {
             const l = matchMyanmarBrokenCluster(info, p, count) - p;
             if (l > best_len) {
@@ -516,10 +523,14 @@ fn findSyllablesMyanmar(buffer: *Buffer) void {
 pub fn collectFeaturesMyanmar(map_builder: *MapBuilder) !void {
     const manual_zwj_syllable = MapFeatureFlags{ .manual_zwj = true, .per_syllable = true };
     const manual_zwj = MapFeatureFlags{ .manual_zwj = true };
-    try map_builder.enableFeature(tag_rphf, manual_zwj_syllable, 1);
-    try map_builder.enableFeature(tag_pref, manual_zwj_syllable, 1);
-    try map_builder.enableFeature(tag_blwf, manual_zwj_syllable, 1);
-    try map_builder.enableFeature(tag_pstf, manual_zwj_syllable, 1);
+    try map_builder.enableFeature(.{ 'l', 'o', 'c', 'l' }, .{ .per_syllable = true }, 1);
+    try map_builder.enableFeature(.{ 'c', 'c', 'm', 'p' }, .{ .per_syllable = true }, 1);
+    try map_builder.addGsubPause(.myanmar_reorder);
+    for ([_]Tag{ tag_rphf, tag_pref, tag_blwf, tag_pstf }) |tag| {
+        try map_builder.enableFeature(tag, manual_zwj_syllable, 1);
+        try map_builder.addGsubPause(.none);
+    }
+    try map_builder.addGsubPause(.none);
     try map_builder.enableFeature(tag_pres, manual_zwj, 1);
     try map_builder.enableFeature(tag_abvs, manual_zwj, 1);
     try map_builder.enableFeature(tag_blws, manual_zwj, 1);
@@ -625,22 +636,33 @@ fn reorderMyanmarSyllable(buffer: *Buffer, start: usize, end: usize) void {
 /// pre-GSUB pass same as Khmer/Indic above. No `Map` parameter needed -
 /// unlike Khmer/Indic, hb's real Myanmar shaper does no per-glyph feature
 /// masking here (see `collectFeaturesMyanmar`'s doc comment).
-pub fn setupMasksMyanmar(buffer: *Buffer, cmap: ?Cmap) !void {
+pub fn setupMasksMyanmar(buffer: *Buffer) void {
     for (buffer.info.items) |*info| info.indic_category = @intCast(indicGetCategories(info.codepoint) & 0xFF);
     findSyllablesMyanmar(buffer);
-    _ = try common.insertDottedCircles(buffer, cmap, myanmar_syllable_broken, ic_dottedcircle, null, null);
-
     var start: usize = 0;
     while (start < buffer.info.items.len) {
-        const syl = buffer.info.items[start].indic_syllable;
-        var end = start + 1;
-        while (end < buffer.info.items.len and buffer.info.items[end].indic_syllable == syl) end += 1;
+        const end = syllableEnd(buffer.info.items, start);
         buffer.unsafeToBreak(start, end);
+        start = end;
+    }
+}
 
-        const stype = syl & 0x0F;
+/// Ported from `reorder_myanmar`: the GSUB pause after `locl`/`ccmp`.
+pub fn reorderMyanmar(buffer: *Buffer, cmap: ?Cmap) !void {
+    _ = try common.insertDottedCircles(buffer, cmap, myanmar_syllable_broken, ic_dottedcircle, null, null, true);
+    var start: usize = 0;
+    while (start < buffer.info.items.len) {
+        const end = syllableEnd(buffer.info.items, start);
+        const stype = buffer.info.items[start].indic_syllable & 0x0F;
         if (stype == myanmar_syllable_consonant or stype == myanmar_syllable_broken) {
             reorderMyanmarSyllable(buffer, start, end);
         }
         start = end;
     }
+}
+
+fn syllableEnd(info: []const GlyphInfo, start: usize) usize {
+    var end = start + 1;
+    while (end < info.len and info[end].indic_syllable == info[start].indic_syllable) end += 1;
+    return end;
 }

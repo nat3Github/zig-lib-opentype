@@ -1,3 +1,4 @@
+// Derived from FreeType (FTL); see THIRD_PARTY_LICENSES.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const decode_mod = @import("decode.zig");

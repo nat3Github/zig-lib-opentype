@@ -1,3 +1,4 @@
+// Derived from font-kit (MIT); see THIRD_PARTY_LICENSES.
 const std = @import("std");
 const build_options = @import("build_options");
 const parsing = @import("parsing.zig");

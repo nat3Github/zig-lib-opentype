@@ -1,3 +1,4 @@
+// Derived from brotli-decompressor (BSD-3-Clause) and FreeType (FTL); see THIRD_PARTY_LICENSES.
 // Ported from vendor/brotli-decompressor (Brotli decoder) and
 // vendor/freetype/src/sfnt/sfwoff2.c (WOFF2 table reconstruction). See
 // CLAUDE.md's "port, don't derive" rule and project_woff2_brotli_port_status

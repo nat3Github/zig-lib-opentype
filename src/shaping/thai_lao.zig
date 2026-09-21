@@ -1,3 +1,4 @@
+// Derived from HarfBuzz (Old MIT); see THIRD_PARTY_LICENSES.
 const parsing = @import("../parsing.zig");
 const common = @import("common.zig");
 const Buffer = common.Buffer;

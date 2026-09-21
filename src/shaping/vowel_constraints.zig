@@ -1,3 +1,4 @@
+// Derived from HarfBuzz (Old MIT); see THIRD_PARTY_LICENSES.
 //! Port of hb-ot-shaper-vowel-constraints.cc (generated from
 //! IndicShapingInvalidCluster.txt): inserts U+25CC between an independent
 //! vowel and a following sign that would make it look like a different

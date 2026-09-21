@@ -1,3 +1,4 @@
+// Derived from brotli-decompressor (BSD-3-Clause); see THIRD_PARTY_LICENSES.
 const std = @import("std");
 const table = @import("transform_table.zig");
 

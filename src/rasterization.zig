@@ -1,3 +1,4 @@
+// Derived from FreeType (FTL); see THIRD_PARTY_LICENSES.
 //! AA scanline rasterizer for OpenType outlines. Port of FreeType's
 //! `smooth` module (`vendor/freetype/src/smooth/ftgrays.c`): exact-coverage
 //! cell accumulation along edges, swept into a per-scanline gray bitmap.

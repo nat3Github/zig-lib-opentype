@@ -1,3 +1,4 @@
+// Derived from HarfBuzz (Old MIT); see THIRD_PARTY_LICENSES.
 const std = @import("std");
 const parsing = @import("../parsing.zig");
 const common = @import("common.zig");
@@ -92,8 +93,8 @@ pub const ic_c: u8 = 1;
 pub const ic_v: u8 = 2;
 pub const ic_n: u8 = 3;
 pub const ic_h: u8 = 4;
-const ic_zwnj: u8 = 5;
-const ic_zwj: u8 = 6;
+pub const ic_zwnj: u8 = 5;
+pub const ic_zwj: u8 = 6;
 const ic_m: u8 = 7;
 pub const ic_sm: u8 = 8;
 pub const ic_placeholder: u8 = 10;
@@ -563,9 +564,8 @@ fn indicIsOldSpec(map: Map) bool {
     return tag[3] != '2';
 }
 
-/// Ported from `collect_features_indic`, minus the `locl`/`ccmp` enables
-/// (already unconditionally enabled by `shape()`'s `default_features`, see
-/// its doc comment). `rphf`/`pref`/`blwf`/`abvf`/`half`/`pstf`/`init` are
+/// Ported from `collect_features_indic`. `locl`/`ccmp` are enabled here as
+/// well as in `default_features` so they land in the first stage. `rphf`/`pref`/`blwf`/`abvf`/`half`/`pstf`/`init` are
 /// added non-globally (`addFeature`, not `enableFeature`) so
 /// `MapBuilder.compile` allocates real mask bits the reordering passes can
 /// assign per-glyph via `map.get1Mask`.
@@ -577,7 +577,9 @@ fn indicIsOldSpec(map: Map) bool {
 /// supposed to ligate). The pause boundaries are also what let
 /// `wouldSubstitute` probe one feature's lookups in isolation.
 pub fn collectFeaturesIndic(map_builder: *MapBuilder) !void {
-    const manual_joiners = MapFeatureFlags{ .manual_zwnj = true, .manual_zwj = true };
+    const manual_joiners = MapFeatureFlags{ .manual_zwnj = true, .manual_zwj = true, .per_syllable = true };
+    try map_builder.enableFeature(.{ 'l', 'o', 'c', 'l' }, .{ .per_syllable = true }, 1);
+    try map_builder.enableFeature(.{ 'c', 'c', 'm', 'p' }, .{ .per_syllable = true }, 1);
     try map_builder.addGsubPause(.indic_initial_reorder);
     const basic_features = [_]Tag{ tag_nukt, tag_akhn, tag_rphf, tag_rkrf, tag_pref, tag_blwf, tag_abvf, tag_half, tag_pstf, tag_vatu, tag_cjct };
     const basic_global = [_]bool{ true, true, false, true, false, false, false, false, false, true, true };
@@ -1119,7 +1121,7 @@ fn indicPlan(font: parsing.Font, map: Map, config: IndicScriptConfig, cmap: ?Cma
 pub fn setupMasksIndic(buffer: *Buffer, cmap: ?Cmap) !void {
     for (buffer.info.items) |*info| setIndicProperties(info);
     findSyllablesIndic(buffer);
-    _ = try common.insertDottedCircles(buffer, cmap, indic_syllable_broken, ic_dottedcircle, ic_repha, ip_end);
+    _ = try common.insertDottedCircles(buffer, cmap, indic_syllable_broken, ic_dottedcircle, ic_repha, ip_end, false);
 
     var start: usize = 0;
     while (start < buffer.info.items.len) {

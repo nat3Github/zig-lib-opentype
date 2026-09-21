@@ -1,3 +1,4 @@
+// Derived from HarfBuzz (Old MIT); see THIRD_PARTY_LICENSES.
 const std = @import("std");
 const unicode = @import("../unicode.zig");
 const common = @import("common.zig");
@@ -39,22 +40,7 @@ const MapFeatureFlags = map_mod.MapFeatureFlags;
 // back to just after the last halant seen so far (or to the syllable
 // start).
 //
-// Scope cuts, same bucket as the ones already documented in the Indic
-// section above:
-//   - `record_rphf_use`/`record_pref_use` (post-GSUB-substitution
-//     reclassification of a repha/pref glyph, needed for hb's real
-//     pause-interleaved pipeline) aren't ported - this port's MapBuilder
-//     has no GSUB-pause machinery (pre-existing scope cut), so, like
-//     Indic, GSUB features are masked on and left to fire without a
-//     would-substitute-style dry-run gate.
-//   - dotted-circle insertion for broken/malformed syllables runs via
-//     `common.insertDottedCircles` right after syllabification, since this
-//     port has no GSUB-pause machinery to run it mid-pipeline like hb does.
-//   - `setup_topographical_masks` (isol/init/medi/fina joining-form
-//     features, needed by the small subset of USE scripts written with
-//     Arabic-style cursive joining, e.g. Mongolian/Phags-pa) isn't
-//     ported - out of scope for this session, a self-contained follow-up
-//     if Mongolian/Phags-pa shaping quality matters later.
+// Scope notes:
 //   - hieroglyph_cluster's own script (Egyptian Hieroglyphs) needs no
 //     reordering (not in reorder_syllable_use's applicable-type list) and
 //     no basic-feature masking beyond what's already registered, so no
@@ -84,7 +70,7 @@ pub const khar_script_tag = Tag{ 'k', 'h', 'a', 'r' };
 pub const sylo_script_tag = Tag{ 's', 'y', 'l', 'o' };
 pub const tfng_script_tag = Tag{ 't', 'f', 'n', 'g' };
 pub const bali_script_tag = Tag{ 'b', 'a', 'l', 'i' };
-pub const nkoo_script_tag = Tag{ 'n', 'k', 'o', 'o' };
+pub const nkoo_script_tag = Tag{ 'n', 'k', 'o', ' ' };
 pub const phag_script_tag = Tag{ 'p', 'h', 'a', 'g' };
 pub const cham_script_tag = Tag{ 'c', 'h', 'a', 'm' };
 pub const kali_script_tag = Tag{ 'k', 'a', 'l', 'i' };
@@ -539,15 +525,50 @@ const use_non_cluster: u8 = 8;
 /// rule wins ties, falling back to a single-glyph `other` match. Requires
 /// `GlyphInfo.indic_category` to already hold each glyph's USE category
 /// (via `unicode.useCategory`).
-///
-/// Deliberate simplification vs. hb: the CGJ (U+034F) default-ignorable
-/// exclusion filter `find_syllables_use`'s C++ builds via `hb_filter`
-/// before running the scanner isn't ported - CGJ is rare enough in real
-/// text that this port just runs the scanner over every glyph including
-/// it, which only affects cluster boundaries around an explicit CGJ, not
-/// ordinary shaping.
-fn findSyllablesUse(buffer: *Buffer) void {
+fn findSyllablesUse(buffer: *Buffer) !void {
     const info = buffer.info.items;
+    if (!hasMachineHiddenGlyph(info)) return findSyllablesUseIn(info);
+
+    // hb runs the machine over a filtered view; each syllable then spans
+    // original indices up to the next visible glyph, hidden ones included.
+    const visible_index = try buffer.allocator.alloc(usize, info.len);
+    defer buffer.allocator.free(visible_index);
+    const visible = try buffer.allocator.alloc(GlyphInfo, info.len);
+    defer buffer.allocator.free(visible);
+    var visible_count: usize = 0;
+    for (info, 0..) |glyph_info, i| {
+        if (hiddenFromMachine(info, i)) continue;
+        visible_index[visible_count] = i;
+        visible[visible_count] = glyph_info;
+        visible_count += 1;
+    }
+    findSyllablesUseIn(visible[0..visible_count]);
+    for (info[0..if (visible_count == 0) info.len else visible_index[0]]) |*glyph_info| glyph_info.indic_syllable = 0;
+    for (0..visible_count) |v| {
+        const range_end = if (v + 1 < visible_count) visible_index[v + 1] else info.len;
+        for (info[visible_index[v]..range_end]) |*glyph_info| glyph_info.indic_syllable = visible[v].indic_syllable;
+    }
+}
+
+const CGJ: u8 = 6;
+
+/// `find_syllables_use`'s two `hb_filter`s: CGJ, and a ZWNJ whose next
+/// non-CGJ glyph is a mark.
+fn hiddenFromMachine(info: []const GlyphInfo, i: usize) bool {
+    if (info[i].indic_category == CGJ) return true;
+    if (info[i].indic_category != ZWNJ) return false;
+    for (info[i + 1 ..]) |next| {
+        if (next.indic_category != CGJ) return unicode.isUnicodeMark(@intCast(next.codepoint));
+    }
+    return false;
+}
+
+fn hasMachineHiddenGlyph(info: []const GlyphInfo) bool {
+    for (0..info.len) |i| if (hiddenFromMachine(info, i)) return true;
+    return false;
+}
+
+fn findSyllablesUseIn(info: []GlyphInfo) void {
     const count = info.len;
     var p: usize = 0;
     var serial: u8 = 1;
@@ -638,8 +659,9 @@ fn isPostBaseUse(cat: u8) bool {
     };
 }
 
-fn isHalantUse(cat: u8) bool {
-    return cat == H or cat == HVM or cat == IS;
+fn isHalantUse(glyph_info: GlyphInfo) bool {
+    const cat = glyph_info.indic_category;
+    return (cat == H or cat == HVM or cat == IS) and !glyph_info.is_ligated;
 }
 
 /// Ported from `reorder_syllable_use`: only fires for the 5 syllable types
@@ -658,7 +680,7 @@ fn reorderUseSyllable(buffer: *Buffer, start: usize, end: usize, stype: u8) void
     if (info[start].indic_category == R and end - start > 1) {
         var i = start + 1;
         while (i < end) : (i += 1) {
-            const is_post_base = isPostBaseUse(info[i].indic_category) or isHalantUse(info[i].indic_category);
+            const is_post_base = isPostBaseUse(info[i].indic_category) or isHalantUse(info[i]);
             if (is_post_base or i == end - 1) {
                 const target = if (is_post_base) i - 1 else i;
                 buffer.mergeClusters(start, target + 1);
@@ -674,9 +696,12 @@ fn reorderUseSyllable(buffer: *Buffer, start: usize, end: usize, stype: u8) void
     var j = start;
     var i = start;
     while (i < end) : (i += 1) {
-        if (isHalantUse(info[i].indic_category)) {
+        if (isHalantUse(info[i])) {
             j = i + 1;
-        } else if ((info[i].indic_category == VPre or info[i].indic_category == VMPre) and j < i) {
+        } else if ((info[i].indic_category == VPre or info[i].indic_category == VMPre) and
+            // Only the first component of a MultipleSubst moves.
+            info[i].lig_comp == 0 and j < i)
+        {
             buffer.mergeClusters(j, i + 1);
             const tmp = info[i];
             var k = i;
@@ -686,33 +711,34 @@ fn reorderUseSyllable(buffer: *Buffer, start: usize, end: usize, stype: u8) void
     }
 }
 
-/// Ported from `collect_features_use`, minus the `locl`/`ccmp` enables
-/// (already unconditionally enabled by `shape()`'s `default_features`, same
-/// as `collectFeaturesIndic`) and the pause registrations (no pause
-/// machinery in this port, see the module doc comment).
+/// Ported from `collect_features_use`. The reordering pause runs after the
+/// basic features, so a glyph `pref`/`rphf` substituted can be reclassified
+/// (`recordPrefUse`/`recordRphfUse`) before `reorderUse` moves it.
 pub fn collectFeaturesUse(map_builder: *MapBuilder) !void {
-    const manual_joiners = MapFeatureFlags{ .manual_zwnj = true, .manual_zwj = true };
-    // "Topographical features": registered unconditionally (isol/init/medi/
-    // fina drive both the arabic-joining-script mask assignment in
-    // `setupMasksUse` and `setupTopographicalMasksUse`'s syllable-adjacency
-    // fallback for every other USE script).
+    const per_syllable = MapFeatureFlags{ .per_syllable = true };
+    const manual_zwj_per_syllable = MapFeatureFlags{ .manual_zwj = true, .per_syllable = true };
+    try map_builder.enableFeature(.{ 'l', 'o', 'c', 'l' }, per_syllable, 1);
+    try map_builder.enableFeature(.{ 'c', 'c', 'm', 'p' }, per_syllable, 1);
+    try map_builder.enableFeature(tag_nukt, per_syllable, 1);
+    try map_builder.enableFeature(tag_akhn, manual_zwj_per_syllable, 1);
+
+    try map_builder.addGsubPause(.clear_substitution_flags);
+    try map_builder.addFeature(tag_rphf, manual_zwj_per_syllable, 1);
+    try map_builder.addGsubPause(.use_record_rphf);
+    try map_builder.addGsubPause(.clear_substitution_flags);
+    try map_builder.enableFeature(tag_pref, manual_zwj_per_syllable, 1);
+    try map_builder.addGsubPause(.use_record_pref);
+
+    for ([_]Tag{ tag_rkrf, tag_abvf, tag_blwf, tag_half, tag_pstf, tag_vatu, tag_cjct }) |tag|
+        try map_builder.enableFeature(tag, manual_zwj_per_syllable, 1);
+    try map_builder.addGsubPause(.use_reorder);
+    try map_builder.addGsubPause(.none);
+
     for (use_topographical_features) |tag| try map_builder.addFeature(tag, .{}, 1);
-    try map_builder.enableFeature(tag_nukt, manual_joiners, 1);
-    try map_builder.enableFeature(tag_akhn, manual_joiners, 1);
-    try map_builder.addFeature(tag_rphf, manual_joiners, 1);
-    try map_builder.enableFeature(tag_pref, manual_joiners, 1);
-    try map_builder.enableFeature(tag_rkrf, manual_joiners, 1);
-    try map_builder.enableFeature(tag_abvf, manual_joiners, 1);
-    try map_builder.enableFeature(tag_blwf, manual_joiners, 1);
-    try map_builder.enableFeature(tag_half, manual_joiners, 1);
-    try map_builder.enableFeature(tag_pstf, manual_joiners, 1);
-    try map_builder.enableFeature(tag_vatu, manual_joiners, 1);
-    try map_builder.enableFeature(tag_cjct, manual_joiners, 1);
-    try map_builder.enableFeature(tag_abvs, manual_joiners, 1);
-    try map_builder.enableFeature(tag_blws, manual_joiners, 1);
-    try map_builder.enableFeature(tag_haln, manual_joiners, 1);
-    try map_builder.enableFeature(tag_pres, manual_joiners, 1);
-    try map_builder.enableFeature(tag_psts, manual_joiners, 1);
+    try map_builder.addGsubPause(.none);
+
+    for ([_]Tag{ tag_abvs, tag_blws, tag_haln, tag_pres, tag_psts }) |tag|
+        try map_builder.enableFeature(tag, .{ .manual_zwj = true }, 1);
 }
 
 /// Ported from `setup_topographical_masks`: for USE scripts without Arabic-
@@ -773,12 +799,11 @@ fn setupTopographicalMasksUse(buffer: *Buffer, map: Map) void {
 /// fallback above (mutually exclusive, same as hb's early return in
 /// `setup_topographical_masks`). The state machine reads raw codepoints, so
 /// it must run before `codepoint` is overwritten with glyph ids.
-pub fn setupMasksUse(buffer: *Buffer, map: Map, cmap: ?Cmap, is_arabic_joining: bool) !void {
+pub fn setupMasksUse(buffer: *Buffer, map: Map, is_arabic_joining: bool) !void {
     if (is_arabic_joining) arabic_mod.setupMasksArabic(buffer, map);
 
     for (buffer.info.items) |*info| info.indic_category = unicode.useCategory(@intCast(info.codepoint));
-    findSyllablesUse(buffer);
-    _ = try common.insertDottedCircles(buffer, cmap, use_broken_cluster, B, R, null);
+    try findSyllablesUse(buffer);
     if (!is_arabic_joining) setupTopographicalMasksUse(buffer, map);
 
     const rphf_mask = map.get1Mask(tag_rphf);
@@ -795,9 +820,58 @@ pub fn setupMasksUse(buffer: *Buffer, map: Map, cmap: ?Cmap, is_arabic_joining: 
             var i = start;
             while (i < start + limit) : (i += 1) buffer.info.items[i].mask |= rphf_mask;
         }
-
-        reorderUseSyllable(buffer, start, end, syl & 0x0F);
-
         start = end;
     }
+}
+
+/// Ported from `record_rphf_use`: a glyph `rphf` substituted is a repha.
+pub fn recordRphfUse(buffer: *Buffer, map: Map) void {
+    const rphf_mask = map.get1Mask(tag_rphf);
+    if (rphf_mask == 0) return;
+    const info = buffer.info.items;
+    var start: usize = 0;
+    while (start < info.len) {
+        const end = syllableEnd(info, start);
+        var i = start;
+        while (i < end and info[i].mask & rphf_mask != 0) : (i += 1) {
+            if (info[i].is_substituted) {
+                info[i].indic_category = R;
+                break;
+            }
+        }
+        start = end;
+    }
+}
+
+/// Ported from `record_pref_use`: a glyph `pref` substituted behaves as VPre.
+pub fn recordPrefUse(buffer: *Buffer) void {
+    const info = buffer.info.items;
+    var start: usize = 0;
+    while (start < info.len) {
+        const end = syllableEnd(info, start);
+        for (info[start..end]) |*glyph_info| {
+            if (glyph_info.is_substituted) {
+                glyph_info.indic_category = VPre;
+                break;
+            }
+        }
+        start = end;
+    }
+}
+
+/// Ported from `reorder_use`.
+pub fn reorderUse(buffer: *Buffer, cmap: ?Cmap) !void {
+    _ = try common.insertDottedCircles(buffer, cmap, use_broken_cluster, B, R, null, true);
+    var start: usize = 0;
+    while (start < buffer.info.items.len) {
+        const end = syllableEnd(buffer.info.items, start);
+        reorderUseSyllable(buffer, start, end, buffer.info.items[start].indic_syllable & 0x0F);
+        start = end;
+    }
+}
+
+fn syllableEnd(info: []const GlyphInfo, start: usize) usize {
+    var end = start + 1;
+    while (end < info.len and info[end].indic_syllable == info[start].indic_syllable) end += 1;
+    return end;
 }

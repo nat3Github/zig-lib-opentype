@@ -1,3 +1,4 @@
+// Derived from FreeType (FTL); see THIRD_PARTY_LICENSES.
 // Adobe `cf2` CFF hinting engine — port of `vendor/freetype/src/psaux`
 // (the modern, default `FT_CFF_HINTING_ADOBE` engine: blue-zone alignment,
 // stem hint capture/mapping, and stem darkening with miter-join outline

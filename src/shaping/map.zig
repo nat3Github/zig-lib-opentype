@@ -1,3 +1,4 @@
+// Derived from HarfBuzz (Old MIT); see THIRD_PARTY_LICENSES.
 // Ported from vendor/harfbuzz/src/hb-ot-map.hh + hb-ot-map.cc (pinned
 // 703e2d1441): turns requested GSUB/GPOS feature tags into an ordered,
 // mask-tagged lookup-index list per table, consulting the font's own
@@ -91,6 +92,12 @@ pub const StagePause = enum(u8) {
     none,
     indic_initial_reorder,
     indic_final_reorder,
+    clear_substitution_flags,
+    use_record_rphf,
+    use_record_pref,
+    use_reorder,
+    myanmar_reorder,
+    arabic_record_stch,
 };
 
 pub const StageMapEntry = struct {

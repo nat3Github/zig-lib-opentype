@@ -1,3 +1,4 @@
+// Derived from HarfBuzz (Old MIT); see THIRD_PARTY_LICENSES.
 const std = @import("std");
 const parsing = @import("../parsing.zig");
 const unicode = @import("../unicode.zig");
@@ -68,6 +69,9 @@ pub const GlyphInfo = struct {
     /// `hideDefaultIgnorables` to zero out any Default_Ignorable_Code_Point
     /// glyph the font didn't otherwise substitute away.
     is_default_ignorable: bool = false,
+    /// hb's UPROPS_MASK_HIDDEN: a default ignorable (CGJ, Mongolian FVS, tag
+    /// characters) GSUB matching must not step over.
+    is_hidden: bool = false,
     /// Hangul complex shaper: which jamo-position feature (ljmo/vjmo/tjmo,
     /// see `HangulJmo`) this glyph belongs to after `preprocessHangul`'s
     /// syllable decompose, 0 meaning none/not applicable.
@@ -97,6 +101,13 @@ pub const GlyphInfo = struct {
     /// character and it substituted the plain space glyph instead; read back
     /// after default positioning to widen/narrow that borrowed advance.
     space_fallback: SpaceFallback = .not_space,
+    /// Set by `reorderMarksArabic` on a modifier combining mark it moved to
+    /// the front: its class reads as hb's CCC22/CCC26 so the sequence stays
+    /// sorted.
+    arabic_mcm_moved: bool = false,
+    /// Arabic shaper: the source codepoint's General_Category is in hb's
+    /// "word" set, which bounds a 'stch' stretch.
+    is_arabic_word: bool = false,
 };
 
 /// hb-unicode.hh's `space_t`. The `em_*` values double as the divisor of an
@@ -140,7 +151,7 @@ pub fn spaceFallbackType(codepoint: u21) SpaceFallback {
 }
 
 /// Same order as hb-ot-shaper-arabic.cc's `arabic_features`/`arabic_action_t`.
-pub const ArabicAction = enum(u8) { isol, fina, fin2, fin3, medi, med2, init, none };
+pub const ArabicAction = enum(u8) { isol, fina, fin2, fin3, medi, med2, init, none, stch_fixed, stch_repeating };
 
 pub const GlyphPosition = struct {
     x_advance: i32 = 0,
@@ -946,6 +957,8 @@ pub fn insertDottedCircles(
     dottedcircle_category: u8,
     repha_category: ?u8,
     dottedcircle_position: ?u8,
+    /// Whether `codepoint` already holds glyph ids (a GSUB-pause caller).
+    glyphs_mapped: bool,
 ) !bool {
     var has_broken = false;
     for (buffer.info.items) |info| {
@@ -960,11 +973,9 @@ pub fn insertDottedCircles(
     const dottedcircle_glyph = resolved.lookup(0x25CC) orelse return false;
 
     var dottedcircle = GlyphInfo{};
-    // Runs pre-mapGlyphsFast (codepoint still holds Unicode values here, see
-    // outputChar/mapGlyphsFast) - stash the resolved glyph in var1 the same
-    // way, not codepoint directly, or mapGlyphsFast's unconditional
-    // `codepoint = var1` overwrite clobbers it back to 0.
-    dottedcircle.codepoint = 0x25CC;
+    // Pre-mapGlyphsFast callers need the glyph in var1 too, or
+    // mapGlyphsFast's unconditional `codepoint = var1` clobbers it to 0.
+    dottedcircle.codepoint = if (glyphs_mapped) dottedcircle_glyph else 0x25CC;
     dottedcircle.var1 = @bitCast(@as(u32, dottedcircle_glyph));
     dottedcircle.indic_category = dottedcircle_category;
     if (dottedcircle_position) |pos| dottedcircle.indic_position = pos;
@@ -1007,6 +1018,14 @@ pub fn containsTag(tags: []const Tag, tag: Tag) bool {
     return false;
 }
 
+/// hb's `_hb_glyph_info_is_default_ignorable`: GSUB output is no longer
+/// ignorable.
+pub fn isIgnorable(info: GlyphInfo) bool {
+    return info.is_default_ignorable and !info.is_substituted;
+}
+
 pub fn combiningClassOf(info: GlyphInfo) u8 {
-    return unicode.modifiedCombiningClass(@intCast(info.codepoint));
+    const class = unicode.modifiedCombiningClass(@intCast(info.codepoint));
+    if (info.arabic_mcm_moved) return if (class == 220) 22 else 26;
+    return class;
 }
