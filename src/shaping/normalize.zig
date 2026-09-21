@@ -186,12 +186,12 @@ fn normalizeRecomposeRound(ctx: NormalizeContext, buffer: *Buffer, block_mark_re
     try buffer.nextGlyph();
     while (buffer.idx < count) {
         const cur_codepoint: u21 = @intCast(buffer.cur(0).codepoint);
-        const cur_cc = unicode.combiningClass(cur_codepoint);
+        const cur_cc = combiningClassOf(buffer.cur(0));
 
         compose_check: {
             if (!unicode.isUnicodeMark(cur_codepoint)) break :compose_check;
             const out_len = buffer.out_info.items.len;
-            const prev_cc = unicode.combiningClass(@intCast(buffer.out_info.items[out_len - 1].codepoint));
+            const prev_cc = combiningClassOf(buffer.out_info.items[out_len - 1]);
             if (!(starter == out_len - 1 or prev_cc < cur_cc)) break :compose_check;
             const starter_codepoint: u21 = @intCast(buffer.out_info.items[starter].codepoint);
             if (block_mark_recompose and unicode.isUnicodeMark(starter_codepoint)) break :compose_check;
@@ -207,7 +207,7 @@ fn normalizeRecomposeRound(ctx: NormalizeContext, buffer: *Buffer, block_mark_re
         }
 
         try buffer.nextGlyph();
-        if (unicode.combiningClass(@intCast(buffer.out_info.items[buffer.out_info.items.len - 1].codepoint)) == 0) {
+        if (combiningClassOf(buffer.out_info.items[buffer.out_info.items.len - 1]) == 0) {
             starter = buffer.out_info.items.len - 1;
         }
     }

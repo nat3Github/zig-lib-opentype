@@ -2066,6 +2066,47 @@ pub fn combiningClass(codepoint: u21) u8 {
     return if (class == no_class) 0 else class;
 }
 
+/// hb's `modified_combining_class`: canonical class with hb's reordering
+/// tweaks (SBL Hebrew point order, Shadda first, Telugu length marks before
+/// nukta/virama, Thai/Tibetan vowel order). Shaping sorts and blocks on this.
+pub fn modifiedCombiningClass(codepoint: u21) u8 {
+    return switch (codepoint) {
+        0x1A60, 0x0FC6 => 254,
+        0x0F39 => 127,
+        else => switch (combiningClass(codepoint)) {
+            10 => 22,
+            11 => 15,
+            12 => 16,
+            13 => 17,
+            14 => 23,
+            15 => 18,
+            16 => 19,
+            17 => 20,
+            18 => 21,
+            19 => 14,
+            20 => 24,
+            21 => 12,
+            22 => 25,
+            23 => 13,
+            24 => 10,
+            25 => 11,
+            27 => 28,
+            28 => 29,
+            29 => 30,
+            30 => 31,
+            31 => 32,
+            32 => 33,
+            33 => 27,
+            84 => 4,
+            91 => 5,
+            103 => 3,
+            130 => 132,
+            132 => 131,
+            else => |class| class,
+        },
+    };
+}
+
 /// General_Category is Mn, Mc, or Me.
 pub fn isUnicodeMark(codepoint: u21) bool {
     return packedContains(&tables.unicode_mark_ranges, codepoint);

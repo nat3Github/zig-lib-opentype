@@ -1008,5 +1008,5 @@ pub fn containsTag(tags: []const Tag, tag: Tag) bool {
 }
 
 pub fn combiningClassOf(info: GlyphInfo) u8 {
-    return unicode.combiningClass(@intCast(info.codepoint));
+    return unicode.modifiedCombiningClass(@intCast(info.codepoint));
 }
