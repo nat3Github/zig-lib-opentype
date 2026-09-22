@@ -108,6 +108,11 @@ pub const GlyphInfo = struct {
     /// Arabic shaper: the source codepoint's General_Category is in hb's
     /// "word" set, which bounds a 'stch' stretch.
     is_arabic_word: bool = false,
+    /// hb's cached `glyph_props` class: GDEF GlyphClassDef of `gdef_class_glyph`.
+    /// Valid only while that still equals `codepoint`; anything else falls
+    /// back to the ClassDef lookup, so a stale entry is never wrong.
+    gdef_class_glyph: u32 = std.math.maxInt(u32),
+    gdef_class: u16 = 0,
 };
 
 /// hb-unicode.hh's `space_t`. The `em_*` values double as the divisor of an

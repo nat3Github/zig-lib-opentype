@@ -480,11 +480,15 @@ fn shapeImpl(
     if (indic_config != null or is_use) try preprocessVowelConstraints(&buffer, script_tags);
     if (direction == .right_to_left or direction == .bottom_to_top) mirrorChars(&buffer, cmap, map.get1Mask(tag_rtlm));
 
-    // COMPOSED_DIACRITICS_NO_SHORT_CIRCUIT in hb's terms - see normalize()'s
-    // doc comment for why these four complex shapers need it.
-    const might_short_circuit = !(indic_config != null or is_khmer or is_myanmar or is_use);
+    // Each hb shaper's `normalization_preference`; see normalize()'s doc.
+    const normalization_mode: normalize_mod.Mode = if (indic_config != null or is_khmer or is_myanmar or is_use)
+        .composed_diacritics_no_short_circuit
+    else if (is_hangul)
+        .none
+    else
+        .composed_diacritics;
     const block_mark_recompose = indic_config != null or is_khmer or is_use;
-    try normalize(&buffer, cmap, might_short_circuit, block_mark_recompose, if (indic_config != null) .indic else if (is_khmer) .khmer else .none, is_arabic);
+    try normalize(&buffer, cmap, normalization_mode, block_mark_recompose, if (indic_config != null) .indic else if (is_khmer) .khmer else .none, if (is_arabic) .arabic else if (containsTag(script_tags, .{ 'h', 'e', 'b', 'r' })) .hebrew else .none);
 
     if (is_hangul) setupMasksHangul(&buffer, map);
     if (is_arabic) setupMasksArabic(&buffer, map);
@@ -501,6 +505,10 @@ fn shapeImpl(
         .classes = parsing.Table.Gdef.glyphClassDef(d) catch null,
         .mark_attach = parsing.Table.Gdef.markAttachClassDef(d) catch null,
         .mark_sets = parsing.Table.Gdef.markGlyphSets(d) catch null,
+        .variations = if (normalized_coords.len == 0) null else if (parsing.Table.Gdef.itemVariationStore(d)) |store_offset|
+            .{ .data = d, .store_offset = store_offset, .normalized_coords = normalized_coords }
+        else
+            null,
     } else .{};
 
     try applyGsub(font, map, gdef_classdef, &buffer, direction, indic_config, cmap);
@@ -520,8 +528,10 @@ fn shapeImpl(
         }
     }
     if (zero_marks_late) zeroMarkWidthsByGdef(&buffer, gdef_classdef);
-    finishGposOffsets(&buffer, direction);
+    // hb_ot_position_complex: ignorables lose their advance before mark
+    // offsets are resolved, so a mark past one still lands on its base.
     zeroDefaultIgnorableAdvances(&buffer, direction);
+    finishGposOffsets(&buffer, direction);
 
     // hb-ot-shape.cc hb_ot_position(): backward directions are shaped in
     // logical order and flipped to visual order as the final position step.

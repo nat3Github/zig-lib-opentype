@@ -921,7 +921,8 @@ pub fn nextGraphemeBoundary(utf8: []const u8, start: usize) usize {
     return utf8.len;
 }
 
-fn isVariationSelector(cp: u21) bool {
+/// hb's `is_variation_selector`: VS1-256, not the Mongolian FVSes.
+pub fn isVariationSelector(cp: u21) bool {
     return (cp >= 0xFE00 and cp <= 0xFE0F) or (cp >= 0xE0100 and cp <= 0xE01EF);
 }
 

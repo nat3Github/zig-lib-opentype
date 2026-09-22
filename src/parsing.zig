@@ -661,7 +661,78 @@ pub const Table = struct {
             /// has no Unicode subtable at all.
             legacy: Legacy = .none,
 
+            /// The format 14 (Unicode Variation Sequences) subtable, empty
+            /// when the font has none.
+            variations: []const u8 = &.{},
+
             pub const Legacy = enum { none, ascii, mac_roman };
+
+            /// hb's `get_variation_glyph`: the glyph for `codepoint` followed
+            /// by variation selector `selector`, or null when the font lists
+            /// no such sequence.
+            pub fn lookupVariation(self: Resolved, codepoint: u21, selector: u21) ?u16 {
+                const sub = self.variations;
+                if (sub.len < 10) return null;
+                const record_count = @min(std.mem.readInt(u32, sub[6..10], .big), (sub.len - 10) / 11);
+                var lo: usize = 0;
+                var hi: usize = record_count;
+                while (lo < hi) {
+                    const mid = lo + (hi - lo) / 2;
+                    const pos = 10 + mid * 11;
+                    const record_selector = std.mem.readInt(u24, sub[pos..][0..3], .big);
+                    if (selector < record_selector) {
+                        hi = mid;
+                    } else if (selector > record_selector) {
+                        lo = mid + 1;
+                    } else {
+                        const default_offset = std.mem.readInt(u32, sub[pos + 3 ..][0..4], .big);
+                        const non_default_offset = std.mem.readInt(u32, sub[pos + 7 ..][0..4], .big);
+                        if (default_offset != 0 and defaultUvsCovers(sub, default_offset, codepoint)) return self.lookup(codepoint);
+                        if (non_default_offset == 0) return null;
+                        return nonDefaultUvsGlyph(sub, non_default_offset, codepoint);
+                    }
+                }
+                return null;
+            }
+
+            fn defaultUvsCovers(sub: []const u8, offset: u32, codepoint: u21) bool {
+                if (@as(u64, offset) + 4 > sub.len) return false;
+                const range_count = @min(std.mem.readInt(u32, sub[offset..][0..4], .big), (sub.len - offset - 4) / 4);
+                var lo: usize = 0;
+                var hi: usize = range_count;
+                while (lo < hi) {
+                    const mid = lo + (hi - lo) / 2;
+                    const pos = offset + 4 + mid * 4;
+                    const start = std.mem.readInt(u24, sub[pos..][0..3], .big);
+                    if (codepoint < start) {
+                        hi = mid;
+                    } else if (codepoint > @as(u32, start) + sub[pos + 3]) {
+                        lo = mid + 1;
+                    } else return true;
+                }
+                return false;
+            }
+
+            fn nonDefaultUvsGlyph(sub: []const u8, offset: u32, codepoint: u21) ?u16 {
+                if (@as(u64, offset) + 4 > sub.len) return null;
+                const mapping_count = @min(std.mem.readInt(u32, sub[offset..][0..4], .big), (sub.len - offset - 4) / 5);
+                var lo: usize = 0;
+                var hi: usize = mapping_count;
+                while (lo < hi) {
+                    const mid = lo + (hi - lo) / 2;
+                    const pos = offset + 4 + mid * 5;
+                    const value = std.mem.readInt(u24, sub[pos..][0..3], .big);
+                    if (codepoint < value) {
+                        hi = mid;
+                    } else if (codepoint > value) {
+                        lo = mid + 1;
+                    } else {
+                        const glyph = std.mem.readInt(u16, sub[pos + 3 ..][0..2], .big);
+                        return if (glyph == 0) null else glyph;
+                    }
+                }
+                return null;
+            }
 
             pub fn lookup(self: Resolved, codepoint: u21) ?u16 {
                 const index: u21 = switch (self.legacy) {
@@ -734,7 +805,28 @@ pub const Table = struct {
 
         pub fn resolve(data: []const u8) ?Resolved {
             const sel = selectSubtable(data) orelse return null;
-            return .{ .sub = data[sel.offset..], .format = sel.format, .legacy = sel.legacy };
+            return .{ .sub = data[sel.offset..], .format = sel.format, .legacy = sel.legacy, .variations = variationSubtable(data) };
+        }
+
+        /// The (platform 0, encoding 5) format 14 subtable, clamped to its
+        /// declared length.
+        fn variationSubtable(data: []const u8) []const u8 {
+            if (data.len < 4) return &.{};
+            const num_tables = std.mem.readInt(u16, data[2..][0..2], .big);
+            if (4 + @as(u64, num_tables) * 8 > data.len) return &.{};
+            for (0..num_tables) |i| {
+                const rec_pos = 4 + i * 8;
+                const platform_id = std.mem.readInt(u16, data[rec_pos..][0..2], .big);
+                const encoding_id = std.mem.readInt(u16, data[rec_pos + 2 ..][0..2], .big);
+                if (platform_id != 0 or encoding_id != 5) continue;
+                const offset = std.mem.readInt(u32, data[rec_pos + 4 ..][0..4], .big);
+                if (@as(u64, offset) + 10 > data.len) return &.{};
+                const sub = data[offset..];
+                if (std.mem.readInt(u16, sub[0..2], .big) != 14) return &.{};
+                const length = std.mem.readInt(u32, sub[2..6], .big);
+                return sub[0..@min(length, sub.len)];
+            }
+            return &.{};
         }
 
         const Subtable = struct { offset: u32, format: u16, legacy: Resolved.Legacy };
@@ -1199,11 +1291,8 @@ pub const Table = struct {
             return .{ .outer = @intCast(raw >> inner_bit_count), .inner = @intCast(raw & ((@as(u32, 1) << inner_bit_count) - 1)) };
         }
 
-        fn f2dot14ToF32(v: i16) f32 {
-            return @as(f32, @floatFromInt(v)) / 16384.0;
-        }
-
-        fn itemDelta(data: []const u8, store_offset: u32, outer: u16, inner: u16, normalized_coords: []const f32) f32 {
+        /// Also GDEF's ItemVariationStore (GPOS VariationIndex deltas).
+        pub fn itemDelta(data: []const u8, store_offset: u32, outer: u16, inner: u16, normalized_coords: []const f32) f32 {
             const store = store_offset;
             if (@as(u64, store) + 8 > data.len) return 0;
             const region_list_offset = offsetWithin(data, @as(u64, store) + std.mem.readInt(u32, data[store + 2 ..][0..4], .big), 4) orelse return 0;
@@ -1243,22 +1332,28 @@ pub const Table = struct {
                 while (axis < axis_count) : (axis += 1) {
                     const region_axis_base = region_offset + axis * 6;
                     if (region_axis_base + 6 > data.len) return 0;
-                    const start = f2dot14ToF32(std.mem.readInt(i16, data[region_axis_base..][0..2], .big));
-                    const peak = f2dot14ToF32(std.mem.readInt(i16, data[region_axis_base + 2 ..][0..2], .big));
-                    const end = f2dot14ToF32(std.mem.readInt(i16, data[region_axis_base + 4 ..][0..2], .big));
-                    const coord: f32 = if (axis < normalized_coords.len) normalized_coords[axis] else 0;
+                    // hb's VarRegionAxis::evaluate on F2Dot14 integers, so the
+                    // float rounding (and thus the rounded delta) matches.
+                    const start: i32 = std.mem.readInt(i16, data[region_axis_base..][0..2], .big);
+                    const peak: i32 = std.mem.readInt(i16, data[region_axis_base + 2 ..][0..2], .big);
+                    const end: i32 = std.mem.readInt(i16, data[region_axis_base + 4 ..][0..2], .big);
+                    const coord: i32 = if (axis < normalized_coords.len) @intFromFloat(@round(normalized_coords[axis] * 16384.0)) else 0;
 
-                    if (start > peak or peak > end or peak == 0 or (start < 0 and end > 0)) continue;
-                    if (coord < start or coord > end) {
+                    if (peak == 0 or coord == peak) continue;
+                    if (coord == 0) {
                         scalar = 0;
                         break;
-                    } else if (coord == peak) {
-                        continue;
-                    } else if (coord < peak) {
-                        scalar = scalar * (coord - start) / (peak - start);
-                    } else {
-                        scalar = scalar * (end - coord) / (end - peak);
                     }
+                    if (start > peak or peak > end or (start < 0 and end > 0)) continue;
+                    if (coord <= start or end <= coord) {
+                        scalar = 0;
+                        break;
+                    }
+                    const factor = if (coord < peak)
+                        @as(f32, @floatFromInt(coord - start)) / @as(f32, @floatFromInt(peak - start))
+                    else
+                        @as(f32, @floatFromInt(end - coord)) / @as(f32, @floatFromInt(end - peak));
+                    scalar *= factor;
                 }
 
                 const val: i16 = if (idx >= short_count) blk: {
@@ -2715,28 +2810,36 @@ pub const Table = struct {
             return @as(f32, @floatFromInt(v)) / 16384.0;
         }
 
-        // Piecewise-linear remap of a default-normalized coordinate through
-        // one axis's avar segment map, per the OpenType `avar` spec. Ported
-        // from fontTools' varLib.models.piecewiseLinearMap (spec algorithm;
-        // avar2 and HarfBuzz's degenerate-input CoreText-compat special
-        // casing are not included — add if a real-world font needs them).
+        /// Ported from hb's `SegmentMaps::map_float`, error recovery for
+        /// short or duplicated maps included.
         pub fn mapValue(segment: []const AxisValueMap, value: f32) f32 {
             if (segment.len == 0) return value;
-            for (segment) |m| {
-                if (m.from_coord == value) return m.to_coord;
+            if (segment.len == 1) return value - segment[0].from_coord + segment[0].to_coord;
+
+            var start: usize = 0;
+            var end: usize = segment.len;
+            if (segment[0].from_coord == -1 and segment[0].to_coord == -1 and segment[1].from_coord == -1) start += 1;
+            if (segment[end - 1].from_coord == 1 and segment[end - 1].to_coord == 1 and segment[end - 2].from_coord == 1) end -= 1;
+
+            var i = start;
+            while (i < end and value != segment[i].from_coord) i += 1;
+            if (i < end) {
+                var j = i;
+                while (j + 1 < end and value == segment[j + 1].from_coord) j += 1;
+                if (i == j) return segment[i].to_coord;
+                if (i + 2 == j) return segment[i + 1].to_coord;
+                if (value < 0) return segment[j].to_coord;
+                if (value > 0) return segment[i].to_coord;
+                return if (@abs(segment[i].to_coord) < @abs(segment[j].to_coord)) segment[i].to_coord else segment[j].to_coord;
             }
 
-            const first = segment[0];
-            if (value < first.from_coord) return value + first.to_coord - first.from_coord;
-            const last = segment[segment.len - 1];
-            if (value > last.from_coord) return value + last.to_coord - last.from_coord;
-
-            var i: usize = 1;
-            while (segment[i].from_coord < value) : (i += 1) {}
+            i = start;
+            while (i < end and value >= segment[i].from_coord) i += 1;
+            if (i == 0) return value - segment[0].from_coord + segment[0].to_coord;
+            if (i == end) return value - segment[end - 1].from_coord + segment[end - 1].to_coord;
             const before = segment[i - 1];
             const after = segment[i];
-            const denom = after.from_coord - before.from_coord;
-            return before.to_coord + (after.to_coord - before.to_coord) * (value - before.from_coord) / denom;
+            return before.to_coord + (after.to_coord - before.to_coord) * (value - before.from_coord) / (after.from_coord - before.from_coord);
         }
     };
 
@@ -3961,6 +4064,14 @@ pub const Table = struct {
                 return (try cov.get(glyph)) != null;
             }
         };
+
+        /// GDEF 1.3's ItemVariationStore offset, null before 1.3 or when absent.
+        pub fn itemVariationStore(data: []const u8) ?u32 {
+            if (data.len < 18) return null;
+            if (std.mem.readInt(u16, data[2..4], .big) < 3) return null;
+            const offset = std.mem.readInt(u32, data[14..18], .big);
+            return if (offset == 0 or offset >= data.len) null else offset;
+        }
 
         pub fn markGlyphSets(data: []const u8) Font.ParseError!?MarkGlyphSets {
             var c = Cursor{ .data = data, .pos = 2 };

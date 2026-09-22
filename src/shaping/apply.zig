@@ -61,10 +61,8 @@ const table_tag_gpos = map_mod.table_tag_gpos;
 //     reachable via nested `LookupRecord` application ("no chaining to this
 //     type" in hb), enforced here via the same `depth != max_nesting_level`
 //     check hb makes with `nesting_level_left`.
-//   - Device tables (ValueFormat's xPlaDevice/yPlaDevice/xAdvDevice/
-//     yAdvDevice bits, ppem-specific hinting deltas / variable-font deltas)
-//     are byte-skipped for correct record sizing but never applied - same
-//     "not a variable-font consumer yet" cut as FeatureVariations above.
+//   - Device tables: only VariationIndex deltas apply (hb at ppem 0);
+//     ppem-specific hinting deltas are skipped.
 //   - Ligature component matching requires an exact contiguous glyph run
 //     (no lookup-flag skipping of marks between components). Real fonts
 //     don't put combining marks between Latin ligature components in
@@ -127,12 +125,52 @@ pub const Gdef = struct {
     classes: ?parsing.Table.Layout.ClassDef = null,
     mark_attach: ?parsing.Table.Layout.ClassDef = null,
     mark_sets: ?parsing.Table.Gdef.MarkGlyphSets = null,
+    /// Set only at non-default variation coords, as hb gates device deltas
+    /// on `has_nonzero_coords`.
+    variations: ?Variations = null,
+
+    pub const Variations = struct {
+        data: []const u8,
+        store_offset: u32,
+        normalized_coords: []const f32,
+    };
 };
+
+/// hb's `roundf`, which it redefines as `floor(x + 0.5)`: halves round up,
+/// not away from zero.
+pub fn hbRound(x: f32) f32 {
+    return @floor(x + 0.5);
+}
+
+/// hb's `Device::get_{x,y}_delta` at ppem 0: only a VariationIndex table
+/// contributes. `device_offset` is relative to `base`.
+fn deviceDelta(gdef: Gdef, base: parsing.Table.Layout.SubtableReader, device_offset: u16) i32 {
+    if (device_offset == 0) return 0;
+    const variations = gdef.variations orelse return 0;
+    const device = parsing.Table.Layout.SubtableReader{ .data = base.data, .offset = base.offset + device_offset };
+    if ((device.u16At(4) catch return 0) != 0x8000) return 0;
+    const outer = device.u16At(0) catch return 0;
+    const inner = device.u16At(2) catch return 0;
+    return @intFromFloat(hbRound(parsing.Table.HVAR.itemDelta(variations.data, variations.store_offset, outer, inner, variations.normalized_coords)));
+}
 
 fn glyphClass(gdef: Gdef, glyph: u32) u16 {
     if (glyph > std.math.maxInt(u16)) return 0;
     const cd = gdef.classes orelse return 0;
     return cd.getClass(@intCast(glyph)) catch 0;
+}
+
+fn infoGlyphClass(gdef: Gdef, info: GlyphInfo) u16 {
+    if (info.gdef_class_glyph == info.codepoint) return info.gdef_class;
+    return glyphClass(gdef, info.codepoint);
+}
+
+fn refreshGlyphClasses(infos: []GlyphInfo, gdef: Gdef) void {
+    for (infos) |*info| {
+        if (info.gdef_class_glyph == info.codepoint) continue;
+        info.gdef_class = glyphClass(gdef, info.codepoint);
+        info.gdef_class_glyph = info.codepoint;
+    }
 }
 
 /// hb's `lookup_props`: the raw lookupFlag with the markFilteringSet index
@@ -197,7 +235,7 @@ fn matchesLookupProps(info: GlyphInfo, gdef: Gdef, lookup_flags: u32) bool {
 }
 
 fn filteredByLookupProps(info: GlyphInfo, gdef: Gdef, lookup_flags: u32) bool {
-    const class = glyphClass(gdef, info.codepoint);
+    const class = infoGlyphClass(gdef, info);
     if (shouldSkipClass(class, lookup_flags)) return true;
     if (class != 3 or info.codepoint > std.math.maxInt(u16)) return false;
     const glyph: u16 = @intCast(info.codepoint);
@@ -325,35 +363,36 @@ const lookup_flag_ignore_marks: u32 = 0x0008;
 /// for its nested lookups to carry.
 const gpos_lookup_mask: u32 = 0;
 
-fn isMarkGlyph(gdef: Gdef, glyph: u32) bool {
-    return glyphClass(gdef, glyph) == 3;
+fn isMarkGlyph(gdef: Gdef, info: GlyphInfo) bool {
+    return infoGlyphClass(gdef, info) == 3;
 }
 
 /// Reads an Offset16To<Anchor> field at `rel` (relative to `reader`'s own
-/// base) and, if non-null, the AnchorFormat 1/2/3-common xCoordinate/
-/// yCoordinate pair at the target (offset +2/+4 - identical across all three
-/// formats). AnchorFormat2's hinted contour-point lookup and AnchorFormat3's
-/// device-table deltas are not applied - same "not a hinting/variable-font
-/// consumer yet" cut as ValueRecord's device fields - so the design-unit
-/// xCoordinate/yCoordinate is used unconditionally, matching hb's own
-/// HB_NO_HINTING fallback path.
+/// base) and, if non-null, the anchor's xCoordinate/yCoordinate (offset
+/// +2/+4 in every format) plus AnchorFormat3's variation deltas.
+/// AnchorFormat2's hinted contour point is not used, matching hb at ppem 0.
 const AnchorPoint = struct { x: i32, y: i32 };
 
-fn readAnchor(reader: parsing.Table.Layout.SubtableReader, rel: usize) parsing.Font.ParseError!?AnchorPoint {
+fn readAnchor(gdef: Gdef, reader: parsing.Table.Layout.SubtableReader, rel: usize) parsing.Font.ParseError!?AnchorPoint {
     const off = try reader.u16At(rel);
     if (off == 0) return null;
     const anchor = parsing.Table.Layout.SubtableReader{ .data = reader.data, .offset = reader.offset + off };
-    return .{ .x = try anchor.i16At(2), .y = try anchor.i16At(4) };
+    var point = AnchorPoint{ .x = try anchor.i16At(2), .y = try anchor.i16At(4) };
+    if (gdef.variations != null and try anchor.u16At(0) == 3) {
+        point.x += deviceDelta(gdef, anchor, try anchor.u16At(6));
+        point.y += deviceDelta(gdef, anchor, try anchor.u16At(8));
+    }
+    return point;
 }
 
 /// AnchorMatrix (OT spec): rows u16, then row-major Offset16To<Anchor> cells
 /// (row*cols+col), relative to the AnchorMatrix's own base. Shared layout
 /// behind BaseArray, LigatureAttach (component-major) and Mark2Array.
-fn readAnchorMatrixCell(matrix: parsing.Table.Layout.SubtableReader, row: u16, col: u16, cols: u16) parsing.Font.ParseError!?AnchorPoint {
+fn readAnchorMatrixCell(gdef: Gdef, matrix: parsing.Table.Layout.SubtableReader, row: u16, col: u16, cols: u16) parsing.Font.ParseError!?AnchorPoint {
     if (col >= cols) return null;
     const rows = try matrix.u16At(0);
     if (row >= rows) return null;
-    return readAnchor(matrix, 2 + (@as(usize, row) * cols + col) * 2);
+    return readAnchor(gdef, matrix, 2 + (@as(usize, row) * cols + col) * 2);
 }
 
 /// Walks a chain of prior cursive attachments starting at `glyph_pos`,
@@ -385,6 +424,7 @@ fn resolveCrossOffset(buffer: *Buffer, glyph_pos: usize, horizontal: bool) i32 {
 /// find it. Shared by MarkBasePos/MarkLigPos/MarkMarkPos, which differ only
 /// in how they pick `row_index` and `glyph_pos`.
 fn applyMarkAttach(
+    gdef: Gdef,
     mark_array: parsing.Table.Layout.SubtableReader,
     mark_index: u16,
     anchor_matrix: parsing.Table.Layout.SubtableReader,
@@ -399,8 +439,8 @@ fn applyMarkAttach(
     const rec_off = 2 + @as(usize, mark_index) * 4;
     const mark_class = try mark_array.u16At(rec_off);
     if (mark_class >= class_count) return false;
-    const mark_anchor = try readAnchor(mark_array, rec_off + 2) orelse return false;
-    const glyph_anchor = try readAnchorMatrixCell(anchor_matrix, row_index, mark_class, class_count) orelse return false;
+    const mark_anchor = try readAnchor(gdef, mark_array, rec_off + 2) orelse return false;
+    const glyph_anchor = try readAnchorMatrixCell(gdef, anchor_matrix, row_index, mark_class, class_count) orelse return false;
 
     const horizontal = direction == .left_to_right or direction == .right_to_left;
     const base_offset = resolveCrossOffset(buffer, glyph_pos, horizontal);
@@ -452,7 +492,7 @@ fn applyGposMarkToBase(
     const mark_array = try reader.subReaderAt(8);
     const base_array = try reader.subReaderAt(10);
 
-    return applyMarkAttach(mark_array, mark_index, base_array, class_count, base_index, base_pos, buffer, direction);
+    return applyMarkAttach(gdef, mark_array, mark_index, base_array, class_count, base_index, base_pos, buffer, direction);
 }
 
 /// MarkBasePos's `accept`: of a MultipleSubst sequence only the first glyph
@@ -461,7 +501,7 @@ fn acceptsMarkBase(infos: []const GlyphInfo, gdef: Gdef, idx: usize) bool {
     const info = infos[idx];
     if (!info.is_multiplied or info.lig_comp == 0 or idx == 0) return true;
     const prev = infos[idx - 1];
-    return isMarkGlyph(gdef, prev.codepoint) or !prev.is_multiplied or
+    return isMarkGlyph(gdef, prev) or !prev.is_multiplied or
         info.lig_id != prev.lig_id or info.lig_comp != prev.lig_comp + 1;
 }
 
@@ -504,7 +544,7 @@ fn applyGposMarkToLigature(
     else
         comp_count - 1;
 
-    return applyMarkAttach(mark_array, mark_index, lig_attach, class_count, comp_index, lig_pos, buffer, direction);
+    return applyMarkAttach(gdef, mark_array, mark_index, lig_attach, class_count, comp_index, lig_pos, buffer, direction);
 }
 
 /// Ports MarkMarkPos (MarkMarkPosFormat1.hh): attaches the current mark to
@@ -535,7 +575,7 @@ fn applyGposMarkToMark(
     // hb keeps the lookup's mark filtering but drops its IgnoreBase/
     // Ligatures/Marks bits, so the search stops at the first non-mark.
     const j = prevUnskipped(buffer, gdef, lookup_flags & ~@as(u32, 0x000E), skip, buffer.idx) orelse return false;
-    if (!isMarkGlyph(gdef, buffer.info.items[j].codepoint)) return false;
+    if (!isMarkGlyph(gdef, buffer.info.items[j])) return false;
     if (!sameLigatureComponent(buffer.info.items[buffer.idx], buffer.info.items[j])) return false;
 
     const mark2_glyph = buffer.info.items[j].codepoint;
@@ -547,7 +587,7 @@ fn applyGposMarkToMark(
     const mark1_array = try reader.subReaderAt(8);
     const mark2_array = try reader.subReaderAt(10);
 
-    return applyMarkAttach(mark1_array, mark1_index, mark2_array, class_count, mark2_index, j, buffer, direction);
+    return applyMarkAttach(gdef, mark1_array, mark1_index, mark2_array, class_count, mark2_index, j, buffer, direction);
 }
 
 /// Iteratively ports `reverse_cursive_minor_offset` (CursivePosFormat1.hh):
@@ -608,14 +648,14 @@ fn applyGposCursive(
     const this_index = try cov.get(gid) orelse return false;
     const record_count = try reader.u16At(4);
     if (this_index >= record_count) return false;
-    const entry_anchor = try readAnchor(reader, 6 + @as(usize, this_index) * 4) orelse return false;
+    const entry_anchor = try readAnchor(gdef, reader, 6 + @as(usize, this_index) * 4) orelse return false;
 
     const i = prevUnskipped(buffer, gdef, lookup_flags, skip, buffer.idx) orelse return false;
     const prev_glyph = buffer.info.items[i].codepoint;
     if (prev_glyph > std.math.maxInt(u16)) return false;
     const prev_index = try cov.get(@intCast(prev_glyph)) orelse return false;
     if (prev_index >= record_count) return false;
-    const exit_anchor = try readAnchor(reader, 6 + @as(usize, prev_index) * 4 + 2) orelse return false;
+    const exit_anchor = try readAnchor(gdef, reader, 6 + @as(usize, prev_index) * 4 + 2) orelse return false;
 
     const j = buffer.idx;
     switch (direction) {
@@ -681,7 +721,7 @@ fn valueRecordSize(format: u16) usize {
     return @as(usize, @popCount(@as(u8, @truncate(format)))) * 2;
 }
 
-fn applyValueRecord(reader: parsing.Table.Layout.SubtableReader, offset: usize, format: u16, pos: *GlyphPosition, direction: Direction) parsing.Font.ParseError!void {
+fn applyValueRecord(gdef: Gdef, reader: parsing.Table.Layout.SubtableReader, offset: usize, format: u16, pos: *GlyphPosition, direction: Direction) parsing.Font.ParseError!void {
     const horizontal = direction == .left_to_right or direction == .right_to_left;
     var rel = offset;
     if (format & 0x0001 != 0) {
@@ -700,11 +740,20 @@ fn applyValueRecord(reader: parsing.Table.Layout.SubtableReader, offset: usize, 
         if (!horizontal) pos.y_advance -= try reader.i16At(rel);
         rel += 2;
     }
-    // xPlaDevice/yPlaDevice/xAdvDevice/yAdvDevice (0x0010/0x0020/0x0040/
-    // 0x0080): byte-skipped for record sizing, not applied - see this
-    // section's doc comment.
-    inline for (.{ 0x0010, 0x0020, 0x0040, 0x0080 }) |bit| {
-        if (format & bit != 0) rel += 2;
+    if (format & 0x0010 != 0) {
+        pos.x_offset += deviceDelta(gdef, reader, try reader.u16At(rel));
+        rel += 2;
+    }
+    if (format & 0x0020 != 0) {
+        pos.y_offset += deviceDelta(gdef, reader, try reader.u16At(rel));
+        rel += 2;
+    }
+    if (format & 0x0040 != 0) {
+        if (horizontal) pos.x_advance += deviceDelta(gdef, reader, try reader.u16At(rel));
+        rel += 2;
+    }
+    if (format & 0x0080 != 0) {
+        if (!horizontal) pos.y_advance -= deviceDelta(gdef, reader, try reader.u16At(rel));
     }
 }
 
@@ -1431,10 +1480,10 @@ fn applyGsubSubtable(
                 // A base (or a mark) that swallowed nothing but marks stays
                 // a base (or a mark), so later marks can still attach to it;
                 // anything else is a real ligature worth tracking.
-                var is_base_ligature = glyphClass(gdef, buffer.info.items[match_positions[0]].codepoint) == 1;
-                var is_mark_ligature = isMarkGlyph(gdef, buffer.info.items[match_positions[0]].codepoint);
+                var is_base_ligature = infoGlyphClass(gdef, buffer.info.items[match_positions[0]]) == 1;
+                var is_mark_ligature = isMarkGlyph(gdef, buffer.info.items[match_positions[0]]);
                 for (match_positions[1..component_count]) |mp| {
-                    if (!isMarkGlyph(gdef, buffer.info.items[mp].codepoint)) {
+                    if (!isMarkGlyph(gdef, buffer.info.items[mp])) {
                         is_base_ligature = false;
                         is_mark_ligature = false;
                         break;
@@ -1549,7 +1598,7 @@ fn applyGposSubtable(
             switch (format) {
                 1 => {
                     const vf = try reader.u16At(4);
-                    try applyValueRecord(reader, 6, vf, buffer.curPos(0), direction);
+                    try applyValueRecord(gdef, reader, 6, vf, buffer.curPos(0), direction);
                     buffer.idx += 1;
                     return true;
                 },
@@ -1558,7 +1607,7 @@ fn applyGposSubtable(
                     const count = try reader.u16At(6);
                     if (idx >= count) return false;
                     const stride = valueRecordSize(vf);
-                    try applyValueRecord(reader, 8 + idx * stride, vf, buffer.curPos(0), direction);
+                    try applyValueRecord(gdef, reader, 8 + idx * stride, vf, buffer.curPos(0), direction);
                     buffer.idx += 1;
                     return true;
                 },
@@ -1593,8 +1642,8 @@ fn applyGposSubtable(
                         const rec_off = 2 + @as(usize, mid) * rec_size;
                         const sg = try pset.u16At(rec_off);
                         if (sg == second_gid) {
-                            if (len1 > 0) try applyValueRecord(pset, rec_off + 2, vf1, buffer.curPos(0), direction);
-                            if (len2 > 0) try applyValueRecord(pset, rec_off + 2 + len1, vf2, buffer.curPos(second_pos_offset), direction);
+                            if (len1 > 0) try applyValueRecord(gdef, pset, rec_off + 2, vf1, buffer.curPos(0), direction);
+                            if (len2 > 0) try applyValueRecord(gdef, pset, rec_off + 2 + len1, vf2, buffer.curPos(second_pos_offset), direction);
                             buffer.idx = next + @as(usize, if (len2 > 0) 1 else 0);
                             return true;
                         }
@@ -1616,8 +1665,8 @@ fn applyGposSubtable(
                     const len2 = valueRecordSize(vf2);
                     const rec_size = len1 + len2;
                     const rec_off = 16 + (@as(usize, k1) * class2count + k2) * rec_size;
-                    if (len1 > 0) try applyValueRecord(reader, rec_off, vf1, buffer.curPos(0), direction);
-                    if (len2 > 0) try applyValueRecord(reader, rec_off + len1, vf2, buffer.curPos(second_pos_offset), direction);
+                    if (len1 > 0) try applyValueRecord(gdef, reader, rec_off, vf1, buffer.curPos(0), direction);
+                    if (len2 > 0) try applyValueRecord(gdef, reader, rec_off + len1, vf2, buffer.curPos(second_pos_offset), direction);
                     buffer.idx = next + @as(usize, if (len2 > 0) 1 else 0);
                     return true;
                 },
@@ -1800,12 +1849,16 @@ pub fn applyStage(
     const data = font.tableData(tag) orelse return;
     const layout = parsing.Table.Layout{ .data = data };
     buffer.updateDigest();
+    // Recomputed per stage: a buffer's cached classes may come from another font.
+    for (buffer.info.items) |*info| info.gdef_class_glyph = std.math.maxInt(u32);
+    refreshGlyphClasses(buffer.info.items, gdef);
     for (map.getStageLookups(table_index, stage)) |entry| {
         // Substitutions during this pass only ever add glyphs to the buffer
         // digest, so a lookup skipped here could not have matched earlier in
         // the pass either.
         if (!entry.digest.mayIntersect(buffer.digest)) continue;
         try applyLookup(layout, entry, gdef, buffer, table_index, direction);
+        if (table_index == 0) refreshGlyphClasses(buffer.info.items, gdef);
     }
 }
 
@@ -1974,7 +2027,7 @@ pub const HorizontalMetrics = struct {
         const glyph_id: u16 = @intCast(glyph & 0xFFFF);
         const advance_width: i32 = parsing.Table.hmtx.metricForGlyph(self.hmtx, glyph_id, self.number_of_h_metrics).advance_width;
         const hv = self.hvar orelse return advance_width;
-        return advance_width + @as(i32, @intFromFloat(@round(parsing.Table.HVAR.advanceWidthDelta(hv, glyph_id, self.normalized_coords))));
+        return advance_width + @as(i32, @intFromFloat(hbRound(parsing.Table.HVAR.advanceWidthDelta(hv, glyph_id, self.normalized_coords))));
     }
 };
 
@@ -2055,7 +2108,7 @@ fn applySpaceFallbackAdvances(
 /// zeroed, offsets just not backfilled) in the rare no-GPOS one.
 pub fn zeroMarkWidthsByGdef(buffer: *Buffer, gdef: Gdef) void {
     for (buffer.info.items, buffer.pos.items) |glyph_info, *pos| {
-        if (isMarkGlyph(gdef, glyph_info.codepoint)) {
+        if (glyphClass(gdef, glyph_info.codepoint) == 3) {
             pos.x_advance = 0;
             pos.y_advance = 0;
         }

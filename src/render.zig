@@ -636,10 +636,14 @@ pub fn normalizedCoords(
         scratch_allocator.free(segments);
     };
 
+    // hb_ot_var_normalize_variations: 16.16 through avar, then F2Dot14, so
+    // variation deltas round the same way hb's do.
     for (axes, 0..) |axis, i| {
-        var n = parsing.Table.fvar.normalizeAxisValue(axis, userValueForAxis(axis, user_coords, ppem));
-        if (i < segments.len) n = parsing.Table.avar.mapValue(segments[i], n);
-        coords[i] = n;
+        // hb's roundf is floor(x + 0.5).
+        var fixed = @floor(parsing.Table.fvar.normalizeAxisValue(axis, userValueForAxis(axis, user_coords, ppem)) * 65536.0 + 0.5);
+        if (i < segments.len) fixed = @floor(parsing.Table.avar.mapValue(segments[i], fixed / 65536.0) * 65536.0 + 0.5);
+        const f2dot14 = (@as(i32, @intFromFloat(fixed)) + 2) >> 2;
+        coords[i] = @as(f32, @floatFromInt(f2dot14)) / 16384.0;
     }
     return coords;
 }
