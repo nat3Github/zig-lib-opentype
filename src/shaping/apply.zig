@@ -1763,20 +1763,21 @@ fn isReverseLookup(layout: parsing.Table.Layout, lk: parsing.Table.Layout.Lookup
 /// The digest may only over-approximate: anything unreadable here yields a
 /// full digest, which filters nothing and leaves the walk exactly as it was.
 ///
-/// Also appends one digest per subtable to `subtable_digests` (hb's
+/// Also appends one `SubtableInfo` per subtable (hb's
 /// `hb_accelerate_subtables_context_t`), so `applyLookup` skips a subtable
-/// whose Coverage can't hold the current glyph. On a read error nothing is
-/// appended and the full digest is returned.
+/// whose Coverage can't hold the current glyph and applies the rest without
+/// re-reading their headers. On a read error nothing is appended and the
+/// full digest is returned, which puts `applyLookup` back on the slow path.
 pub fn lookupDigest(
     allocator: std.mem.Allocator,
     layout: parsing.Table.Layout,
     lookup_index: u16,
     table_index: u1,
-    subtable_digests: *std.ArrayList(common.Digest),
+    subtables: *std.ArrayList(common.SubtableInfo),
 ) error{OutOfMemory}!common.Digest {
-    const start = subtable_digests.items.len;
-    const digest = collectSubtableDigests(allocator, layout, lookup_index, table_index, subtable_digests) catch |err| {
-        subtable_digests.shrinkRetainingCapacity(start);
+    const start = subtables.items.len;
+    const digest = collectSubtableDigests(allocator, layout, lookup_index, table_index, subtables) catch |err| {
+        subtables.shrinkRetainingCapacity(start);
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .full();
     };
@@ -1788,7 +1789,7 @@ fn collectSubtableDigests(
     layout: parsing.Table.Layout,
     lookup_index: u16,
     table_index: u1,
-    subtable_digests: *std.ArrayList(common.Digest),
+    subtables: *std.ArrayList(common.SubtableInfo),
 ) (parsing.Font.ParseError || error{ OutOfMemory, Unfilterable })!common.Digest {
     const extension_tag: u16 = if (table_index == 0) gsub_tag_extension else gpos_tag_extension;
     const context_tag: u16 = if (table_index == 0) gsub_tag_context else gpos_tag_context;
@@ -1799,7 +1800,7 @@ fn collectSubtableDigests(
     const lookup_type = try lk.lookupType();
     const sub_count = try lk.subtableCount();
     // Bounded by the font: each subtable costs its lookup two bytes of offset.
-    try subtable_digests.ensureUnusedCapacity(allocator, sub_count);
+    try subtables.ensureUnusedCapacity(allocator, sub_count);
 
     var si: u16 = 0;
     while (si < sub_count) : (si += 1) {
@@ -1827,7 +1828,8 @@ fn collectSubtableDigests(
         var sub_digest: common.Digest = .{};
         try cov.collectRanges(&sub_digest);
         digest.unionWith(sub_digest);
-        subtable_digests.appendAssumeCapacity(sub_digest);
+        if (reader.offset > std.math.maxInt(u32)) return error.InvalidTableFormat;
+        subtables.appendAssumeCapacity(.{ .digest = sub_digest, .offset = @intCast(reader.offset), .lookup_type = effective_type });
     }
     return digest;
 }
@@ -1839,7 +1841,7 @@ fn applyLookup(
     buffer: *Buffer,
     table_index: u1,
     direction: Direction,
-    subtable_digests: []const common.Digest,
+    subtables: []const common.SubtableInfo,
 ) (parsing.Font.ParseError || error{OutOfMemory})!void {
     const lk = try layout.lookupAt(entry.index);
     const lookup_type = try lk.lookupType();
@@ -1858,9 +1860,13 @@ fn applyLookup(
             {
                 var si: u16 = 0;
                 while (si < sub_count) : (si += 1) {
-                    if (si < subtable_digests.len and !subtable_digests[si].mayHave(buffer.info.items[idx].codepoint)) continue;
-                    const sub_off = try lk.subtableOffset(si);
-                    if (try applyGsubSubtable(layout, lookup_type, sub_off, entry.mask, entry.random, joiners, buffer, gdef, lookup_flags, max_nesting_level)) break;
+                    var sub_type = lookup_type;
+                    const sub_off = if (si < subtables.len) blk: {
+                        if (!subtables[si].digest.mayHave(buffer.info.items[idx].codepoint)) continue;
+                        sub_type = subtables[si].lookup_type;
+                        break :blk @as(usize, subtables[si].offset);
+                    } else try lk.subtableOffset(si);
+                    if (try applyGsubSubtable(layout, sub_type, sub_off, entry.mask, entry.random, joiners, buffer, gdef, lookup_flags, max_nesting_level)) break;
                 }
             }
             if (idx == 0) break;
@@ -1879,12 +1885,16 @@ fn applyLookup(
         {
             var si: u16 = 0;
             while (si < sub_count) : (si += 1) {
-                if (si < subtable_digests.len and !subtable_digests[si].mayHave(buffer.info.items[buffer.idx].codepoint)) continue;
-                const sub_off = try lk.subtableOffset(si);
+                var sub_type = lookup_type;
+                const sub_off = if (si < subtables.len) blk: {
+                    if (!subtables[si].digest.mayHave(buffer.info.items[buffer.idx].codepoint)) continue;
+                    sub_type = subtables[si].lookup_type;
+                    break :blk @as(usize, subtables[si].offset);
+                } else try lk.subtableOffset(si);
                 applied = if (table_index == 0)
-                    try applyGsubSubtable(layout, lookup_type, sub_off, entry.mask, entry.random, joiners, buffer, gdef, lookup_flags, max_nesting_level)
+                    try applyGsubSubtable(layout, sub_type, sub_off, entry.mask, entry.random, joiners, buffer, gdef, lookup_flags, max_nesting_level)
                 else
-                    try applyGposSubtable(layout, lookup_type, sub_off, joiners, gdef, lookup_flags, buffer, direction, max_nesting_level);
+                    try applyGposSubtable(layout, sub_type, sub_off, joiners, gdef, lookup_flags, buffer, direction, max_nesting_level);
                 if (applied) break;
             }
         }
@@ -1911,8 +1921,8 @@ pub fn applyStage(
         // digest, so a lookup skipped here could not have matched earlier in
         // the pass either.
         if (!entry.digest.mayIntersect(buffer.digest)) continue;
-        const subtable_digests = map.subtable_digests.items[entry.subtable_digests_start..][0..entry.subtable_digests_len];
-        try applyLookup(layout, entry, gdef, buffer, table_index, direction, subtable_digests);
+        const subtables = map.subtables.items[entry.subtables_start..][0..entry.subtables_len];
+        try applyLookup(layout, entry, gdef, buffer, table_index, direction, subtables);
     }
 }
 
@@ -1994,6 +2004,9 @@ pub fn featureWouldSubstitute(
     const data = font.tableData(table_tag_gsub) orelse return false;
     const layout = parsing.Table.Layout{ .data = data };
     for (map.getStageLookups(0, stage)) |entry| {
+        // A lookup whose coverage can't hold the first glyph can't match the
+        // sequence either; the Indic shaper asks this of every consonant.
+        if (glyphs.len != 0 and !entry.digest.mayHave(glyphs[0])) continue;
         if (try lookupWouldSubstitute(layout, entry.index, glyphs)) return true;
     }
     return false;

@@ -78,10 +78,10 @@ pub const LookupMapEntry = struct {
     /// (the map builder has no reason to walk subtables). Left full so an
     /// unfilled entry filters nothing.
     digest: common.Digest = common.Digest.full(),
-    /// This lookup's per-subtable digests in `Map.subtable_digests`; an empty
+    /// This lookup's entries in `Map.subtables`; an empty
     /// range filters nothing.
-    subtable_digests_start: u32 = 0,
-    subtable_digests_len: u32 = 0,
+    subtables_start: u32 = 0,
+    subtables_len: u32 = 0,
     auto_zwnj: bool = true,
     auto_zwj: bool = true,
     random: bool = false,
@@ -117,11 +117,11 @@ pub const Map = struct {
     features: std.ArrayList(FeatureMapEntry) = .empty,
     lookups: [2]std.ArrayList(LookupMapEntry) = .{ .empty, .empty },
     stages: [2]std.ArrayList(StageMapEntry) = .{ .empty, .empty },
-    subtable_digests: std.ArrayList(common.Digest) = .empty,
+    subtables: std.ArrayList(common.SubtableInfo) = .empty,
 
     pub fn deinit(self: *Map, allocator: std.mem.Allocator) void {
         self.features.deinit(allocator);
-        self.subtable_digests.deinit(allocator);
+        self.subtables.deinit(allocator);
         for (&self.lookups) |*l| l.deinit(allocator);
         for (&self.stages) |*s| s.deinit(allocator);
         self.* = undefined;

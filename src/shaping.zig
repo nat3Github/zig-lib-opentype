@@ -200,10 +200,10 @@ fn fillLookupDigests(allocator: std.mem.Allocator, font: parsing.Font, map: *Map
         if (font.tableData(tag)) |data| {
             const layout = parsing.Table.Layout{ .data = data };
             for (map.lookups[table_index].items) |*entry| {
-                const start = map.subtable_digests.items.len;
-                entry.digest = try apply_mod.lookupDigest(allocator, layout, entry.index, table_index, &map.subtable_digests);
-                entry.subtable_digests_start = @intCast(start);
-                entry.subtable_digests_len = @intCast(map.subtable_digests.items.len - start);
+                const start = map.subtables.items.len;
+                entry.digest = try apply_mod.lookupDigest(allocator, layout, entry.index, table_index, &map.subtables);
+                entry.subtables_start = @intCast(start);
+                entry.subtables_len = @intCast(map.subtables.items.len - start);
             }
         }
     }

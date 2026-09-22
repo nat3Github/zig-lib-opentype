@@ -1034,6 +1034,16 @@ pub fn isIgnorable(info: GlyphInfo) bool {
     return info.is_default_ignorable and !info.is_substituted;
 }
 
+/// One GSUB/GPOS subtable, resolved once at plan time (hb's
+/// `hb_ot_layout_lookup_accelerator_t` entry): its set digest plus the
+/// extension-unwrapped offset and type, so applying it to a glyph needs no
+/// header re-read.
+pub const SubtableInfo = struct {
+    digest: Digest,
+    offset: u32,
+    lookup_type: u16,
+};
+
 pub fn combiningClassOf(info: *GlyphInfo) u8 {
     if (info.ccc_codepoint != info.codepoint) {
         info.ccc = unicode.modifiedCombiningClass(@intCast(info.codepoint));
