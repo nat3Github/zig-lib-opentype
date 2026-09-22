@@ -14,6 +14,9 @@ const NormalizeContext = struct {
     cmap: ?Cmap,
     /// hb's per-shaper `decompose` override (`decompose_indic`/`decompose_khmer`).
     decompose_override: DecomposeOverride = .none,
+    /// `compose_hebrew`'s fallback half, which hb runs only when the font
+    /// has no GPOS 'mark' feature to position the points itself.
+    hebrew_presentation_forms: bool = false,
 
     /// Ported from `decompose_indic`'s explicit "don't decompose these"
     /// cases: these four are letters in their own right, and splitting them
@@ -41,7 +44,9 @@ const NormalizeContext = struct {
     /// `compose_indic` recomposes this composition exclusion anyway.
     fn compose(self: NormalizeContext, a: u21, b: u21) ?u21 {
         if (self.decompose_override == .indic and a == 0x09AF and b == 0x09BC) return 0x09DF;
-        return unicode.composeCanonical(a, b);
+        if (unicode.composeCanonical(a, b)) |ab| return ab;
+        if (self.hebrew_presentation_forms) return composeHebrew(a, b);
+        return null;
     }
 
     fn variationGlyph(self: NormalizeContext, codepoint: u21, selector: u21) ?u32 {
@@ -54,6 +59,50 @@ const NormalizeContext = struct {
         return resolved.lookup(codepoint) orelse null;
     }
 };
+
+/// Ported from `compose_hebrew`'s fallback: Hebrew presentation forms that
+/// canonical composition excludes, but that old fonts without GPOS mark
+/// positioning still rely on.
+fn composeHebrew(a: u21, b: u21) ?u21 {
+    const dagesh_forms = [_]u21{
+        0xFB30, 0xFB31, 0xFB32, 0xFB33, 0xFB34, 0xFB35, 0xFB36, 0x0000, 0xFB38,
+        0xFB39, 0xFB3A, 0xFB3B, 0xFB3C, 0x0000, 0xFB3E, 0x0000, 0xFB40, 0xFB41,
+        0x0000, 0xFB43, 0xFB44, 0x0000, 0xFB46, 0xFB47, 0xFB48, 0xFB49, 0xFB4A,
+    };
+    return switch (b) {
+        0x05B4 => if (a == 0x05D9) 0xFB1D else null, // HIRIQ
+        0x05B7 => switch (a) { // PATAH
+            0x05F2 => 0xFB1F,
+            0x05D0 => 0xFB2E,
+            else => null,
+        },
+        0x05B8 => if (a == 0x05D0) 0xFB2F else null, // QAMATS
+        0x05B9 => if (a == 0x05D5) 0xFB4B else null, // HOLAM
+        0x05BC => switch (a) { // DAGESH
+            0x05D0...0x05EA => if (dagesh_forms[a - 0x05D0] != 0) dagesh_forms[a - 0x05D0] else null,
+            0xFB2A => 0xFB2C,
+            0xFB2B => 0xFB2D,
+            else => null,
+        },
+        0x05BF => switch (a) { // RAFE
+            0x05D1 => 0xFB4C,
+            0x05DB => 0xFB4D,
+            0x05E4 => 0xFB4E,
+            else => null,
+        },
+        0x05C1 => switch (a) { // SHIN DOT
+            0x05E9 => 0xFB2A,
+            0xFB49 => 0xFB2C,
+            else => null,
+        },
+        0x05C2 => switch (a) { // SIN DOT
+            0x05E9 => 0xFB2B,
+            0xFB49 => 0xFB2D,
+            else => null,
+        },
+        else => null,
+    };
+}
 
 /// Ported from output_char: appends a copy of the not-yet-consumed current
 /// input glyph to the output (cluster/mask carried over, same as
@@ -341,11 +390,11 @@ fn normalizeRecomposeRound(ctx: NormalizeContext, buffer: *Buffer, block_mark_re
 pub const Mode = enum { none, composed_diacritics, composed_diacritics_no_short_circuit };
 pub const ReorderMarks = enum { none, arabic, hebrew };
 
-pub fn normalize(buffer: *Buffer, cmap: ?Cmap, mode: Mode, block_mark_recompose: bool, decompose_override: DecomposeOverride, reorder_marks: ReorderMarks) !void {
+pub fn normalize(buffer: *Buffer, cmap: ?Cmap, mode: Mode, block_mark_recompose: bool, decompose_override: DecomposeOverride, reorder_marks: ReorderMarks, hebrew_presentation_forms: bool) !void {
     if (buffer.info.items.len == 0) return;
     const always_short_circuit = mode == .none;
     const might_short_circuit = mode != .composed_diacritics_no_short_circuit;
-    const ctx = NormalizeContext{ .cmap = cmap, .decompose_override = decompose_override };
+    const ctx = NormalizeContext{ .cmap = cmap, .decompose_override = decompose_override, .hebrew_presentation_forms = hebrew_presentation_forms };
 
     var all_simple = true;
     buffer.clearOutput();

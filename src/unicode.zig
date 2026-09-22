@@ -2140,6 +2140,11 @@ pub fn isArabicWordCategory(codepoint: u21) bool {
     return packedContains(&tables.arabic_word_ranges, codepoint);
 }
 
+/// General_Category Nd.
+pub fn isDecimalNumber(codepoint: u21) bool {
+    return packedContains(&tables.decimal_number_ranges, codepoint);
+}
+
 /// Ported from hb-unicode.hh's `is_default_ignorable` - a hardcoded
 /// approximation of Default_Ignorable_Code_Point (see that function's
 /// comment for the exact character list this covers).

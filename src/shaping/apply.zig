@@ -165,10 +165,21 @@ fn infoGlyphClass(gdef: Gdef, info: GlyphInfo) u16 {
     return glyphClass(gdef, info.codepoint);
 }
 
+fn markAttachClass(gdef: Gdef, glyph: u16) u16 {
+    const cd = gdef.mark_attach orelse return 0;
+    return cd.getClass(glyph) catch 0;
+}
+
+/// Drops every cached class; the next `applyStage` recomputes them.
+pub fn resetGlyphClasses(infos: []GlyphInfo) void {
+    for (infos) |*info| info.gdef_class_glyph = std.math.maxInt(u32);
+}
+
 fn refreshGlyphClasses(infos: []GlyphInfo, gdef: Gdef) void {
     for (infos) |*info| {
         if (info.gdef_class_glyph == info.codepoint) continue;
         info.gdef_class = glyphClass(gdef, info.codepoint);
+        info.gdef_mark_attach_class = if (info.codepoint > std.math.maxInt(u16)) 0 else markAttachClass(gdef, @intCast(info.codepoint));
         info.gdef_class_glyph = info.codepoint;
     }
 }
@@ -246,8 +257,8 @@ fn filteredByLookupProps(info: GlyphInfo, gdef: Gdef, lookup_flags: u32) bool {
         return !(sets.covers(@truncate(lookup_flags >> 16), glyph) catch false);
     }
     if (lookup_flags & 0xFF00 != 0) {
-        const cd = gdef.mark_attach orelse return true;
-        const attach = cd.getClass(glyph) catch 0;
+        if (gdef.mark_attach == null) return true;
+        const attach = if (info.gdef_class_glyph == info.codepoint) info.gdef_mark_attach_class else markAttachClass(gdef, glyph);
         return (lookup_flags & 0xFF00) != (@as(u32, attach) << 8);
     }
     return false;
@@ -1740,40 +1751,72 @@ fn isReverseLookup(layout: parsing.Table.Layout, lk: parsing.Table.Layout.Lookup
 ///
 /// The digest may only over-approximate: anything unreadable here yields a
 /// full digest, which filters nothing and leaves the walk exactly as it was.
-pub fn lookupDigest(layout: parsing.Table.Layout, lookup_index: u16, table_index: u1) common.Digest {
+///
+/// Also appends one digest per subtable to `subtable_digests` (hb's
+/// `hb_accelerate_subtables_context_t`), so `applyLookup` skips a subtable
+/// whose Coverage can't hold the current glyph. On a read error nothing is
+/// appended and the full digest is returned.
+pub fn lookupDigest(
+    allocator: std.mem.Allocator,
+    layout: parsing.Table.Layout,
+    lookup_index: u16,
+    table_index: u1,
+    subtable_digests: *std.ArrayList(common.Digest),
+) error{OutOfMemory}!common.Digest {
+    const start = subtable_digests.items.len;
+    const digest = collectSubtableDigests(allocator, layout, lookup_index, table_index, subtable_digests) catch |err| {
+        subtable_digests.shrinkRetainingCapacity(start);
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return .full();
+    };
+    return digest;
+}
+
+fn collectSubtableDigests(
+    allocator: std.mem.Allocator,
+    layout: parsing.Table.Layout,
+    lookup_index: u16,
+    table_index: u1,
+    subtable_digests: *std.ArrayList(common.Digest),
+) (parsing.Font.ParseError || error{ OutOfMemory, Unfilterable })!common.Digest {
     const extension_tag: u16 = if (table_index == 0) gsub_tag_extension else gpos_tag_extension;
     const context_tag: u16 = if (table_index == 0) gsub_tag_context else gpos_tag_context;
     const chain_context_tag: u16 = if (table_index == 0) gsub_tag_chain_context else gpos_tag_chain_context;
 
     var digest: common.Digest = .{};
-    const lk = layout.lookupAt(lookup_index) catch return .full();
-    const lookup_type = lk.lookupType() catch return .full();
-    const sub_count = lk.subtableCount() catch return .full();
+    const lk = try layout.lookupAt(lookup_index);
+    const lookup_type = try lk.lookupType();
+    const sub_count = try lk.subtableCount();
+    // Bounded by the font: each subtable costs its lookup two bytes of offset.
+    try subtable_digests.ensureUnusedCapacity(allocator, sub_count);
 
     var si: u16 = 0;
     while (si < sub_count) : (si += 1) {
-        const sub_off = lk.subtableOffset(si) catch return .full();
+        const sub_off = try lk.subtableOffset(si);
         var reader = parsing.Table.Layout.SubtableReader{ .data = layout.data, .offset = sub_off };
         var effective_type = lookup_type;
         if (effective_type == extension_tag) {
-            const unwrapped = (unwrapExtension(reader, extension_tag) catch return .full()) orelse return .full();
+            const unwrapped = (try unwrapExtension(reader, extension_tag)) orelse return error.Unfilterable;
             effective_type = unwrapped.lookup_type;
             reader = .{ .data = layout.data, .offset = unwrapped.sub_off };
         }
-        const format = reader.u16At(0) catch return .full();
+        const format = try reader.u16At(0);
         // Every subtable format keeps its input Coverage at offset 2 except
         // Context/ChainContext format 3, where offset 2 is a glyph count and
         // the coverage offsets follow the counts.
         const coverage_rel: usize = if (format == 3 and (effective_type == context_tag or effective_type == chain_context_tag)) blk: {
-            const offs = (if (effective_type == context_tag)
+            const offs = try (if (effective_type == context_tag)
                 readContextFormat3Offsets(reader)
             else
-                readChainContextFormat3Offsets(reader)) catch return .full();
-            if (offs.input_count == 0) return .full();
+                readChainContextFormat3Offsets(reader));
+            if (offs.input_count == 0) return error.Unfilterable;
             break :blk offs.input_base;
         } else 2;
-        const cov = reader.coverageAt(coverage_rel) catch return .full();
-        cov.collectRanges(&digest) catch return .full();
+        const cov = try reader.coverageAt(coverage_rel);
+        var sub_digest: common.Digest = .{};
+        try cov.collectRanges(&sub_digest);
+        digest.unionWith(sub_digest);
+        subtable_digests.appendAssumeCapacity(sub_digest);
     }
     return digest;
 }
@@ -1785,6 +1828,7 @@ fn applyLookup(
     buffer: *Buffer,
     table_index: u1,
     direction: Direction,
+    subtable_digests: []const common.Digest,
 ) (parsing.Font.ParseError || error{OutOfMemory})!void {
     const lk = try layout.lookupAt(entry.index);
     const lookup_type = try lk.lookupType();
@@ -1803,6 +1847,7 @@ fn applyLookup(
             {
                 var si: u16 = 0;
                 while (si < sub_count) : (si += 1) {
+                    if (si < subtable_digests.len and !subtable_digests[si].mayHave(buffer.info.items[idx].codepoint)) continue;
                     const sub_off = try lk.subtableOffset(si);
                     if (try applyGsubSubtable(layout, lookup_type, sub_off, entry.mask, entry.random, joiners, buffer, gdef, lookup_flags, max_nesting_level)) break;
                 }
@@ -1823,6 +1868,7 @@ fn applyLookup(
         {
             var si: u16 = 0;
             while (si < sub_count) : (si += 1) {
+                if (si < subtable_digests.len and !subtable_digests[si].mayHave(buffer.info.items[buffer.idx].codepoint)) continue;
                 const sub_off = try lk.subtableOffset(si);
                 applied = if (table_index == 0)
                     try applyGsubSubtable(layout, lookup_type, sub_off, entry.mask, entry.random, joiners, buffer, gdef, lookup_flags, max_nesting_level)
@@ -1849,15 +1895,14 @@ pub fn applyStage(
     const data = font.tableData(tag) orelse return;
     const layout = parsing.Table.Layout{ .data = data };
     buffer.updateDigest();
-    // Recomputed per stage: a buffer's cached classes may come from another font.
-    for (buffer.info.items) |*info| info.gdef_class_glyph = std.math.maxInt(u32);
     refreshGlyphClasses(buffer.info.items, gdef);
     for (map.getStageLookups(table_index, stage)) |entry| {
         // Substitutions during this pass only ever add glyphs to the buffer
         // digest, so a lookup skipped here could not have matched earlier in
         // the pass either.
         if (!entry.digest.mayIntersect(buffer.digest)) continue;
-        try applyLookup(layout, entry, gdef, buffer, table_index, direction);
+        const subtable_digests = map.subtable_digests.items[entry.subtable_digests_start..][0..entry.subtable_digests_len];
+        try applyLookup(layout, entry, gdef, buffer, table_index, direction, subtable_digests);
         if (table_index == 0) refreshGlyphClasses(buffer.info.items, gdef);
     }
 }
@@ -2108,7 +2153,7 @@ fn applySpaceFallbackAdvances(
 /// zeroed, offsets just not backfilled) in the rare no-GPOS one.
 pub fn zeroMarkWidthsByGdef(buffer: *Buffer, gdef: Gdef) void {
     for (buffer.info.items, buffer.pos.items) |glyph_info, *pos| {
-        if (glyphClass(gdef, glyph_info.codepoint) == 3) {
+        if (isMarkGlyph(gdef, glyph_info)) {
             pos.x_advance = 0;
             pos.y_advance = 0;
         }

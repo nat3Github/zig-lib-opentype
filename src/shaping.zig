@@ -39,6 +39,7 @@ pub const MapFeatureFlags = map_mod.MapFeatureFlags;
 pub const FeatureMapEntry = map_mod.FeatureMapEntry;
 pub const LookupMapEntry = map_mod.LookupMapEntry;
 pub const StageMapEntry = map_mod.StageMapEntry;
+pub const findFeatureVariations = map_mod.findFeatureVariations;
 
 const containsTag = common.containsTag;
 const applyStage = apply_mod.applyStage;
@@ -193,13 +194,16 @@ pub fn shapeWithContext(
 /// selects. None of it depends on the text, so a caller shaping many runs
 /// against the same font can build it once and reuse it -- hb's
 /// `hb_shape_plan_t`.
-fn fillLookupDigests(font: parsing.Font, map: *Map) void {
+fn fillLookupDigests(allocator: std.mem.Allocator, font: parsing.Font, map: *Map) error{OutOfMemory}!void {
     inline for (0..2) |table_index| {
         const tag = if (table_index == 0) map_mod.table_tag_gsub else map_mod.table_tag_gpos;
         if (font.tableData(tag)) |data| {
             const layout = parsing.Table.Layout{ .data = data };
             for (map.lookups[table_index].items) |*entry| {
-                entry.digest = apply_mod.lookupDigest(layout, entry.index, table_index);
+                const start = map.subtable_digests.items.len;
+                entry.digest = try apply_mod.lookupDigest(allocator, layout, entry.index, table_index, &map.subtable_digests);
+                entry.subtable_digests_start = @intCast(start);
+                entry.subtable_digests_len = @intCast(map.subtable_digests.items.len - start);
             }
         }
     }
@@ -292,16 +296,27 @@ pub const Plan = struct {
             },
             .top_to_bottom, .bottom_to_top => {},
         }
+        // Automatic fractions: registered non-global, masked per run by
+        // setupMasksFraction.
+        try map_builder.addFeature(tag_frac, .{}, 1);
+        try map_builder.addFeature(tag_numr, .{}, 1);
+        try map_builder.addFeature(tag_dnom, .{}, 1);
         // 'rand' is registered at the maximum feature value, which is what
         // tells AlternateSubst to draw an alternate at random; a caller
         // passing rand=N in `extra_features` overrides that to a fixed N.
         try map_builder.enableFeature(.{ 'r', 'a', 'n', 'd' }, .{ .global = true, .random = true }, apply_mod.map_max_feature_value);
+        // hb's own debugging hooks: a font can hang lookups off these to see
+        // what ran before (Harf/HARF) and after (Buzz/BUZZ) the shaper.
+        try map_builder.enableFeature(.{ 'H', 'a', 'r', 'f' }, .{}, 1);
+        try map_builder.enableFeature(.{ 'H', 'A', 'R', 'F' }, .{}, 1);
         if (is_hangul) try collectFeaturesHangul(&map_builder);
         if (is_arabic) try collectFeaturesArabic(&map_builder, containsTag(script_tags, arab_script_tag));
         if (indic_config != null) try collectFeaturesIndic(&map_builder);
         if (is_khmer) try collectFeaturesKhmer(&map_builder);
         if (is_myanmar) try collectFeaturesMyanmar(&map_builder);
         if (is_use) try collectFeaturesUse(&map_builder);
+        try map_builder.enableFeature(.{ 'B', 'u', 'z', 'z' }, .{}, 1);
+        try map_builder.enableFeature(.{ 'B', 'U', 'Z', 'Z' }, .{}, 1);
         for (default_features) |tag| {
             // hb's common_features: mark attachment doesn't step over joiners.
             const manual_joiners = std.mem.eql(u8, &tag, "mark") or std.mem.eql(u8, &tag, "mkmk");
@@ -314,7 +329,7 @@ pub const Plan = struct {
 
         var map = try map_builder.compile(allocator);
         errdefer map.deinit(allocator);
-        fillLookupDigests(font, &map);
+        try fillLookupDigests(allocator, font, &map);
 
         return .{
             .map = map,
@@ -426,17 +441,6 @@ fn shapeImpl(
     item: ?Item,
     plans: ?Plans,
 ) (parsing.Font.ParseError || error{OutOfMemory})!Buffer {
-    var buffer = Buffer.init(allocator);
-    errdefer buffer.deinit();
-
-    // Glyph count starts 1:1 with codepoints; presizing avoids the ~log2(n)
-    // growth reallocations `.add()` would otherwise trigger per call.
-    try buffer.info.ensureTotalCapacityPrecise(allocator, codepoints.len);
-    try buffer.out_info.ensureTotalCapacityPrecise(allocator, codepoints.len);
-
-    for (codepoints, 0..) |cp, i| try buffer.add(cp, @intCast(i));
-    formClusters(&buffer);
-
     // The plan only depends on font+tags, not on buffer glyph content, so it
     // is built before any shaper preprocessing (vs. a naive
     // preprocess-then-map order) both to give setupMasksHangul a chance to
@@ -455,6 +459,45 @@ fn shapeImpl(
         owned_plan = try Plan.init(allocator, font, script_tags, language_tags, extra_features, direction, variations_index);
         break :blk &owned_plan.?;
     };
+    return shapeWithPlanImpl(allocator, font, plan, codepoints, direction, script_tags, normalized_coords, item);
+}
+
+/// Shapes against a caller-built `Plan`, skipping the plan-cache lookup:
+/// hb's `hb_shape_plan_execute`. `plan` must have been built for this
+/// `font`, `direction`, `script_tags` and the FeatureVariations record
+/// `normalized_coords` selects.
+pub fn shapeWithPlan(
+    allocator: std.mem.Allocator,
+    font: parsing.Font,
+    plan: *const Plan,
+    codepoints: []const u21,
+    direction: Direction,
+    script_tags: []const Tag,
+    normalized_coords: []const f32,
+) (parsing.Font.ParseError || error{OutOfMemory})!Buffer {
+    return shapeWithPlanImpl(allocator, font, plan, codepoints, direction, script_tags, normalized_coords, null);
+}
+
+fn shapeWithPlanImpl(
+    allocator: std.mem.Allocator,
+    font: parsing.Font,
+    plan: *const Plan,
+    codepoints: []const u21,
+    direction: Direction,
+    script_tags: []const Tag,
+    normalized_coords: []const f32,
+    item: ?Item,
+) (parsing.Font.ParseError || error{OutOfMemory})!Buffer {
+    var buffer = Buffer.init(allocator);
+    errdefer buffer.deinit();
+
+    // Glyph count starts 1:1 with codepoints; presizing avoids the ~log2(n)
+    // growth reallocations `.add()` would otherwise trigger per call.
+    try buffer.info.ensureTotalCapacityPrecise(allocator, codepoints.len);
+    try buffer.out_info.ensureTotalCapacityPrecise(allocator, codepoints.len);
+
+    for (codepoints, 0..) |cp, i| try buffer.add(cp, @intCast(i));
+    formClusters(&buffer);
 
     const map = plan.map;
     const cmap = plan.cmap;
@@ -488,7 +531,13 @@ fn shapeImpl(
     else
         .composed_diacritics;
     const block_mark_recompose = indic_config != null or is_khmer or is_use;
-    try normalize(&buffer, cmap, normalization_mode, block_mark_recompose, if (indic_config != null) .indic else if (is_khmer) .khmer else .none, if (is_arabic) .arabic else if (containsTag(script_tags, .{ 'h', 'e', 'b', 'r' })) .hebrew else .none);
+    const is_hebrew = containsTag(script_tags, .{ 'h', 'e', 'b', 'r' });
+    // compose_hebrew's presentation-form fallback: only for legacy fonts
+    // that have no GPOS 'mark' feature to position the points themselves.
+    const hebrew_presentation_forms = is_hebrew and map.get1Mask(.{ 'm', 'a', 'r', 'k' }) == 0;
+    try normalize(&buffer, cmap, normalization_mode, block_mark_recompose, if (indic_config != null) .indic else if (is_khmer) .khmer else .none, if (is_arabic) .arabic else if (is_hebrew) .hebrew else .none, hebrew_presentation_forms);
+
+    setupMasksFraction(&buffer, map, direction);
 
     if (is_hangul) setupMasksHangul(&buffer, map);
     if (is_arabic) setupMasksArabic(&buffer, map);
@@ -549,6 +598,40 @@ fn shapeImpl(
 }
 
 const tag_rtlm = Tag{ 'r', 't', 'l', 'm' };
+const tag_frac = Tag{ 'f', 'r', 'a', 'c' };
+const tag_numr = Tag{ 'n', 'u', 'm', 'r' };
+const tag_dnom = Tag{ 'd', 'n', 'o', 'm' };
+
+/// Ported from `hb_ot_shape_setup_masks_fraction`: a U+2044 FRACTION SLASH
+/// with decimal digits on both sides turns those digits into a numerator and
+/// a denominator run.
+fn setupMasksFraction(buffer: *Buffer, map: map_mod.Map, direction: Direction) void {
+    const frac_mask = map.get1Mask(tag_frac);
+    const numr_mask = map.get1Mask(tag_numr);
+    const dnom_mask = map.get1Mask(tag_dnom);
+    if (frac_mask == 0 and numr_mask == 0 and dnom_mask == 0) return;
+
+    const forward = direction == .left_to_right or direction == .top_to_bottom;
+    const pre_mask = if (forward) numr_mask | frac_mask else frac_mask | dnom_mask;
+    const post_mask = if (forward) frac_mask | dnom_mask else numr_mask | frac_mask;
+
+    const info = buffer.info.items;
+    var i: usize = 0;
+    while (i < info.len) : (i += 1) {
+        if (info[i].codepoint != 0x2044) continue;
+        var start = i;
+        var end = i + 1;
+        while (start > 0 and unicode.isDecimalNumber(@intCast(info[start - 1].codepoint))) start -= 1;
+        while (end < info.len and unicode.isDecimalNumber(@intCast(info[end].codepoint))) end += 1;
+        if (start == i or end == i + 1) continue;
+
+        buffer.unsafeToBreak(start, end);
+        for (info[start..i]) |*g| g.mask |= pre_mask;
+        info[i].mask |= frac_mask;
+        for (info[i + 1 .. end]) |*g| g.mask |= post_mask;
+        i = end - 1;
+    }
+}
 
 /// Ported from `hb_ot_rotate_chars`: in backward runs a character with a
 /// Bidi_Mirroring_Glyph the font covers is swapped for it; anything else is
@@ -574,6 +657,7 @@ fn applyGsub(
     indic_config: ?*const indic_mod.IndicScriptConfig,
     cmap: ?parsing.Table.cmap.Resolved,
 ) (parsing.Font.ParseError || error{OutOfMemory})!void {
+    apply_mod.resetGlyphClasses(buffer.info.items);
     var stage: u32 = 0;
     while (stage < map.stageCount(0)) : (stage += 1) {
         try applyStage(font, map, 0, gdef_classdef, buffer, direction, stage);
