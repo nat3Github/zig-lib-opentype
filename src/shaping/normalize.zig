@@ -17,13 +17,18 @@ const NormalizeContext = struct {
     /// `compose_hebrew`'s fallback half, which hb runs only when the font
     /// has no GPOS 'mark' feature to position the points itself.
     hebrew_presentation_forms: bool = false,
+    cached_codepoint: [64]u21 = @splat(not_unicode),
+    cached_glyph: [64]u32 = undefined,
+
+    const not_unicode = std.math.maxInt(u21);
+    const not_found = std.math.maxInt(u32);
 
     /// Ported from `decompose_indic`'s explicit "don't decompose these"
     /// cases: these four are letters in their own right, and splitting them
     /// leaves the syllable machine looking at a consonant plus a stray
     /// nukta/matra (a Tamil AU would shape as a broken cluster and take a
     /// dotted circle).
-    fn blocksDecomposition(self: NormalizeContext, ab: u21) bool {
+    fn blocksDecomposition(self: *NormalizeContext, ab: u21) bool {
         if (self.decompose_override != .indic) return false;
         return switch (ab) {
             0x0931, 0x09DC, 0x09DD, 0x0B94 => true,
@@ -33,7 +38,7 @@ const NormalizeContext = struct {
 
     /// Ported from `decompose_khmer`: split matras with no Unicode
     /// decomposition still carry the pre-base 0x17C1 part.
-    fn decompose(self: NormalizeContext, ab: u21) ?unicode.Decomposition {
+    fn decompose(self: *NormalizeContext, ab: u21) ?unicode.Decomposition {
         if (self.decompose_override == .khmer) switch (ab) {
             0x17BE, 0x17BF, 0x17C0, 0x17C4, 0x17C5 => return .{ .first = 0x17C1, .second = ab },
             else => {},
@@ -42,21 +47,29 @@ const NormalizeContext = struct {
     }
 
     /// `compose_indic` recomposes this composition exclusion anyway.
-    fn compose(self: NormalizeContext, a: u21, b: u21) ?u21 {
+    fn compose(self: *NormalizeContext, a: u21, b: u21) ?u21 {
         if (self.decompose_override == .indic and a == 0x09AF and b == 0x09BC) return 0x09DF;
         if (unicode.composeCanonical(a, b)) |ab| return ab;
         if (self.hebrew_presentation_forms) return composeHebrew(a, b);
         return null;
     }
 
-    fn variationGlyph(self: NormalizeContext, codepoint: u21, selector: u21) ?u32 {
+    fn variationGlyph(self: *NormalizeContext, codepoint: u21, selector: u21) ?u32 {
         const resolved = self.cmap orelse return null;
         return resolved.lookupVariation(codepoint, selector) orelse null;
     }
 
-    fn nominalGlyph(self: NormalizeContext, codepoint: u21) ?u32 {
+    /// hb's font-level nominal-glyph cache, direct-mapped: text repeats
+    /// characters and each miss is a cmap subtable search.
+    fn nominalGlyph(self: *NormalizeContext, codepoint: u21) ?u32 {
         const resolved = self.cmap orelse return null;
-        return resolved.lookup(codepoint) orelse null;
+        const slot = codepoint & 0x3F;
+        if (self.cached_codepoint[slot] != codepoint) {
+            self.cached_codepoint[slot] = codepoint;
+            self.cached_glyph[slot] = resolved.lookup(codepoint) orelse not_found;
+        }
+        const glyph = self.cached_glyph[slot];
+        return if (glyph == not_found) null else glyph;
     }
 };
 
@@ -130,7 +143,7 @@ fn nextChar(buffer: *Buffer, glyph: u32) !void {
 /// single unit). Unbounded recursion is safe here (unlike GSUB/GPOS lookup
 /// nesting): the decomposition chain is fixed Unicode data, not
 /// attacker/font-controlled, and UAX #15 guarantees it's finite and short.
-fn decomposeChar(ctx: NormalizeContext, buffer: *Buffer, shortest: bool, ab: u21) (error{OutOfMemory})!usize {
+fn decomposeChar(ctx: *NormalizeContext, buffer: *Buffer, shortest: bool, ab: u21) (error{OutOfMemory})!usize {
     if (ctx.blocksDecomposition(ab)) return 0;
     const dec = ctx.decompose(ab) orelse return 0;
     const a = dec.first;
@@ -169,7 +182,7 @@ fn decomposeChar(ctx: NormalizeContext, buffer: *Buffer, shortest: bool, ab: u21
 }
 
 /// Ported from decompose_current_character.
-fn decomposeCurrentChar(ctx: NormalizeContext, buffer: *Buffer, shortest: bool) !void {
+fn decomposeCurrentChar(ctx: *NormalizeContext, buffer: *Buffer, shortest: bool) !void {
     const u: u21 = @intCast(buffer.cur(0).codepoint);
 
     if (shortest) {
@@ -214,7 +227,7 @@ fn decomposeCurrentChar(ctx: NormalizeContext, buffer: *Buffer, shortest: bool) 
     try nextChar(buffer, 0);
 }
 
-fn decomposeMultiCharCluster(ctx: NormalizeContext, buffer: *Buffer, end: usize, shortest: bool) !void {
+fn decomposeMultiCharCluster(ctx: *NormalizeContext, buffer: *Buffer, end: usize, shortest: bool) !void {
     for (buffer.info.items[buffer.idx..end]) |info| {
         if (unicode.isVariationSelector(@intCast(info.codepoint))) return handleVariationSelectorCluster(ctx, buffer, end);
     }
@@ -224,7 +237,7 @@ fn decomposeMultiCharCluster(ctx: NormalizeContext, buffer: *Buffer, end: usize,
 /// Ported from `handle_variation_selector_cluster`: a cluster holding a
 /// variation selector is not normalized at all. A base+selector pair the
 /// font maps becomes one glyph; otherwise both pass through for GSUB.
-fn handleVariationSelectorCluster(ctx: NormalizeContext, buffer: *Buffer, end: usize) !void {
+fn handleVariationSelectorCluster(ctx: *NormalizeContext, buffer: *Buffer, end: usize) !void {
     while (buffer.idx + 1 < end) {
         const next: u21 = @intCast(buffer.cur(1).codepoint);
         if (!unicode.isVariationSelector(next)) {
@@ -246,7 +259,7 @@ fn handleVariationSelectorCluster(ctx: NormalizeContext, buffer: *Buffer, end: u
     if (buffer.idx < end) try nextChar(buffer, nominalOrNotdef(ctx, buffer));
 }
 
-fn nominalOrNotdef(ctx: NormalizeContext, buffer: *Buffer) u32 {
+fn nominalOrNotdef(ctx: *NormalizeContext, buffer: *Buffer) u32 {
     return ctx.nominalGlyph(@intCast(buffer.cur(0).codepoint)) orelse 0;
 }
 
@@ -330,7 +343,7 @@ fn reorderMarksArabic(buffer: *Buffer, run_start: usize, end: usize) void {
 /// left to right, trying to canonically compose each mark onto the most
 /// recent starter (ccc=0 glyph) unless something with a lower-or-equal
 /// combining class already sits between them (Unicode's "blocked" rule).
-fn normalizeRecomposeRound(ctx: NormalizeContext, buffer: *Buffer, block_mark_recompose: bool) !void {
+fn normalizeRecomposeRound(ctx: *NormalizeContext, buffer: *Buffer, block_mark_recompose: bool) !void {
     buffer.clearOutput();
     const count = buffer.info.items.len;
     var starter: usize = 0;
@@ -394,7 +407,8 @@ pub fn normalize(buffer: *Buffer, cmap: ?Cmap, mode: Mode, block_mark_recompose:
     if (buffer.info.items.len == 0) return;
     const always_short_circuit = mode == .none;
     const might_short_circuit = mode != .composed_diacritics_no_short_circuit;
-    const ctx = NormalizeContext{ .cmap = cmap, .decompose_override = decompose_override, .hebrew_presentation_forms = hebrew_presentation_forms };
+    var ctx_storage = NormalizeContext{ .cmap = cmap, .decompose_override = decompose_override, .hebrew_presentation_forms = hebrew_presentation_forms };
+    const ctx = &ctx_storage;
 
     var all_simple = true;
     buffer.clearOutput();
