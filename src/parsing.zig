@@ -3832,30 +3832,34 @@ pub const Table = struct {
                 }
             }
 
+            /// The whole record array is bounds-checked once here, so the
+            /// binary search below reads it without a per-probe check --
+            /// this runs for every glyph of every subtable application.
             pub fn get(self: Coverage, glyph: u16) Font.ParseError!?u16 {
                 const format = try self.u16At(self.offset);
+                const count = try self.u16At(self.offset + 2);
                 switch (format) {
                     1 => {
-                        const count = try self.u16At(self.offset + 2);
+                        const records = try recordArray(self.data, self.offset + 4, count, 2);
                         var lo: u16 = 0;
                         var hi: u16 = count;
                         while (lo < hi) {
                             const mid = lo + (hi - lo) / 2;
-                            const g = try self.u16At(self.offset + 4 + @as(usize, mid) * 2);
+                            const g = readU16At(records, @as(usize, mid) * 2);
                             if (g == glyph) return mid;
                             if (g < glyph) lo = mid + 1 else hi = mid;
                         }
                         return null;
                     },
                     2 => {
-                        const count = try self.u16At(self.offset + 2);
+                        const records = try recordArray(self.data, self.offset + 4, count, 6);
                         var lo: u16 = 0;
                         var hi: u16 = count;
                         while (lo < hi) {
                             const mid = lo + (hi - lo) / 2;
-                            const rec_pos = self.offset + 4 + @as(usize, mid) * 6;
-                            const start = try self.u16At(rec_pos);
-                            const end = try self.u16At(rec_pos + 2);
+                            const rec_pos = @as(usize, mid) * 6;
+                            const start = readU16At(records, rec_pos);
+                            const end = readU16At(records, rec_pos + 2);
                             if (glyph < start) {
                                 hi = mid;
                                 continue;
@@ -3864,8 +3868,7 @@ pub const Table = struct {
                                 lo = mid + 1;
                                 continue;
                             }
-                            const start_cov = try self.u16At(rec_pos + 4);
-                            const index = @as(u32, start_cov) + (glyph - start);
+                            const index = @as(u32, readU16At(records, rec_pos + 4)) + (glyph - start);
                             if (index > std.math.maxInt(u16)) return error.InvalidTableFormat;
                             return @intCast(index);
                         }
@@ -3875,6 +3878,19 @@ pub const Table = struct {
                 }
             }
         };
+
+        /// `count` fixed-size records at `offset`, bounds- and
+        /// overflow-checked once so the caller can index them freely.
+        fn recordArray(data: []const u8, offset: usize, count: u16, stride: usize) Font.ParseError![]const u8 {
+            const len = @as(usize, count) * stride;
+            const end = std.math.add(usize, offset, len) catch return error.UnexpectedEndOfData;
+            if (end > data.len) return error.UnexpectedEndOfData;
+            return data[offset..end];
+        }
+
+        inline fn readU16At(records: []const u8, pos: usize) u16 {
+            return std.mem.readInt(u16, records[pos..][0..2], .big);
+        }
 
         /// glyph -> class lookup (OT spec 1.8.2). Used by PairPosFormat2's
         /// class-kerning matrix and (via `Table.Gdef`) to drive lookup-flag
@@ -3901,13 +3917,14 @@ pub const Table = struct {
                     },
                     2 => {
                         const count = try self.u16At(self.offset + 2);
+                        const records = try recordArray(self.data, self.offset + 4, count, 6);
                         var lo: u16 = 0;
                         var hi: u16 = count;
                         while (lo < hi) {
                             const mid = lo + (hi - lo) / 2;
-                            const rec_pos = self.offset + 4 + @as(usize, mid) * 6;
-                            const start = try self.u16At(rec_pos);
-                            const end = try self.u16At(rec_pos + 2);
+                            const rec_pos = @as(usize, mid) * 6;
+                            const start = readU16At(records, rec_pos);
+                            const end = readU16At(records, rec_pos + 2);
                             if (glyph < start) {
                                 hi = mid;
                                 continue;
@@ -3916,7 +3933,7 @@ pub const Table = struct {
                                 lo = mid + 1;
                                 continue;
                             }
-                            return self.u16At(rec_pos + 4);
+                            return readU16At(records, rec_pos + 4);
                         }
                         return 0;
                     },
