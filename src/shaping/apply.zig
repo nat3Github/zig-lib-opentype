@@ -160,9 +160,21 @@ fn glyphClass(gdef: Gdef, glyph: u32) u16 {
     return cd.getClass(@intCast(glyph)) catch 0;
 }
 
-fn infoGlyphClass(gdef: Gdef, info: GlyphInfo) u16 {
-    if (info.gdef_class_glyph == info.codepoint) return info.gdef_class;
-    return glyphClass(gdef, info.codepoint);
+/// hb's `glyph_props`, filled on first touch instead of by a buffer sweep
+/// after every lookup. Cached against `gdef_class_glyph`, so a substitution
+/// that changes the glyph id just recomputes.
+fn cacheGlyphClasses(gdef: Gdef, info: *GlyphInfo) void {
+    // Both are cached as u8 to keep GlyphInfo at 48 bytes; only classes
+    // 1-4 (and the 1-255 markAttachmentType filter) are meaningful, so a
+    // malformed out-of-range class folds to 0, which behaves identically.
+    info.gdef_class = narrowClass(glyphClass(gdef, info.codepoint));
+    info.gdef_mark_attach_class = if (info.codepoint > std.math.maxInt(u16)) 0 else narrowClass(markAttachClass(gdef, @intCast(info.codepoint)));
+    info.gdef_class_glyph = info.codepoint;
+}
+
+fn infoGlyphClass(gdef: Gdef, info: *GlyphInfo) u16 {
+    if (info.gdef_class_glyph != info.codepoint) cacheGlyphClasses(gdef, info);
+    return info.gdef_class;
 }
 
 fn narrowClass(class: u16) u8 {
@@ -174,21 +186,10 @@ fn markAttachClass(gdef: Gdef, glyph: u16) u16 {
     return cd.getClass(glyph) catch 0;
 }
 
-/// Drops every cached class; the next `applyStage` recomputes them.
+/// Drops every cached class: the cache key is a glyph id, so entries left
+/// by another font would otherwise read as valid.
 pub fn resetGlyphClasses(infos: []GlyphInfo) void {
     for (infos) |*info| info.gdef_class_glyph = std.math.maxInt(u32);
-}
-
-fn refreshGlyphClasses(infos: []GlyphInfo, gdef: Gdef) void {
-    for (infos) |*info| {
-        if (info.gdef_class_glyph == info.codepoint) continue;
-        // Both are cached as u8 to keep GlyphInfo at 48 bytes; only classes
-        // 1-4 (and the 1-255 markAttachmentType filter) are meaningful, so a
-        // malformed out-of-range class folds to 0, which behaves identically.
-        info.gdef_class = narrowClass(glyphClass(gdef, info.codepoint));
-        info.gdef_mark_attach_class = if (info.codepoint > std.math.maxInt(u16)) 0 else narrowClass(markAttachClass(gdef, @intCast(info.codepoint)));
-        info.gdef_class_glyph = info.codepoint;
-    }
 }
 
 /// hb's `lookup_props`: the raw lookupFlag with the markFilteringSet index
@@ -240,19 +241,19 @@ const Joiners = struct {
 };
 
 
-fn shouldSkipGlyph(info: GlyphInfo, gdef: Gdef, lookup_flags: u32, skip: Skip) bool {
-    return !matchesLookupProps(info, gdef, lookup_flags) or maybeSkippable(info, skip);
+fn shouldSkipGlyph(info: *GlyphInfo, gdef: Gdef, lookup_flags: u32, skip: Skip) bool {
+    return !matchesLookupProps(info, gdef, lookup_flags) or maybeSkippable(info.*, skip);
 }
 
 /// hb's `check_glyph_property`: the lookup-flag half of the skip predicate,
 /// without the joiner handling. `applyLookup` gates each glyph it steps
 /// over on this rather than on `shouldSkipGlyph`, because a lookup does
 /// apply at a ZWJ/ZWNJ even though matching steps over one.
-fn matchesLookupProps(info: GlyphInfo, gdef: Gdef, lookup_flags: u32) bool {
+fn matchesLookupProps(info: *GlyphInfo, gdef: Gdef, lookup_flags: u32) bool {
     return !filteredByLookupProps(info, gdef, lookup_flags);
 }
 
-fn filteredByLookupProps(info: GlyphInfo, gdef: Gdef, lookup_flags: u32) bool {
+fn filteredByLookupProps(info: *GlyphInfo, gdef: Gdef, lookup_flags: u32) bool {
     const class = infoGlyphClass(gdef, info);
     if (shouldSkipClass(class, lookup_flags)) return true;
     if (class != 3 or info.codepoint > std.math.maxInt(u16)) return false;
@@ -265,8 +266,7 @@ fn filteredByLookupProps(info: GlyphInfo, gdef: Gdef, lookup_flags: u32) bool {
     }
     if (lookup_flags & 0xFF00 != 0) {
         if (gdef.mark_attach == null) return true;
-        const attach = if (info.gdef_class_glyph == info.codepoint) info.gdef_mark_attach_class else markAttachClass(gdef, glyph);
-        return (lookup_flags & 0xFF00) != (@as(u32, attach) << 8);
+        return (lookup_flags & 0xFF00) != (@as(u32, info.gdef_mark_attach_class) << 8);
     }
     return false;
 }
@@ -276,21 +276,21 @@ fn filteredByLookupProps(info: GlyphInfo, gdef: Gdef, lookup_flags: u32) bool {
 /// Context/ChainContext matching (src/shaping.zig's `applyContextCore`) can
 /// reuse it against either `buffer.info` (GSUB "input"/"lookahead", GPOS
 /// everything) without duplicating the skip logic.
-fn nextUnskippedIn(infos: []const GlyphInfo, gdef: Gdef, lookup_flags: u32, skip: Skip, start: usize) ?usize {
+fn nextUnskippedIn(infos: []GlyphInfo, gdef: Gdef, lookup_flags: u32, skip: Skip, start: usize) ?usize {
     var i = start;
     while (i < infos.len) : (i += 1) {
-        if (!shouldSkipGlyph(infos[i], gdef, lookup_flags, skip)) return i;
+        if (!shouldSkipGlyph(&infos[i], gdef, lookup_flags, skip)) return i;
     }
     return null;
 }
 
 /// Searches backward from `start - 1` down to 0 in `infos` for the first
 /// glyph not filtered by `lookup_flags`. See `nextUnskippedIn`.
-fn prevUnskippedIn(infos: []const GlyphInfo, gdef: Gdef, lookup_flags: u32, skip: Skip, start: usize) ?usize {
+fn prevUnskippedIn(infos: []GlyphInfo, gdef: Gdef, lookup_flags: u32, skip: Skip, start: usize) ?usize {
     var i = start;
     while (i > 0) {
         i -= 1;
-        if (!shouldSkipGlyph(infos[i], gdef, lookup_flags, skip)) return i;
+        if (!shouldSkipGlyph(&infos[i], gdef, lookup_flags, skip)) return i;
     }
     return null;
 }
@@ -316,11 +316,11 @@ fn maybeSkippable(info: GlyphInfo, skip: Skip) bool {
 /// Emoji ZWJ sequences depend on that - their ligatures list the joiner as a
 /// real component. Any other glyph that doesn't match ends the search.
 /// `matcher` is duck-typed: anything with `matches(GlyphInfo) !bool`.
-fn matchForward(infos: []const GlyphInfo, gdef: Gdef, lookup_flags: u32, skip: Skip, start: usize, matcher: anytype) !?usize {
+fn matchForward(infos: []GlyphInfo, gdef: Gdef, lookup_flags: u32, skip: Skip, start: usize, matcher: anytype) !?usize {
     var i = start;
     while (i < infos.len) : (i += 1) {
         const info = infos[i];
-        if (!matchesLookupProps(info, gdef, lookup_flags)) continue;
+        if (!matchesLookupProps(&infos[i], gdef, lookup_flags)) continue;
         if ((skip.syllable == 0 or info.indic_syllable == skip.syllable) and try matcher.matches(info)) return i;
         if (!maybeSkippable(info, skip)) return null;
     }
@@ -350,12 +350,12 @@ const SlotMatcher = struct {
 };
 
 /// `matchForward` walking backwards from `start - 1`.
-fn matchBackward(infos: []const GlyphInfo, gdef: Gdef, lookup_flags: u32, skip: Skip, start: usize, matcher: anytype) !?usize {
+fn matchBackward(infos: []GlyphInfo, gdef: Gdef, lookup_flags: u32, skip: Skip, start: usize, matcher: anytype) !?usize {
     var i = start;
     while (i > 0) {
         i -= 1;
         const info = infos[i];
-        if (!matchesLookupProps(info, gdef, lookup_flags)) continue;
+        if (!matchesLookupProps(&infos[i], gdef, lookup_flags)) continue;
         if ((skip.syllable == 0 or info.indic_syllable == skip.syllable) and try matcher.matches(info)) return i;
         if (!maybeSkippable(info, skip)) return null;
     }
@@ -381,7 +381,7 @@ const lookup_flag_ignore_marks: u32 = 0x0008;
 /// for its nested lookups to carry.
 const gpos_lookup_mask: u32 = 0;
 
-fn isMarkGlyph(gdef: Gdef, info: GlyphInfo) bool {
+fn isMarkGlyph(gdef: Gdef, info: *GlyphInfo) bool {
     return infoGlyphClass(gdef, info) == 3;
 }
 
@@ -515,11 +515,11 @@ fn applyGposMarkToBase(
 
 /// MarkBasePos's `accept`: of a MultipleSubst sequence only the first glyph
 /// takes marks, unless a mark sits inside the sequence.
-fn acceptsMarkBase(infos: []const GlyphInfo, gdef: Gdef, idx: usize) bool {
+fn acceptsMarkBase(infos: []GlyphInfo, gdef: Gdef, idx: usize) bool {
     const info = infos[idx];
     if (!info.is_multiplied or info.lig_comp == 0 or idx == 0) return true;
     const prev = infos[idx - 1];
-    return isMarkGlyph(gdef, prev) or !prev.is_multiplied or
+    return isMarkGlyph(gdef, &infos[idx - 1]) or !prev.is_multiplied or
         info.lig_id != prev.lig_id or info.lig_comp != prev.lig_comp + 1;
 }
 
@@ -593,7 +593,7 @@ fn applyGposMarkToMark(
     // hb keeps the lookup's mark filtering but drops its IgnoreBase/
     // Ligatures/Marks bits, so the search stops at the first non-mark.
     const j = prevUnskipped(buffer, gdef, lookup_flags & ~@as(u32, 0x000E), skip, buffer.idx) orelse return false;
-    if (!isMarkGlyph(gdef, buffer.info.items[j])) return false;
+    if (!isMarkGlyph(gdef, &buffer.info.items[j])) return false;
     if (!sameLigatureComponent(buffer.info.items[buffer.idx], buffer.info.items[j])) return false;
 
     const mark2_glyph = buffer.info.items[j].codepoint;
@@ -1498,10 +1498,10 @@ fn applyGsubSubtable(
                 // A base (or a mark) that swallowed nothing but marks stays
                 // a base (or a mark), so later marks can still attach to it;
                 // anything else is a real ligature worth tracking.
-                var is_base_ligature = infoGlyphClass(gdef, buffer.info.items[match_positions[0]]) == 1;
-                var is_mark_ligature = isMarkGlyph(gdef, buffer.info.items[match_positions[0]]);
+                var is_base_ligature = infoGlyphClass(gdef, &buffer.info.items[match_positions[0]]) == 1;
+                var is_mark_ligature = isMarkGlyph(gdef, &buffer.info.items[match_positions[0]]);
                 for (match_positions[1..component_count]) |mp| {
-                    if (!isMarkGlyph(gdef, buffer.info.items[mp])) {
+                    if (!isMarkGlyph(gdef, &buffer.info.items[mp])) {
                         is_base_ligature = false;
                         is_mark_ligature = false;
                         break;
@@ -1850,7 +1850,7 @@ fn applyLookup(
             buffer.idx = idx;
             if (buffer.info.items[idx].mask & entry.mask != 0 and
                 entry.digest.mayHave(buffer.info.items[idx].codepoint) and
-                matchesLookupProps(buffer.info.items[idx], gdef, lookup_flags))
+                matchesLookupProps(&buffer.info.items[idx], gdef, lookup_flags))
             {
                 var si: u16 = 0;
                 while (si < sub_count) : (si += 1) {
@@ -1871,7 +1871,7 @@ fn applyLookup(
         var applied = false;
         if (buffer.info.items[buffer.idx].mask & entry.mask != 0 and
             entry.digest.mayHave(buffer.info.items[buffer.idx].codepoint) and
-            matchesLookupProps(buffer.info.items[buffer.idx], gdef, lookup_flags))
+            matchesLookupProps(&buffer.info.items[buffer.idx], gdef, lookup_flags))
         {
             var si: u16 = 0;
             while (si < sub_count) : (si += 1) {
@@ -1902,7 +1902,6 @@ pub fn applyStage(
     const data = font.tableData(tag) orelse return;
     const layout = parsing.Table.Layout{ .data = data };
     buffer.updateDigest();
-    refreshGlyphClasses(buffer.info.items, gdef);
     for (map.getStageLookups(table_index, stage)) |entry| {
         // Substitutions during this pass only ever add glyphs to the buffer
         // digest, so a lookup skipped here could not have matched earlier in
@@ -1910,7 +1909,6 @@ pub fn applyStage(
         if (!entry.digest.mayIntersect(buffer.digest)) continue;
         const subtable_digests = map.subtable_digests.items[entry.subtable_digests_start..][0..entry.subtable_digests_len];
         try applyLookup(layout, entry, gdef, buffer, table_index, direction, subtable_digests);
-        if (table_index == 0) refreshGlyphClasses(buffer.info.items, gdef);
     }
 }
 
@@ -2179,7 +2177,7 @@ fn applySpaceFallbackAdvances(
 /// font-has-GPOS case exactly and degrades gracefully (mark advances still
 /// zeroed, offsets just not backfilled) in the rare no-GPOS one.
 pub fn zeroMarkWidthsByGdef(buffer: *Buffer, gdef: Gdef) void {
-    for (buffer.info.items, buffer.pos.items) |glyph_info, *pos| {
+    for (buffer.info.items, buffer.pos.items) |*glyph_info, *pos| {
         if (isMarkGlyph(gdef, glyph_info)) {
             pos.x_advance = 0;
             pos.y_advance = 0;
