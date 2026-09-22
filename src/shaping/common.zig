@@ -32,21 +32,18 @@ pub fn insertionSort(comptime T: type, items: []T, context: anytype, comptime le
     }
 }
 
+comptime { std.debug.assert(@sizeOf(GlyphInfo) == 48); }
+
 pub const GlyphInfo = struct {
     /// Unicode codepoint before shaping, glyph index after shaping.
     codepoint: u32 = 0,
     /// Low bits (glyph_flag_*) plus shaper-assigned feature-lookup mask bits.
     mask: u32 = 0,
     cluster: u32 = 0,
-    /// Scratch storage reused by GSUB/GPOS lookups (glyph_props, lig_props,
-    /// syllable, ...) once those land; kept as plain bit-reinterpretable
-    /// fields rather than named fields until a consumer exists. Also
-    /// doubles as the normalizer's `normalizer_glyph_index` scratch slot
-    /// (see `outputChar`/`nextChar`/`mapGlyphsFast`) - both uses are
-    /// mutually exclusive in time (normalize finishes and converts
-    /// `codepoint` to a real glyph id before any GSUB/GPOS lookup runs).
+    /// The normalizer's `normalizer_glyph_index` scratch slot: the font's
+    /// mapping for `codepoint` while that still holds a Unicode value (see
+    /// `outputChar`/`nextChar`/`mapGlyphsFast`).
     var1: i32 = 0,
-    var2: i32 = 0,
     /// hb's `lig_props`, unpacked. A LigatureSubst that fires stamps the
     /// ligature and every mark it swallowed with one fresh `lig_id`, gives
     /// the ligature its component count and each mark the 1-based component
@@ -113,8 +110,14 @@ pub const GlyphInfo = struct {
     /// anything else falls back to the ClassDef lookups, so a stale entry is
     /// never wrong.
     gdef_class_glyph: u32 = std.math.maxInt(u32),
-    gdef_class: u16 = 0,
-    gdef_mark_attach_class: u16 = 0,
+    gdef_class: u8 = 0,
+    gdef_mark_attach_class: u8 = 0,
+    /// hb's `unicode_props` combining class, cached the same way: the raw
+    /// `modifiedCombiningClass` of `ccc_codepoint` (the mcm adjustment is
+    /// applied on read, so moving a mark doesn't invalidate it). Stale
+    /// entries fall back to the table lookup, never to a wrong answer.
+    ccc_codepoint: u32 = std.math.maxInt(u32),
+    ccc: u8 = 0,
 };
 
 /// hb-unicode.hh's `space_t`. The `em_*` values double as the divisor of an
@@ -578,7 +581,7 @@ pub const Buffer = struct {
         var i = start + 1;
         while (i < end) : (i += 1) {
             var j = i;
-            while (j > start and combiningClassOf(self.info.items[j - 1]) > combiningClassOf(self.info.items[i])) j -= 1;
+            while (j > start and combiningClassOf(&self.info.items[j - 1]) > combiningClassOf(&self.info.items[i])) j -= 1;
             if (i == j) continue;
             self.mergeClusters(j, i + 1);
             const moved = self.info.items[i];
@@ -1031,8 +1034,12 @@ pub fn isIgnorable(info: GlyphInfo) bool {
     return info.is_default_ignorable and !info.is_substituted;
 }
 
-pub fn combiningClassOf(info: GlyphInfo) u8 {
-    const class = unicode.modifiedCombiningClass(@intCast(info.codepoint));
-    if (info.arabic_mcm_moved) return if (class == 220) 22 else 26;
-    return class;
+pub fn combiningClassOf(info: *GlyphInfo) u8 {
+    if (info.ccc_codepoint != info.codepoint) {
+        info.ccc = unicode.modifiedCombiningClass(@intCast(info.codepoint));
+        info.ccc_codepoint = info.codepoint;
+    }
+    if (info.arabic_mcm_moved) return if (info.ccc == 220) 22 else 26;
+    return info.ccc;
 }
+

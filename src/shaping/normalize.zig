@@ -260,12 +260,12 @@ fn normalizeReorderRound(buffer: *Buffer, reorder_marks: ReorderMarks) void {
     const infos = buffer.info.items;
     var i: usize = 0;
     while (i < infos.len) {
-        if (combiningClassOf(infos[i]) == 0) {
+        if (combiningClassOf(&infos[i]) == 0) {
             i += 1;
             continue;
         }
         var end = i + 1;
-        while (end < infos.len and combiningClassOf(infos[end]) != 0) : (end += 1) {}
+        while (end < infos.len and combiningClassOf(&infos[end]) != 0) : (end += 1) {}
         if (end - i > max_reorder_combining_marks) {
             i = end;
             continue;
@@ -293,9 +293,9 @@ fn reorderMarksHebrew(buffer: *Buffer, start: usize, end: usize) void {
     const info = buffer.info.items;
     var i = start + 2;
     while (i < end) : (i += 1) {
-        const c0 = combiningClassOf(info[i - 2]);
-        const c1 = combiningClassOf(info[i - 1]);
-        const c2 = combiningClassOf(info[i]);
+        const c0 = combiningClassOf(&info[i - 2]);
+        const c1 = combiningClassOf(&info[i - 1]);
+        const c2 = combiningClassOf(&info[i]);
         if ((c0 == 20 or c0 == 21) and (c1 == 22 or c1 == 23) and (c2 == 25 or c2 == 220)) {
             buffer.mergeClusters(i - 1, i + 1);
             std.mem.swap(GlyphInfo, &info[i - 1], &info[i]);
@@ -311,11 +311,11 @@ fn reorderMarksArabic(buffer: *Buffer, run_start: usize, end: usize) void {
     var start = run_start;
     var i = start;
     for ([_]u8{ 220, 230 }) |class| {
-        while (i < end and combiningClassOf(info[i]) < class) i += 1;
+        while (i < end and combiningClassOf(&info[i]) < class) i += 1;
         if (i == end) break;
-        if (combiningClassOf(info[i]) > class) continue;
+        if (combiningClassOf(&info[i]) > class) continue;
         var j = i;
-        while (j < end and combiningClassOf(info[j]) == class and isModifierCombiningMark(info[j].codepoint)) j += 1;
+        while (j < end and combiningClassOf(&info[j]) == class and isModifierCombiningMark(info[j].codepoint)) j += 1;
         if (i == j) continue;
 
         buffer.mergeClusters(start, j);
@@ -337,12 +337,12 @@ fn normalizeRecomposeRound(ctx: NormalizeContext, buffer: *Buffer, block_mark_re
     try buffer.nextGlyph();
     while (buffer.idx < count) {
         const cur_codepoint: u21 = @intCast(buffer.cur(0).codepoint);
-        const cur_cc = combiningClassOf(buffer.cur(0));
+        const cur_cc = combiningClassOf(buffer.curPtr(0));
 
         compose_check: {
             if (!unicode.isUnicodeMark(cur_codepoint)) break :compose_check;
             const out_len = buffer.out_info.items.len;
-            const prev_cc = combiningClassOf(buffer.out_info.items[out_len - 1]);
+            const prev_cc = combiningClassOf(&buffer.out_info.items[out_len - 1]);
             if (!(starter == out_len - 1 or prev_cc < cur_cc)) break :compose_check;
             const starter_codepoint: u21 = @intCast(buffer.out_info.items[starter].codepoint);
             if (block_mark_recompose and unicode.isUnicodeMark(starter_codepoint)) break :compose_check;
@@ -358,7 +358,7 @@ fn normalizeRecomposeRound(ctx: NormalizeContext, buffer: *Buffer, block_mark_re
         }
 
         try buffer.nextGlyph();
-        if (combiningClassOf(buffer.out_info.items[buffer.out_info.items.len - 1]) == 0) {
+        if (combiningClassOf(&buffer.out_info.items[buffer.out_info.items.len - 1]) == 0) {
             starter = buffer.out_info.items.len - 1;
         }
     }
@@ -509,7 +509,7 @@ fn hideBlockingCgjs(buffer: *Buffer) void {
     for (infos, 0..) |*info, i| {
         if (info.codepoint != 0x034F) continue;
         const skippable = i > 0 and i + 1 < infos.len and
-            (combiningClassOf(infos[i + 1]) == 0 or combiningClassOf(infos[i - 1]) <= combiningClassOf(infos[i + 1]));
+            (combiningClassOf(&infos[i + 1]) == 0 or combiningClassOf(&infos[i - 1]) <= combiningClassOf(&infos[i + 1]));
         info.is_hidden = !skippable;
     }
 }

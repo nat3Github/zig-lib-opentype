@@ -165,6 +165,10 @@ fn infoGlyphClass(gdef: Gdef, info: GlyphInfo) u16 {
     return glyphClass(gdef, info.codepoint);
 }
 
+fn narrowClass(class: u16) u8 {
+    return if (class > std.math.maxInt(u8)) 0 else @intCast(class);
+}
+
 fn markAttachClass(gdef: Gdef, glyph: u16) u16 {
     const cd = gdef.mark_attach orelse return 0;
     return cd.getClass(glyph) catch 0;
@@ -178,8 +182,11 @@ pub fn resetGlyphClasses(infos: []GlyphInfo) void {
 fn refreshGlyphClasses(infos: []GlyphInfo, gdef: Gdef) void {
     for (infos) |*info| {
         if (info.gdef_class_glyph == info.codepoint) continue;
-        info.gdef_class = glyphClass(gdef, info.codepoint);
-        info.gdef_mark_attach_class = if (info.codepoint > std.math.maxInt(u16)) 0 else markAttachClass(gdef, @intCast(info.codepoint));
+        // Both are cached as u8 to keep GlyphInfo at 48 bytes; only classes
+        // 1-4 (and the 1-255 markAttachmentType filter) are meaningful, so a
+        // malformed out-of-range class folds to 0, which behaves identically.
+        info.gdef_class = narrowClass(glyphClass(gdef, info.codepoint));
+        info.gdef_mark_attach_class = if (info.codepoint > std.math.maxInt(u16)) 0 else narrowClass(markAttachClass(gdef, @intCast(info.codepoint)));
         info.gdef_class_glyph = info.codepoint;
     }
 }
