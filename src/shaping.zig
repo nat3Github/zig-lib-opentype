@@ -212,6 +212,10 @@ fn fillLookupDigests(allocator: std.mem.Allocator, font: parsing.Font, map: *Map
 pub const Plan = struct {
     map: Map,
     cmap: ?parsing.Table.cmap.Resolved,
+    /// GDEF GlyphClassDef decoded to a glyph-indexed array: every matched
+    /// glyph of every lookup asks for its class, so the binary search shows
+    /// up in profiles. Null when the font has no usable GlyphClassDef.
+    gdef_classes: ?[]u8,
     indic_config: ?*const indic_mod.IndicScriptConfig,
     is_hangul: bool,
     is_arabic: bool,
@@ -331,9 +335,19 @@ pub const Plan = struct {
         errdefer map.deinit(allocator);
         try fillLookupDigests(allocator, font, &map);
 
+        const gdef_classes: ?[]u8 = if (font.tableData(table_tag_gdef)) |d| blk: {
+            const cd = (parsing.Table.Gdef.glyphClassDef(d) catch null) orelse break :blk null;
+            break :blk cd.decodeDense(allocator) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => null,
+            };
+        } else null;
+        errdefer if (gdef_classes) |d| allocator.free(d);
+
         return .{
             .map = map,
             .cmap = cmap,
+            .gdef_classes = gdef_classes,
             .indic_config = indic_config,
             .is_hangul = is_hangul,
             .is_arabic = is_arabic,
@@ -348,6 +362,7 @@ pub const Plan = struct {
 
     pub fn deinit(self: *Plan, allocator: std.mem.Allocator) void {
         self.map.deinit(allocator);
+        if (self.gdef_classes) |d| allocator.free(d);
         self.* = undefined;
     }
 };
@@ -552,6 +567,7 @@ fn shapeWithPlanImpl(
     const gdef_data = font.tableData(table_tag_gdef);
     const gdef_classdef: apply_mod.Gdef = if (gdef_data) |d| .{
         .classes = parsing.Table.Gdef.glyphClassDef(d) catch null,
+        .dense_classes = plan.gdef_classes,
         .mark_attach = parsing.Table.Gdef.markAttachClassDef(d) catch null,
         .mark_sets = parsing.Table.Gdef.markGlyphSets(d) catch null,
         .variations = if (normalized_coords.len == 0) null else if (parsing.Table.Gdef.itemVariationStore(d)) |store_offset|

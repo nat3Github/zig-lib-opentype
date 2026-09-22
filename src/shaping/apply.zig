@@ -123,6 +123,9 @@ fn unwrapExtension(reader: parsing.Table.Layout.SubtableReader, extension_tag: u
 /// shaping run rather than re-walked per glyph.
 pub const Gdef = struct {
     classes: ?parsing.Table.Layout.ClassDef = null,
+    /// `classes` decoded to a glyph-indexed array at plan time; `classes` is
+    /// the fallback for callers that have no plan.
+    dense_classes: ?[]const u8 = null,
     mark_attach: ?parsing.Table.Layout.ClassDef = null,
     mark_sets: ?parsing.Table.Gdef.MarkGlyphSets = null,
     /// Set only at non-default variation coords, as hb gates device deltas
@@ -156,6 +159,7 @@ fn deviceDelta(gdef: Gdef, base: parsing.Table.Layout.SubtableReader, device_off
 
 fn glyphClass(gdef: Gdef, glyph: u32) u16 {
     if (glyph > std.math.maxInt(u16)) return 0;
+    if (gdef.dense_classes) |dense| return if (glyph < dense.len) dense[glyph] else 0;
     const cd = gdef.classes orelse return 0;
     return cd.getClass(@intCast(glyph)) catch 0;
 }

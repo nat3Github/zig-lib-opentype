@@ -3904,6 +3904,45 @@ pub const Table = struct {
                 return c.readU16();
             }
 
+            /// Decodes the whole table into a glyph-indexed array, so the
+            /// per-glyph lookup is one indexed read instead of a binary
+            /// search. The length follows the table's own coverage (never
+            /// `maxp`), capped at the format's 64K ceiling.
+            pub fn decodeDense(self: ClassDef, allocator: Allocator) (Font.ParseError || error{OutOfMemory})!?[]u8 {
+                const format = try self.u16At(self.offset);
+                var dense: std.ArrayList(u8) = .empty;
+                errdefer dense.deinit(allocator);
+                switch (format) {
+                    1 => {
+                        const start_glyph = try self.u16At(self.offset + 2);
+                        const count = try self.u16At(self.offset + 4);
+                        if (count == 0) return null;
+                        const records = try recordArray(self.data, self.offset + 6, count, 2);
+                        try dense.appendNTimes(allocator, 0, @as(usize, start_glyph) + count);
+                        for (0..count) |i| {
+                            const class = readU16At(records, i * 2);
+                            dense.items[start_glyph + i] = if (class > std.math.maxInt(u8)) 0 else @intCast(class);
+                        }
+                    },
+                    2 => {
+                        const count = try self.u16At(self.offset + 2);
+                        if (count == 0) return null;
+                        const records = try recordArray(self.data, self.offset + 4, count, 6);
+                        for (0..count) |i| {
+                            const start = readU16At(records, i * 6);
+                            const end = readU16At(records, i * 6 + 2);
+                            const class = readU16At(records, i * 6 + 4);
+                            if (end < start or class > std.math.maxInt(u8)) continue;
+                            if (dense.items.len <= end) try dense.appendNTimes(allocator, 0, @as(usize, end) + 1 - dense.items.len);
+                            @memset(dense.items[start .. @as(usize, end) + 1], @intCast(class));
+                        }
+                    },
+                    else => return error.InvalidTableFormat,
+                }
+                if (dense.items.len == 0) return null;
+                return try dense.toOwnedSlice(allocator);
+            }
+
             /// Returns 0 (the default/unassigned class) for glyphs the table
             /// doesn't cover, matching OT spec semantics.
             pub fn getClass(self: ClassDef, glyph: u16) Font.ParseError!u16 {
