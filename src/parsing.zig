@@ -3836,47 +3836,77 @@ pub const Table = struct {
             /// binary search below reads it without a per-probe check --
             /// this runs for every glyph of every subtable application.
             pub fn get(self: Coverage, glyph: u16) Font.ParseError!?u16 {
+                return (try self.resolve()).get(glyph);
+            }
+
+            /// Validates the header and record array once, so repeated
+            /// probes of the same subtable are a bare binary search. Held
+            /// per subtable in the shaping plan.
+            pub fn resolve(self: Coverage) Font.ParseError!Resolved {
                 const format = try self.u16At(self.offset);
                 const count = try self.u16At(self.offset + 2);
-                switch (format) {
-                    1 => {
-                        const records = try recordArray(self.data, self.offset + 4, count, 2);
-                        var lo: u16 = 0;
-                        var hi: u16 = count;
-                        while (lo < hi) {
-                            const mid = lo + (hi - lo) / 2;
-                            const g = readU16At(records, @as(usize, mid) * 2);
-                            if (g == glyph) return mid;
-                            if (g < glyph) lo = mid + 1 else hi = mid;
-                        }
-                        return null;
-                    },
-                    2 => {
-                        const records = try recordArray(self.data, self.offset + 4, count, 6);
-                        var lo: u16 = 0;
-                        var hi: u16 = count;
-                        while (lo < hi) {
-                            const mid = lo + (hi - lo) / 2;
-                            const rec_pos = @as(usize, mid) * 6;
-                            const start = readU16At(records, rec_pos);
-                            const end = readU16At(records, rec_pos + 2);
-                            if (glyph < start) {
-                                hi = mid;
-                                continue;
-                            }
-                            if (glyph > end) {
-                                lo = mid + 1;
-                                continue;
-                            }
-                            const index = @as(u32, readU16At(records, rec_pos + 4)) + (glyph - start);
-                            if (index > std.math.maxInt(u16)) return error.InvalidTableFormat;
-                            return @intCast(index);
-                        }
-                        return null;
-                    },
+                const stride: usize = switch (format) {
+                    1 => 2,
+                    2 => 6,
                     else => return error.InvalidTableFormat,
-                }
+                };
+                return .{
+                    .records = try recordArray(self.data, self.offset + 4, count, stride),
+                    .format = @intCast(format),
+                    .count = count,
+                };
             }
+
+            /// A `Coverage` with its header read and its records already
+            /// bounds-checked. `format` 0 means "not resolved".
+            pub const Resolved = struct {
+                records: []const u8 = &.{},
+                format: u8 = 0,
+                count: u16 = 0,
+
+                pub fn get(self: Resolved, glyph: u16) Font.ParseError!?u16 {
+                    const format = self.format;
+                    const count = self.count;
+                    switch (format) {
+                        1 => {
+                            const records = self.records;
+                            var lo: u16 = 0;
+                            var hi: u16 = count;
+                            while (lo < hi) {
+                                const mid = lo + (hi - lo) / 2;
+                                const g = readU16At(records, @as(usize, mid) * 2);
+                                if (g == glyph) return mid;
+                                if (g < glyph) lo = mid + 1 else hi = mid;
+                            }
+                            return null;
+                        },
+                        2 => {
+                            const records = self.records;
+                            var lo: u16 = 0;
+                            var hi: u16 = count;
+                            while (lo < hi) {
+                                const mid = lo + (hi - lo) / 2;
+                                const rec_pos = @as(usize, mid) * 6;
+                                const start = readU16At(records, rec_pos);
+                                const end = readU16At(records, rec_pos + 2);
+                                if (glyph < start) {
+                                    hi = mid;
+                                    continue;
+                                }
+                                if (glyph > end) {
+                                    lo = mid + 1;
+                                    continue;
+                                }
+                                const index = @as(u32, readU16At(records, rec_pos + 4)) + (glyph - start);
+                                if (index > std.math.maxInt(u16)) return error.InvalidTableFormat;
+                                return @intCast(index);
+                            }
+                            return null;
+                        },
+                        else => return error.InvalidTableFormat,
+                    }
+                }
+            };
         };
 
         /// `count` fixed-size records at `offset`, bounds- and
@@ -4047,6 +4077,12 @@ pub const Table = struct {
         pub const SubtableReader = struct {
             data: []const u8,
             offset: usize,
+            /// This subtable's input Coverage (the Offset16 at rel 2),
+            /// resolved once at plan time -- see
+            /// `shaping.common.SubtableInfo`. Points into the plan, which
+            /// outlives every application. Readers made by `subReaderAt`
+            /// deliberately do not inherit it: it describes this subtable.
+            cov0: ?*const Coverage.Resolved = null,
 
             pub fn u16At(self: SubtableReader, rel: usize) Font.ParseError!u16 {
                 var c = Cursor{ .data = self.data, .pos = self.offset + rel };
@@ -4077,9 +4113,11 @@ pub const Table = struct {
                 return .{ .data = self.data, .offset = self.offset + off };
             }
 
-            pub fn coverageAt(self: SubtableReader, rel: usize) Font.ParseError!Coverage {
+            pub fn coverageAt(self: SubtableReader, rel: usize) Font.ParseError!Coverage.Resolved {
+                if (rel == 2) if (self.cov0) |c| return c.*;
                 const off = try self.u16At(rel);
-                return .{ .data = self.data, .offset = self.offset + off };
+                const cov = Coverage{ .data = self.data, .offset = self.offset + off };
+                return cov.resolve();
             }
 
             pub fn classDefAt(self: SubtableReader, rel: usize) Font.ParseError!ClassDef {
@@ -4121,7 +4159,6 @@ pub const Table = struct {
             if (format != 1 and format != 3) return null;
             return try c.readI16();
         }
-
 
         pub fn glyphClassDef(data: []const u8) Font.ParseError!?Layout.ClassDef {
             var c = Cursor{ .data = data, .pos = 4 };

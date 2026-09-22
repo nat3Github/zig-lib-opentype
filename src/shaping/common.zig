@@ -33,7 +33,9 @@ pub fn insertionSort(comptime T: type, items: []T, context: anytype, comptime le
     }
 }
 
-comptime { std.debug.assert(@sizeOf(GlyphInfo) == 48); }
+comptime {
+    std.debug.assert(@sizeOf(GlyphInfo) == 48);
+}
 
 pub const GlyphInfo = struct {
     /// Unicode codepoint before shaping, glyph index after shaping.
@@ -1112,6 +1114,11 @@ pub const SubtableInfo = struct {
     digest: Digest,
     offset: u32,
     lookup_type: u16,
+    /// This subtable's input Coverage, header-read and bounds-checked once
+    /// here instead of per glyph. `format` 0 means it could not be resolved
+    /// (Context/ChainContext format 3 keeps its coverage elsewhere), and the
+    /// applier falls back to reading it from the table.
+    coverage: parsing.Table.Layout.Coverage.Resolved = .{},
 };
 
 pub fn combiningClassOf(info: *GlyphInfo) u8 {
@@ -1122,4 +1129,3 @@ pub fn combiningClassOf(info: *GlyphInfo) u8 {
     if (info.arabic_mcm_moved) return if (info.ccc == 220) 22 else 26;
     return info.ccc;
 }
-

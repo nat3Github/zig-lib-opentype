@@ -244,7 +244,6 @@ const Joiners = struct {
     }
 };
 
-
 fn shouldSkipGlyph(info: *GlyphInfo, gdef: Gdef, lookup_flags: u32, skip: Skip) bool {
     return !matchesLookupProps(info, gdef, lookup_flags) or maybeSkippable(info.*, skip);
 }
@@ -1010,9 +1009,9 @@ fn applyLookupOnce(
     while (si < sub_count) : (si += 1) {
         const sub_off = try lk.subtableOffset(si);
         const applied = if (table_index == 0)
-            try applyGsubSubtable(layout, lookup_type, sub_off, lookup_mask, random, joiners, buffer, gdef, lookup_flags, depth - 1)
+            try applyGsubSubtable(layout, lookup_type, sub_off, null, lookup_mask, random, joiners, buffer, gdef, lookup_flags, depth - 1)
         else
-            try applyGposSubtable(layout, lookup_type, sub_off, joiners, gdef, lookup_flags, buffer, direction, depth - 1);
+            try applyGposSubtable(layout, lookup_type, sub_off, null, joiners, gdef, lookup_flags, buffer, direction, depth - 1);
         if (applied) return true;
     }
     return false;
@@ -1351,6 +1350,7 @@ fn applyGsubSubtable(
     layout: parsing.Table.Layout,
     lookup_type: u16,
     sub_off: usize,
+    cov0: ?*const parsing.Table.Layout.Coverage.Resolved,
     lookup_mask: u32,
     random: bool,
     lookup_joiners: Joiners,
@@ -1363,7 +1363,7 @@ fn applyGsubSubtable(
     // application, nested ones included.
     var joiners = lookup_joiners;
     if (joiners.per_syllable) joiners.syllable = buffer.info.items[buffer.idx].indic_syllable;
-    const reader = parsing.Table.Layout.SubtableReader{ .data = layout.data, .offset = sub_off };
+    const reader = parsing.Table.Layout.SubtableReader{ .data = layout.data, .offset = sub_off, .cov0 = cov0 };
     const format = try reader.u16At(0);
     const glyph = buffer.info.items[buffer.idx].codepoint;
     if (glyph > std.math.maxInt(u16)) return false;
@@ -1592,7 +1592,7 @@ fn applyGsubSubtable(
         },
         gsub_tag_extension => {
             const unwrapped = try unwrapExtension(reader, gsub_tag_extension) orelse return false;
-            return applyGsubSubtable(layout, unwrapped.lookup_type, unwrapped.sub_off, lookup_mask, random, joiners, buffer, gdef, lookup_flags, depth);
+            return applyGsubSubtable(layout, unwrapped.lookup_type, unwrapped.sub_off, null, lookup_mask, random, joiners, buffer, gdef, lookup_flags, depth);
         },
         else => return false,
     }
@@ -1602,6 +1602,7 @@ fn applyGposSubtable(
     layout: parsing.Table.Layout,
     lookup_type: u16,
     sub_off: usize,
+    cov0: ?*const parsing.Table.Layout.Coverage.Resolved,
     joiners: Joiners,
     gdef: Gdef,
     lookup_flags: u32,
@@ -1609,7 +1610,7 @@ fn applyGposSubtable(
     direction: Direction,
     depth: u8,
 ) (parsing.Font.ParseError || error{OutOfMemory})!bool {
-    const reader = parsing.Table.Layout.SubtableReader{ .data = layout.data, .offset = sub_off };
+    const reader = parsing.Table.Layout.SubtableReader{ .data = layout.data, .offset = sub_off, .cov0 = cov0 };
     const format = try reader.u16At(0);
     const glyph = buffer.info.items[buffer.idx].codepoint;
     if (glyph > std.math.maxInt(u16)) return false;
@@ -1737,7 +1738,7 @@ fn applyGposSubtable(
         },
         gpos_tag_extension => {
             const unwrapped = try unwrapExtension(reader, gpos_tag_extension) orelse return false;
-            return applyGposSubtable(layout, unwrapped.lookup_type, unwrapped.sub_off, joiners, gdef, lookup_flags, buffer, direction, depth);
+            return applyGposSubtable(layout, unwrapped.lookup_type, unwrapped.sub_off, null, joiners, gdef, lookup_flags, buffer, direction, depth);
         },
         else => return false,
     }
@@ -1815,7 +1816,7 @@ fn collectSubtableDigests(
             reader = .{ .data = layout.data, .offset = unwrapped.sub_off };
         }
         const format = try reader.u16At(0);
-        // Every subtable format keeps its input Coverage at offset 2 except
+        // Every subtable keeps its input Coverage at offset 2 except
         // Context/ChainContext format 3, where offset 2 is a glyph count and
         // the coverage offsets follow the counts.
         const coverage_rel: usize = if (format == 3 and (effective_type == context_tag or effective_type == chain_context_tag)) blk: {
@@ -1826,12 +1827,18 @@ fn collectSubtableDigests(
             if (offs.input_count == 0) return error.Unfilterable;
             break :blk offs.input_base;
         } else 2;
-        const cov = try reader.coverageAt(coverage_rel);
+        const cov_off = try reader.u16At(coverage_rel);
+        const cov = parsing.Table.Layout.Coverage{ .data = reader.data, .offset = reader.offset + cov_off };
         var sub_digest: common.Digest = .{};
         try cov.collectRanges(&sub_digest);
         digest.unionWith(sub_digest);
         if (reader.offset > std.math.maxInt(u32)) return error.InvalidTableFormat;
-        subtables.appendAssumeCapacity(.{ .digest = sub_digest, .offset = @intCast(reader.offset), .lookup_type = effective_type });
+        subtables.appendAssumeCapacity(.{
+            .digest = sub_digest,
+            .offset = @intCast(reader.offset),
+            .lookup_type = effective_type,
+            .coverage = if (coverage_rel == 2) try cov.resolve() else .{},
+        });
     }
     return digest;
 }
@@ -1863,12 +1870,14 @@ fn applyLookup(
                 var si: u16 = 0;
                 while (si < sub_count) : (si += 1) {
                     var sub_type = lookup_type;
+                    var sub_cov: ?*const parsing.Table.Layout.Coverage.Resolved = null;
                     const sub_off = if (si < subtables.len) blk: {
                         if (!subtables[si].digest.mayHave(buffer.info.items[idx].codepoint)) continue;
                         sub_type = subtables[si].lookup_type;
+                        if (subtables[si].coverage.format != 0) sub_cov = &subtables[si].coverage;
                         break :blk @as(usize, subtables[si].offset);
                     } else try lk.subtableOffset(si);
-                    if (try applyGsubSubtable(layout, sub_type, sub_off, entry.mask, entry.random, joiners, buffer, gdef, lookup_flags, max_nesting_level)) break;
+                    if (try applyGsubSubtable(layout, sub_type, sub_off, sub_cov, entry.mask, entry.random, joiners, buffer, gdef, lookup_flags, max_nesting_level)) break;
                 }
             }
             if (idx == 0) break;
@@ -1888,15 +1897,17 @@ fn applyLookup(
             var si: u16 = 0;
             while (si < sub_count) : (si += 1) {
                 var sub_type = lookup_type;
+                var sub_cov: ?*const parsing.Table.Layout.Coverage.Resolved = null;
                 const sub_off = if (si < subtables.len) blk: {
                     if (!subtables[si].digest.mayHave(buffer.info.items[buffer.idx].codepoint)) continue;
                     sub_type = subtables[si].lookup_type;
+                    if (subtables[si].coverage.format != 0) sub_cov = &subtables[si].coverage;
                     break :blk @as(usize, subtables[si].offset);
                 } else try lk.subtableOffset(si);
                 applied = if (table_index == 0)
-                    try applyGsubSubtable(layout, sub_type, sub_off, entry.mask, entry.random, joiners, buffer, gdef, lookup_flags, max_nesting_level)
+                    try applyGsubSubtable(layout, sub_type, sub_off, sub_cov, entry.mask, entry.random, joiners, buffer, gdef, lookup_flags, max_nesting_level)
                 else
-                    try applyGposSubtable(layout, sub_type, sub_off, joiners, gdef, lookup_flags, buffer, direction, max_nesting_level);
+                    try applyGposSubtable(layout, sub_type, sub_off, sub_cov, joiners, gdef, lookup_flags, buffer, direction, max_nesting_level);
                 if (applied) break;
             }
         }
