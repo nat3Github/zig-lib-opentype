@@ -1244,7 +1244,7 @@ pub const Table = struct {
     /// mappings aren't needed since nothing here reports side bearings
     /// separately from the outline itself.
     pub const HVAR = struct {
-        pub fn advanceWidthDelta(data: []const u8, glyph_id: u16, normalized_coords: []const f32) f32 {
+        pub fn advanceWidthDelta(data: []const u8, glyph_id: u16, normalized_coords: []const f32, scalars: ?*const RegionScalars) f32 {
             if (data.len < 8) return 0;
             const item_variation_store_offset = std.mem.readInt(u32, data[4..][0..4], .big);
             if (item_variation_store_offset == 0 or item_variation_store_offset >= data.len) return 0;
@@ -1259,7 +1259,7 @@ pub const Table = struct {
                     inner = mapped.inner;
                 }
             }
-            return itemDelta(data, item_variation_store_offset, outer, inner, normalized_coords);
+            return itemDeltaCached(data, item_variation_store_offset, outer, inner, normalized_coords, scalars);
         }
 
         const MapEntry = struct { outer: u16, inner: u16 };
@@ -1291,8 +1291,66 @@ pub const Table = struct {
             return .{ .outer = @intCast(raw >> inner_bit_count), .inner = @intCast(raw & ((@as(u32, 1) << inner_bit_count) - 1)) };
         }
 
+        /// hb's `hb_scalar_cache`: the region scalars depend only on the
+        /// region list and the coords, so a caller shaping many glyphs at one
+        /// instance evaluates them once instead of per item.
+        pub const RegionScalars = struct {
+            // ponytail: real fonts stay well under this; beyond it `itemDelta`
+            // just falls back to evaluating each scalar inline as before.
+            const max_regions = 256;
+            values: [max_regions]f32 = undefined,
+            len: u16 = 0,
+
+            pub fn init(data: []const u8, store_offset: u32, normalized_coords: []const f32) RegionScalars {
+                var self: RegionScalars = .{};
+                const store = store_offset;
+                if (@as(u64, store) + 8 > data.len) return self;
+                const region_list_offset = offsetWithin(data, @as(u64, store) + std.mem.readInt(u32, data[store + 2 ..][0..4], .big), 4) orelse return self;
+                const axis_count = std.mem.readInt(u16, data[region_list_offset..][0..2], .big);
+                const region_count = std.mem.readInt(u16, data[region_list_offset + 2 ..][0..2], .big);
+                if (region_count > max_regions) return self;
+                for (0..region_count) |i| {
+                    self.values[i] = regionScalar(data, region_list_offset, axis_count, @intCast(i), normalized_coords);
+                }
+                self.len = region_count;
+                return self;
+            }
+        };
+
+        /// One VarRegionAxis::evaluate product, on F2Dot14 integers so the
+        /// float rounding (and thus the rounded delta) matches hb's.
+        fn regionScalar(data: []const u8, region_list_offset: usize, axis_count: u16, region_index: u16, normalized_coords: []const f32) f32 {
+            const region_record_size = @as(usize, axis_count) * 6;
+            const region_offset = region_list_offset + 4 + @as(usize, region_index) * region_record_size;
+            var scalar: f32 = 1.0;
+            var axis: usize = 0;
+            while (axis < axis_count) : (axis += 1) {
+                const region_axis_base = region_offset + axis * 6;
+                if (region_axis_base + 6 > data.len) return 0;
+                const start: i32 = std.mem.readInt(i16, data[region_axis_base..][0..2], .big);
+                const peak: i32 = std.mem.readInt(i16, data[region_axis_base + 2 ..][0..2], .big);
+                const end: i32 = std.mem.readInt(i16, data[region_axis_base + 4 ..][0..2], .big);
+                const coord: i32 = if (axis < normalized_coords.len) @intFromFloat(@round(normalized_coords[axis] * 16384.0)) else 0;
+
+                if (peak == 0 or coord == peak) continue;
+                if (coord == 0) return 0;
+                if (start > peak or peak > end or (start < 0 and end > 0)) continue;
+                if (coord <= start or end <= coord) return 0;
+                const factor = if (coord < peak)
+                    @as(f32, @floatFromInt(coord - start)) / @as(f32, @floatFromInt(peak - start))
+                else
+                    @as(f32, @floatFromInt(end - coord)) / @as(f32, @floatFromInt(end - peak));
+                scalar *= factor;
+            }
+            return scalar;
+        }
+
         /// Also GDEF's ItemVariationStore (GPOS VariationIndex deltas).
         pub fn itemDelta(data: []const u8, store_offset: u32, outer: u16, inner: u16, normalized_coords: []const f32) f32 {
+            return itemDeltaCached(data, store_offset, outer, inner, normalized_coords, null);
+        }
+
+        pub fn itemDeltaCached(data: []const u8, store_offset: u32, outer: u16, inner: u16, normalized_coords: []const f32, scalars: ?*const RegionScalars) f32 {
             const store = store_offset;
             if (@as(u64, store) + 8 > data.len) return 0;
             const region_list_offset = offsetWithin(data, @as(u64, store) + std.mem.readInt(u32, data[store + 2 ..][0..4], .big), 4) orelse return 0;
@@ -1300,7 +1358,6 @@ pub const Table = struct {
             if (outer >= data_count) return 0;
 
             const axis_count = std.mem.readInt(u16, data[region_list_offset..][0..2], .big);
-            const region_record_size = @as(usize, axis_count) * 6;
             const region_count = std.mem.readInt(u16, data[region_list_offset + 2 ..][0..2], .big);
 
             const data_offset_pos = @as(u64, store) + 8 + @as(u64, outer) * 4;
@@ -1326,35 +1383,10 @@ pub const Table = struct {
                 const region_index = std.mem.readInt(u16, data[region_index_base + idx * 2 ..][0..2], .big);
                 if (region_index >= region_count) return 0;
 
-                const region_offset = region_list_offset + 4 + @as(usize, region_index) * region_record_size;
-                var scalar: f32 = 1.0;
-                var axis: usize = 0;
-                while (axis < axis_count) : (axis += 1) {
-                    const region_axis_base = region_offset + axis * 6;
-                    if (region_axis_base + 6 > data.len) return 0;
-                    // hb's VarRegionAxis::evaluate on F2Dot14 integers, so the
-                    // float rounding (and thus the rounded delta) matches.
-                    const start: i32 = std.mem.readInt(i16, data[region_axis_base..][0..2], .big);
-                    const peak: i32 = std.mem.readInt(i16, data[region_axis_base + 2 ..][0..2], .big);
-                    const end: i32 = std.mem.readInt(i16, data[region_axis_base + 4 ..][0..2], .big);
-                    const coord: i32 = if (axis < normalized_coords.len) @intFromFloat(@round(normalized_coords[axis] * 16384.0)) else 0;
-
-                    if (peak == 0 or coord == peak) continue;
-                    if (coord == 0) {
-                        scalar = 0;
-                        break;
-                    }
-                    if (start > peak or peak > end or (start < 0 and end > 0)) continue;
-                    if (coord <= start or end <= coord) {
-                        scalar = 0;
-                        break;
-                    }
-                    const factor = if (coord < peak)
-                        @as(f32, @floatFromInt(coord - start)) / @as(f32, @floatFromInt(peak - start))
-                    else
-                        @as(f32, @floatFromInt(end - coord)) / @as(f32, @floatFromInt(end - peak));
-                    scalar *= factor;
-                }
+                const scalar = if (scalars) |sc|
+                    (if (region_index < sc.len) sc.values[region_index] else regionScalar(data, region_list_offset, axis_count, region_index, normalized_coords))
+                else
+                    regionScalar(data, region_list_offset, axis_count, region_index, normalized_coords);
 
                 const val: i16 = if (idx >= short_count) blk: {
                     const v: i8 = @bitCast(data[delta_pos]);

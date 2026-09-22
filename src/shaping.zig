@@ -589,7 +589,7 @@ fn shapeWithPlanImpl(
     // hb_ot_substitute_post: runs on the positioned, visual-order buffer.
     hideDefaultIgnorables(&buffer, cmap);
     if (is_arabic) if (apply_mod.HorizontalMetrics.init(font, normalized_coords)) |metrics| {
-        try arabic_mod.applyStch(&buffer, direction == .right_to_left, metrics);
+        try arabic_mod.applyStch(&buffer, direction == .right_to_left, &metrics);
     };
 
     if (item) |it| retainItemGlyphs(&buffer, it);

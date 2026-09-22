@@ -176,7 +176,7 @@ const stch_max_glyphs = 256;
 /// stretch spans the rest of its word. Runs on the positioned, visual-order
 /// buffer. Two passes, as in hb: measure how many copies to add, then grow
 /// the buffer and copy glyphs toward its end.
-pub fn applyStch(buffer: *Buffer, rtl: bool, metrics: apply_mod.HorizontalMetrics) !void {
+pub fn applyStch(buffer: *Buffer, rtl: bool, metrics: *const apply_mod.HorizontalMetrics) !void {
     for (buffer.info.items) |info| {
         if (isStch(info)) break;
     } else return;

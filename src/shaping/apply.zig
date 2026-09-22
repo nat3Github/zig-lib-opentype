@@ -2063,31 +2063,51 @@ pub const HorizontalMetrics = struct {
     number_of_h_metrics: u16,
     hvar: ?[]const u8,
     normalized_coords: []const f32,
+    /// Evaluated once per buffer rather than once per glyph -- the region
+    /// scalars only depend on the coords.
+    scalars: parsing.Table.HVAR.RegionScalars = .{},
 
     pub fn init(font: parsing.Font, normalized_coords: []const f32) ?HorizontalMetrics {
         const hhea_data = font.tableData(table_tag_hhea) orelse return null;
         const hhea = parsing.Table.hhea.parse(hhea_data) catch return null;
-        return .{
+        var self: HorizontalMetrics = .{
             .hmtx = font.tableData(table_tag_hmtx) orelse return null,
             .number_of_h_metrics = hhea.number_of_h_metrics,
             .hvar = if (normalized_coords.len != 0) font.tableData(table_tag_hvar) else null,
             .normalized_coords = normalized_coords,
         };
+        if (self.hvar) |hv| {
+            if (hv.len >= 8) {
+                const store_offset = std.mem.readInt(u32, hv[4..][0..4], .big);
+                self.scalars = .init(hv, store_offset, normalized_coords);
+            }
+        }
+        return self;
     }
 
-    pub fn advance(self: HorizontalMetrics, glyph: u32) i32 {
+    pub fn advance(self: *const HorizontalMetrics, glyph: u32) i32 {
         const glyph_id: u16 = @intCast(glyph & 0xFFFF);
         const advance_width: i32 = parsing.Table.hmtx.metricForGlyph(self.hmtx, glyph_id, self.number_of_h_metrics).advance_width;
         const hv = self.hvar orelse return advance_width;
-        return advance_width + @as(i32, @intFromFloat(hbRound(parsing.Table.HVAR.advanceWidthDelta(hv, glyph_id, self.normalized_coords))));
+        return advance_width + @as(i32, @intFromFloat(hbRound(parsing.Table.HVAR.advanceWidthDelta(hv, glyph_id, self.normalized_coords, &self.scalars))));
     }
 };
 
 pub fn applyDefaultHorizontalAdvances(font: parsing.Font, buffer: *Buffer, cmap: ?Cmap, normalized_coords: []const f32) void {
     const metrics = HorizontalMetrics.init(font, normalized_coords) orelse return;
     var has_space_fallback = false;
+    // hb's `hb_cache_t`, direct-mapped: text repeats glyphs, and an HVAR
+    // delta costs a delta-set map lookup plus a delta-row walk each time.
+    var cached_glyph: [256]u32 = @splat(std.math.maxInt(u32));
+    var cached_advance: [256]i32 = undefined;
     for (buffer.info.items, buffer.pos.items) |glyph_info, *pos| {
-        pos.x_advance = metrics.advance(glyph_info.codepoint);
+        const glyph = glyph_info.codepoint;
+        const slot = glyph & 0xFF;
+        if (cached_glyph[slot] != glyph) {
+            cached_glyph[slot] = glyph;
+            cached_advance[slot] = metrics.advance(glyph);
+        }
+        pos.x_advance = cached_advance[slot];
         if (glyph_info.space_fallback != .not_space) has_space_fallback = true;
     }
     if (has_space_fallback) applySpaceFallbackAdvances(font, buffer, cmap, metrics.hmtx, metrics.number_of_h_metrics);
