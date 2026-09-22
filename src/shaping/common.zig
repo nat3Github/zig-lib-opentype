@@ -4,12 +4,13 @@ const parsing = @import("../parsing.zig");
 const unicode = @import("../unicode.zig");
 
 // Ported from vendor/harfbuzz/src/hb-buffer.hh + hb-buffer.cc (pinned
-// 703e2d1441). The single-allocation info/out_info-aliasing trick hb uses to
-// avoid a second malloc during in-place shaping is dropped in favor of two
-// plain ArrayLists (Zig's allocator already amortizes growth); sync() swaps
-// them instead. Everything else - cluster merge semantics, glyph-flag
-// propagation, max_ops budget - is ported as-is since that's where the
-// actual shaping correctness lives.
+// 703e2d1441), including the info/out_info aliasing: while the output is
+// still a prefix of the input (`out_split` false), `nextGlyph` copies
+// nothing and in-place substitutions write straight into `info`. Only an
+// output that would overrun unread input splits the two apart
+// (`makeRoomFor`, hb's `make_room_for`). Everything else - cluster merge
+// semantics, glyph-flag propagation, max_ops budget - is ported as-is since
+// that's where the actual shaping correctness lives.
 
 pub const glyph_flag_unsafe_to_break: u32 = 0x1;
 pub const glyph_flag_unsafe_to_concat: u32 = 0x2;
@@ -273,7 +274,13 @@ pub const Buffer = struct {
     /// digest to skip lookups that cannot match anything in this run.
     digest: Digest = .{},
     info: std.ArrayList(GlyphInfo) = .empty,
+    /// Backing store for the output half only once it has split from
+    /// `info`; read it through `outItems()`, never directly.
     out_info: std.ArrayList(GlyphInfo) = .empty,
+    /// Glyphs committed to the output half of this pass.
+    out_len: usize = 0,
+    /// False while the output is still `info[0..out_len]` written in place.
+    out_split: bool = false,
     pos: std.ArrayList(GlyphPosition) = .empty,
     /// Cursor into `info` (backtrack side when have_output is set).
     idx: usize = 0,
@@ -318,7 +325,43 @@ pub const Buffer = struct {
     }
 
     pub fn outLen(self: Buffer) usize {
-        return self.out_info.items.len;
+        return self.out_len;
+    }
+
+    /// The output half of an in-progress pass, wherever it currently lives.
+    pub fn outItems(self: *Buffer) []GlyphInfo {
+        return if (self.out_split) self.out_info.items else self.info.items[0..self.out_len];
+    }
+
+    /// hb's `make_room_for`: an output that would overrun input not yet read
+    /// can no longer share `info`, so copy what is committed into `out_info`
+    /// and run split from here to the end of the pass.
+    fn makeRoomFor(self: *Buffer, num_in: usize, num_out: usize) !void {
+        if (self.out_split or self.out_len + num_out <= self.idx + num_in) return;
+        try self.unsplitToSplit();
+    }
+
+    fn unsplitToSplit(self: *Buffer) !void {
+        if (self.out_split) return;
+        self.out_info.clearRetainingCapacity();
+        try self.out_info.appendSlice(self.allocator, self.info.items[0..self.out_len]);
+        self.out_split = true;
+    }
+
+    /// Appends one glyph to the output half. The caller must have reserved
+    /// room with `makeRoomFor` first, so the unsplit write is in bounds.
+    fn outAppend(self: *Buffer, glyph_info: GlyphInfo) !void {
+        if (self.out_split) {
+            try self.out_info.append(self.allocator, glyph_info);
+        } else {
+            self.info.items[self.out_len] = glyph_info;
+        }
+        self.out_len += 1;
+    }
+
+    pub fn outShrink(self: *Buffer, new_len: usize) void {
+        if (self.out_split) self.out_info.shrinkRetainingCapacity(new_len);
+        self.out_len = new_len;
     }
 
     /// Ported from hb_buffer_t::backtrack_len(): during a GSUB pass
@@ -353,9 +396,9 @@ pub const Buffer = struct {
         return &self.pos.items[absolute_index];
     }
 
-    fn prevInfo(self: Buffer) GlyphInfo {
-        const n = self.out_info.items.len;
-        return if (n > 0) self.out_info.items[n - 1] else GlyphInfo{};
+    fn prevInfo(self: *Buffer) GlyphInfo {
+        const out = self.outItems();
+        return if (out.len > 0) out[out.len - 1] else GlyphInfo{};
     }
 
     pub fn add(self: *Buffer, codepoint: u32, cluster: u32) !void {
@@ -373,11 +416,11 @@ pub const Buffer = struct {
 
         const orig_info = if (self.idx < self.info.items.len) self.cur(0) else self.prevInfo();
 
-        try self.out_info.ensureUnusedCapacity(self.allocator, glyph_ids.len);
+        try self.makeRoomFor(num_in, glyph_ids.len);
         for (glyph_ids) |gid| {
             var glyph_info = orig_info;
             glyph_info.codepoint = gid;
-            self.out_info.appendAssumeCapacity(glyph_info);
+            try self.outAppend(glyph_info);
             self.digest.add(gid);
         }
 
@@ -395,7 +438,8 @@ pub const Buffer = struct {
     }
 
     pub fn outputInfo(self: *Buffer, glyph_info: GlyphInfo) !void {
-        try self.out_info.append(self.allocator, glyph_info);
+        try self.makeRoomFor(0, 1);
+        try self.outAppend(glyph_info);
         self.digest.add(glyph_info.codepoint);
     }
 
@@ -406,7 +450,7 @@ pub const Buffer = struct {
     pub fn updateDigest(self: *Buffer) void {
         self.digest.clear();
         for (self.info.items) |glyph_info| self.digest.add(glyph_info.codepoint);
-        for (self.out_info.items) |glyph_info| self.digest.add(glyph_info.codepoint);
+        for (self.outItems()) |glyph_info| self.digest.add(glyph_info.codepoint);
     }
 
     /// Copies the glyph at idx to output without advancing idx.
@@ -417,7 +461,12 @@ pub const Buffer = struct {
     /// Copies the glyph at idx to output (if have_output) and advances idx.
     pub fn nextGlyph(self: *Buffer) !void {
         if (self.have_output) {
-            try self.out_info.append(self.allocator, self.info.items[self.idx]);
+            if (self.out_split) {
+                try self.out_info.append(self.allocator, self.info.items[self.idx]);
+            } else if (self.out_len != self.idx) {
+                self.info.items[self.out_len] = self.info.items[self.idx];
+            }
+            self.out_len += 1;
         }
         self.idx += 1;
     }
@@ -425,7 +474,12 @@ pub const Buffer = struct {
     /// Copies n glyphs at idx to output (if have_output) and advances idx.
     pub fn nextGlyphs(self: *Buffer, n: usize) !void {
         if (self.have_output) {
-            try self.out_info.appendSlice(self.allocator, self.info.items[self.idx..][0..n]);
+            if (self.out_split) {
+                try self.out_info.appendSlice(self.allocator, self.info.items[self.idx..][0..n]);
+            } else if (self.out_len != self.idx) {
+                std.mem.copyForwards(GlyphInfo, self.info.items[self.out_len..][0..n], self.info.items[self.idx..][0..n]);
+            }
+            self.out_len += n;
         }
         self.idx += n;
     }
@@ -440,17 +494,18 @@ pub const Buffer = struct {
     /// cluster itself doesn't vanish from the output.
     pub fn deleteGlyph(self: *Buffer) void {
         const cluster = self.info.items[self.idx].cluster;
-        const out_len = self.out_info.items.len;
+        const out = self.outItems();
+        const out_len = out.len;
         const cluster_survives = (self.idx + 1 < self.info.items.len and cluster == self.info.items[self.idx + 1].cluster) or
-            (out_len != 0 and cluster == self.out_info.items[out_len - 1].cluster);
+            (out_len != 0 and cluster == out[out_len - 1].cluster);
         if (!cluster_survives) {
             if (out_len != 0) {
-                if (cluster < self.out_info.items[out_len - 1].cluster) {
+                if (cluster < out[out_len - 1].cluster) {
                     const mask = self.info.items[self.idx].mask;
-                    const old_cluster = self.out_info.items[out_len - 1].cluster;
+                    const old_cluster = out[out_len - 1].cluster;
                     var i = out_len;
-                    while (i != 0 and self.out_info.items[i - 1].cluster == old_cluster) : (i -= 1) {
-                        setCluster(&self.out_info.items[i - 1], cluster, mask);
+                    while (i != 0 and out[i - 1].cluster == old_cluster) : (i -= 1) {
+                        setCluster(&out[i - 1], cluster, mask);
                     }
                 }
             } else if (self.idx + 1 < self.info.items.len) {
@@ -527,9 +582,10 @@ pub const Buffer = struct {
 
         if (self.idx == start and self.info.items[start].cluster != cluster) {
             const target_cluster = self.info.items[start].cluster;
-            var i = self.out_info.items.len;
-            while (i > 0 and self.out_info.items[i - 1].cluster == target_cluster) : (i -= 1) {
-                setCluster(&self.out_info.items[i - 1], cluster, 0);
+            const out = self.outItems();
+            var i = out.len;
+            while (i > 0 and out[i - 1].cluster == target_cluster) : (i -= 1) {
+                setCluster(&out[i - 1], cluster, 0);
             }
         }
 
@@ -555,21 +611,22 @@ pub const Buffer = struct {
         self.max_ops -= @intCast(end - start);
         if (self.max_ops < 0) self.successful = false;
 
-        var cluster = self.out_info.items[start].cluster;
-        for (self.out_info.items[start + 1 .. end]) |glyph_info| cluster = @min(cluster, glyph_info.cluster);
+        const out = self.outItems();
+        var cluster = out[start].cluster;
+        for (out[start + 1 .. end]) |glyph_info| cluster = @min(cluster, glyph_info.cluster);
 
-        while (start > 0 and self.out_info.items[start - 1].cluster == self.out_info.items[start].cluster) start -= 1;
-        while (end < self.out_info.items.len and self.out_info.items[end - 1].cluster == self.out_info.items[end].cluster) end += 1;
+        while (start > 0 and out[start - 1].cluster == out[start].cluster) start -= 1;
+        while (end < out.len and out[end - 1].cluster == out[end].cluster) end += 1;
 
-        if (end == self.out_info.items.len) {
-            const target_cluster = self.out_info.items[end - 1].cluster;
+        if (end == out.len) {
+            const target_cluster = out[end - 1].cluster;
             var k = self.idx;
             while (k < self.info.items.len and self.info.items[k].cluster == target_cluster) : (k += 1) {
                 setCluster(&self.info.items[k], cluster, 0);
             }
         }
 
-        for (self.out_info.items[start..end]) |*glyph_info| setCluster(glyph_info, cluster, 0);
+        for (out[start..end]) |*glyph_info| setCluster(glyph_info, cluster, 0);
     }
 
     /// Ported from hb_buffer_t::sort - insertion sort restricted to
@@ -672,13 +729,14 @@ pub const Buffer = struct {
                 self.infosSetGlyphFlags(self.info.items, start, end, cluster, mask);
             }
         } else {
+            const out = self.outItems();
             if (!interior) {
-                for (self.out_info.items[start..]) |*glyph_info| glyph_info.mask |= mask;
+                for (out[start..]) |*glyph_info| glyph_info.mask |= mask;
                 for (self.info.items[self.idx..end]) |*glyph_info| glyph_info.mask |= mask;
             } else {
                 var cluster = self.infosFindMinCluster(self.info.items, self.idx, end, std.math.maxInt(u32));
-                cluster = self.infosFindMinCluster(self.out_info.items, start, self.out_info.items.len, cluster);
-                self.infosSetGlyphFlags(self.out_info.items, start, self.out_info.items.len, cluster, mask);
+                cluster = self.infosFindMinCluster(out, start, out.len, cluster);
+                self.infosSetGlyphFlags(out, start, out.len, cluster, mask);
                 self.infosSetGlyphFlags(self.info.items, self.idx, end, cluster, mask);
             }
         }
@@ -713,18 +771,20 @@ pub const Buffer = struct {
             return;
         }
         if (!self.successful) return;
-        const out_len = self.out_info.items.len;
+        const out_len = self.out_len;
         if (out_len < target) {
-            const count = target - out_len;
-            try self.out_info.appendSlice(self.allocator, self.info.items[self.idx..][0..count]);
-            self.idx += count;
+            try self.nextGlyphs(target - out_len);
         } else if (out_len > target) {
             const count = out_len - target;
+            // The splice below reads the output while writing `info`, so the
+            // two must not be the same array.
+            try self.unsplitToSplit();
             // Splice the un-committed tail of out_info back in right before
             // the current input window; idx keeps its numeric value since
             // that's exactly where the spliced-in glyphs now start.
             try self.info.insertSlice(self.allocator, self.idx, self.out_info.items[out_len - count ..]);
             self.out_info.shrinkRetainingCapacity(out_len - count);
+            self.out_len = out_len - count;
         }
     }
 
@@ -734,12 +794,16 @@ pub const Buffer = struct {
         self.have_output = true;
         self.have_positions = false;
         self.idx = 0;
+        self.out_len = 0;
+        self.out_split = false;
         self.out_info.clearRetainingCapacity();
     }
 
     pub fn clearPositions(self: *Buffer) !void {
         self.have_output = false;
         self.have_positions = true;
+        self.out_len = 0;
+        self.out_split = false;
         self.out_info.clearRetainingCapacity();
         try self.pos.resize(self.allocator, self.info.items.len);
         @memset(self.pos.items, .{});
@@ -751,9 +815,15 @@ pub const Buffer = struct {
         std.debug.assert(self.have_output);
         if (self.successful) {
             try self.nextGlyphs(self.info.items.len - self.idx);
-            std.mem.swap(std.ArrayList(GlyphInfo), &self.info, &self.out_info);
+            if (self.out_split) {
+                std.mem.swap(std.ArrayList(GlyphInfo), &self.info, &self.out_info);
+            } else {
+                self.info.shrinkRetainingCapacity(self.out_len);
+            }
         }
         self.have_output = false;
+        self.out_len = 0;
+        self.out_split = false;
         self.out_info.clearRetainingCapacity();
         self.idx = 0;
     }

@@ -1091,12 +1091,13 @@ fn applyContextCore(
 
     {
         var i: u16 = 0;
-        var out_prev = buffer.out_info.items.len;
+        const out_items = buffer.outItems();
+        var out_prev = out_items.len;
         var in_prev = buffer.idx;
         while (i < offs.backtrack_count) : (i += 1) {
             const slot = SlotMatcher{ .reader = reader, .mode = offs.backtrack_mode, .off = offs.backtrack_base + @as(usize, i) * 2 };
             const pos = if (table_index == 0)
-                try matchBackward(buffer.out_info.items, gdef, lookup_flags, joiners.contextual(table_index), out_prev, slot) orelse return false
+                try matchBackward(out_items, gdef, lookup_flags, joiners.contextual(table_index), out_prev, slot) orelse return false
             else
                 try matchBackward(buffer.info.items, gdef, lookup_flags, joiners.contextual(table_index), in_prev, slot) orelse return false;
             if (table_index == 0) out_prev = pos else in_prev = pos;
@@ -1333,7 +1334,7 @@ fn applyReverseChainSingleSubst(
 /// hb's `hb_ot_apply_context_t::_set_glyph_props`: stamps the glyphs a GSUB
 /// lookup just appended to the output. `count` is how many it appended.
 fn setGlyphProps(buffer: *Buffer, count: usize, ligature: bool, component: bool) void {
-    const out = buffer.out_info.items;
+    const out = buffer.outItems();
     for (out[out.len - count ..]) |*glyph_info| {
         glyph_info.is_substituted = true;
         // hb: only the *last* Ligature/Multiple transformation counts, so a
@@ -1421,7 +1422,8 @@ fn applyGsubSubtable(
             setGlyphProps(buffer, gcount, false, true);
             // hb: a glyph already attached to a ligature keeps its lig props.
             if (lig_id == 0) {
-                const produced = buffer.out_info.items[buffer.out_info.items.len - gcount ..];
+                const out_items = buffer.outItems();
+                const produced = out_items[out_items.len - gcount ..];
                 for (produced, 0..) |*glyph_info, component| glyph_info.lig_comp = @truncate(component & 0x0F);
             }
             return true;

@@ -354,25 +354,25 @@ fn normalizeRecomposeRound(ctx: *NormalizeContext, buffer: *Buffer, block_mark_r
 
         compose_check: {
             if (!unicode.isUnicodeMark(cur_codepoint)) break :compose_check;
-            const out_len = buffer.out_info.items.len;
-            const prev_cc = combiningClassOf(&buffer.out_info.items[out_len - 1]);
+            const out_len = buffer.outLen();
+            const prev_cc = combiningClassOf(&buffer.outItems()[out_len - 1]);
             if (!(starter == out_len - 1 or prev_cc < cur_cc)) break :compose_check;
-            const starter_codepoint: u21 = @intCast(buffer.out_info.items[starter].codepoint);
+            const starter_codepoint: u21 = @intCast(buffer.outItems()[starter].codepoint);
             if (block_mark_recompose and unicode.isUnicodeMark(starter_codepoint)) break :compose_check;
             const composed = ctx.compose(starter_codepoint, cur_codepoint) orelse break :compose_check;
             const glyph = ctx.nominalGlyph(composed) orelse break :compose_check;
 
             try buffer.nextGlyph(); // Copy cur to out-buffer.
-            buffer.mergeOutClusters(starter, buffer.out_info.items.len);
-            buffer.out_info.shrinkRetainingCapacity(buffer.out_info.items.len - 1);
-            buffer.out_info.items[starter].codepoint = composed;
-            buffer.out_info.items[starter].var1 = @bitCast(glyph);
+            buffer.mergeOutClusters(starter, buffer.outLen());
+            buffer.outShrink(buffer.outLen() - 1);
+            buffer.outItems()[starter].codepoint = composed;
+            buffer.outItems()[starter].var1 = @bitCast(glyph);
             continue;
         }
 
         try buffer.nextGlyph();
-        if (combiningClassOf(&buffer.out_info.items[buffer.out_info.items.len - 1]) == 0) {
-            starter = buffer.out_info.items.len - 1;
+        if (combiningClassOf(&buffer.outItems()[buffer.outLen() - 1]) == 0) {
+            starter = buffer.outLen() - 1;
         }
     }
     try buffer.sync();

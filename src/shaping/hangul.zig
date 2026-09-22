@@ -141,7 +141,7 @@ pub fn preprocessHangul(font: parsing.Font, buffer: *Buffer, cmap: ?Cmap) !void 
                 try buffer.nextGlyph();
                 if (!hangulIsZeroWidthChar(cmap, hhea, hmtx_data, u)) {
                     buffer.mergeOutClusters(start, end + 1);
-                    const info = buffer.out_info.items;
+                    const info = buffer.outItems();
                     const tone = info[end];
                     var i = end;
                     while (i > start) : (i -= 1) info[i] = info[i - 1];
@@ -240,11 +240,12 @@ pub fn preprocessHangul(font: parsing.Font, buffer: *Buffer, cmap: ?Cmap) !void 
 
                     end = start + s_len;
                     var i = start;
-                    buffer.out_info.items[i].hangul_feature = @intFromEnum(HangulJmo.ljmo);
+                    const out = buffer.outItems();
+                    out[i].hangul_feature = @intFromEnum(HangulJmo.ljmo);
                     i += 1;
-                    buffer.out_info.items[i].hangul_feature = @intFromEnum(HangulJmo.vjmo);
+                    out[i].hangul_feature = @intFromEnum(HangulJmo.vjmo);
                     i += 1;
-                    if (i < end) buffer.out_info.items[i].hangul_feature = @intFromEnum(HangulJmo.tjmo);
+                    if (i < end) out[i].hangul_feature = @intFromEnum(HangulJmo.tjmo);
 
                     buffer.mergeOutGraphemeClusters(start, end);
                     continue;

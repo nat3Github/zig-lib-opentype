@@ -209,14 +209,15 @@ pub fn preprocessTextThai(buffer: *Buffer, cmap: ?Cmap, is_thai: bool, has_thai_
 
         const end = buffer.outLen();
         var start = end - 2;
-        while (start > 0 and thaiIsAboveBaseMark(buffer.out_info.items[start - 1].codepoint)) start -= 1;
+        while (start > 0 and thaiIsAboveBaseMark(buffer.outItems()[start - 1].codepoint)) start -= 1;
 
         if (start + 2 < end) {
             buffer.mergeOutClusters(start, end);
-            const t = buffer.out_info.items[end - 2];
+            const out = buffer.outItems();
+            const t = out[end - 2];
             var j = end - 2;
-            while (j > start) : (j -= 1) buffer.out_info.items[j] = buffer.out_info.items[j - 1];
-            buffer.out_info.items[start] = t;
+            while (j > start) : (j -= 1) out[j] = out[j - 1];
+            out[start] = t;
         }
 
         if (start > 0) buffer.mergeOutGraphemeClusters(start - 1, end);
