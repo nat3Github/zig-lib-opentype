@@ -4,6 +4,7 @@ const parsing = @import("../parsing.zig");
 const common = @import("common.zig");
 const apply_mod = @import("apply.zig");
 const map_mod = @import("map.zig");
+const syllable_machines = @import("syllable_machines.zig");
 const Buffer = common.Buffer;
 const GlyphInfo = common.GlyphInfo;
 const Cmap = common.Cmap;
@@ -516,6 +517,75 @@ fn findSyllablesIndic(buffer: *Buffer) void {
         serial += 1;
         if (serial == 16) serial = 1;
         p = end;
+    }
+}
+
+/// hb's ragel scanner loop (`write exec` in hb-ot-shaper-*-machine.hh),
+/// run over one machine's tables: longest match across the grammar's
+/// alternatives, first-listed rule winning ties, backtracking to the last
+/// accepting position. Every `found_*` action stamps [ts, te) with the next
+/// syllable serial and the rule's syllable type.
+pub fn findSyllables(info: []GlyphInfo, comptime machine: syllable_machines.Machine) void {
+    const pe = info.len;
+    var cs: usize = machine.start;
+    var ts: usize = 0;
+    var te: usize = 0;
+    var act: u8 = 0;
+    var serial: u8 = 1;
+    var p: usize = 0;
+    while (true) {
+        var trans: usize = undefined;
+        if (p == pe) {
+            const eof_trans = machine.eof_trans[cs];
+            if (eof_trans == 0) break;
+            trans = eof_trans - 1;
+        } else {
+            if (machine.from_state_ts[cs]) ts = p;
+            const category = info[p].indic_category;
+            const low = machine.trans_keys[2 * cs];
+            const high = machine.trans_keys[2 * cs + 1];
+            const span = machine.key_spans[cs];
+            const key: usize = if (span > 0 and low <= category and category <= high) category - low else span;
+            trans = machine.indicies[machine.index_offsets[cs] + key];
+        }
+        cs = machine.trans_targs[trans];
+        const action = machine.actions[machine.trans_actions[trans]];
+        const syllable_type: ?u8 = switch (action.kind) {
+            .none => null,
+            .te_next => blk: {
+                te = p + 1;
+                break :blk null;
+            },
+            .te_next_set_act => blk: {
+                te = p + 1;
+                act = action.arg;
+                break :blk null;
+            },
+            .found_next => blk: {
+                te = p + 1;
+                break :blk action.arg;
+            },
+            .found_prev => blk: {
+                te = p;
+                p -= 1;
+                break :blk action.arg;
+            },
+            .found_te => blk: {
+                p = te - 1;
+                break :blk action.arg;
+            },
+            .found_act => blk: {
+                p = te - 1;
+                break :blk machine.act_types[act];
+            },
+        };
+        if (syllable_type) |t| {
+            for (info[ts..te]) |*glyph_info| glyph_info.indic_syllable = (serial << 4) | t;
+            serial += 1;
+            if (serial == 16) serial = 1;
+        }
+        if (machine.to_state_ts[cs]) ts = 0;
+        p += 1;
     }
 }
 

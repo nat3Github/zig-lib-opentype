@@ -2,6 +2,7 @@
 const common = @import("common.zig");
 const map_mod = @import("map.zig");
 const indic_mod = @import("indic.zig");
+const syllable_machines = @import("syllable_machines.zig");
 const arabic_mod = @import("arabic.zig");
 const Buffer = common.Buffer;
 const GlyphInfo = common.GlyphInfo;
@@ -92,9 +93,6 @@ const cat_vabv: u8 = 20;
 const cat_vblw: u8 = 21;
 const cat_vpre: u8 = 22;
 const cat_vpst: u8 = 23;
-const cat_robatic: u8 = 25;
-const cat_xgroup: u8 = 26;
-const cat_ygroup: u8 = 27;
 /// Myanmar's "A" (Asat-adjacent vowel-killer mark); shares numeric value 9
 /// with Indic's A/VD (see `ic_*`'s doc comment above `ic_x`).
 const cat_a: u8 = 9;
@@ -107,133 +105,9 @@ const cat_pt: u8 = 39;
 const cat_vs: u8 = 40;
 const cat_ml: u8 = 41;
 
-fn isKhmerC(cat: u8) bool {
-    return cat == ic_c or cat == ic_ra or cat == ic_v;
-}
-
-/// Ported from `cn = c.((ZWJ|ZWNJ)?.Robatic)?`.
-fn matchKhmerCn(info: []const GlyphInfo, p: usize, end: usize) ?usize {
-    if (!(p < end and isKhmerC(info[p].indic_category))) return null;
-    var q = p + 1;
-    var r = q;
-    if (r < end and isIndicJoiner(info[r].indic_category)) r += 1;
-    if (r < end and info[r].indic_category == cat_robatic) q = r + 1;
-    return q;
-}
-
-/// Ported from `xgroup = (joiner*.Xgroup)*`.
-fn matchKhmerXgroup(info: []const GlyphInfo, p: usize, end: usize) usize {
-    var q = p;
-    while (true) {
-        var r = q;
-        while (r < end and isIndicJoiner(info[r].indic_category)) r += 1;
-        if (r < end and info[r].indic_category == cat_xgroup) {
-            q = r + 1;
-        } else break;
-    }
-    return q;
-}
-
-/// Ported from `ygroup = Ygroup*`.
-fn matchKhmerYgroup(info: []const GlyphInfo, p: usize, end: usize) usize {
-    var q = p;
-    while (q < end and info[q].indic_category == cat_ygroup) q += 1;
-    return q;
-}
-
-/// Ported from `matra_group = VPre? xgroup VBlw? xgroup (joiner?.VAbv)? xgroup VPst?`.
-fn matchKhmerMatraGroup(info: []const GlyphInfo, p: usize, end: usize) usize {
-    var q = p;
-    if (q < end and info[q].indic_category == cat_vpre) q += 1;
-    q = matchKhmerXgroup(info, q, end);
-    if (q < end and info[q].indic_category == cat_vblw) q += 1;
-    q = matchKhmerXgroup(info, q, end);
-    {
-        var r = q;
-        if (r < end and isIndicJoiner(info[r].indic_category)) r += 1;
-        if (r < end and info[r].indic_category == cat_vabv) q = r + 1;
-    }
-    q = matchKhmerXgroup(info, q, end);
-    if (q < end and info[q].indic_category == cat_vpst) q += 1;
-    return q;
-}
-
-/// Ported from `syllable_tail = xgroup matra_group xgroup (H.c)? ygroup`.
-fn matchKhmerSyllableTail(info: []const GlyphInfo, p: usize, end: usize) usize {
-    var q = matchKhmerXgroup(info, p, end);
-    q = matchKhmerMatraGroup(info, q, end);
-    q = matchKhmerXgroup(info, q, end);
-    if (q < end and info[q].indic_category == ic_h and q + 1 < end and isKhmerC(info[q + 1].indic_category)) q += 2;
-    q = matchKhmerYgroup(info, q, end);
-    return q;
-}
-
-/// Ported from `broken_cluster = Robatic? (H.cn)* (H | syllable_tail)`.
-fn matchKhmerBrokenCluster(info: []const GlyphInfo, p: usize, end: usize) usize {
-    var q = p;
-    if (q < end and info[q].indic_category == cat_robatic) q += 1;
-    while (q < end and info[q].indic_category == ic_h) {
-        if (matchKhmerCn(info, q + 1, end)) |e| {
-            q = e;
-        } else break;
-    }
-    const tail_end = matchKhmerSyllableTail(info, q, end);
-    var alt_end = tail_end;
-    if (q < end and info[q].indic_category == ic_h and q + 1 > alt_end) alt_end = q + 1;
-    return alt_end;
-}
-
-/// Ported from `consonant_syllable = (cn|PLACEHOLDER|DOTTEDCIRCLE) broken_cluster`.
-fn matchKhmerConsonantSyllable(info: []const GlyphInfo, p: usize, end: usize) ?usize {
-    var q: usize = undefined;
-    if (matchKhmerCn(info, p, end)) |e| {
-        q = e;
-    } else if (p < end and (info[p].indic_category == ic_placeholder or info[p].indic_category == ic_dottedcircle)) {
-        q = p + 1;
-    } else return null;
-    return matchKhmerBrokenCluster(info, q, end);
-}
-
 const khmer_syllable_consonant: u8 = 0;
 const khmer_syllable_broken: u8 = 1;
 const khmer_syllable_non_khmer: u8 = 2;
-
-/// Ported from `find_syllables_khmer`, same greedy-longest-match-across-
-/// alternatives technique as `findSyllablesIndic` above.
-fn findSyllablesKhmer(buffer: *Buffer) void {
-    const info = buffer.info.items;
-    const count = info.len;
-    var p: usize = 0;
-    var serial: u8 = 1;
-    while (p < count) {
-        // 0 sentinels "no rule matched yet" so `other` (last-listed in the
-        // .rl scanner) loses ties instead of winning them - see the
-        // matching comment in use.zig's findSyllablesUse.
-        var best_len: usize = 0;
-        var best_type: u8 = khmer_syllable_non_khmer;
-        if (matchKhmerConsonantSyllable(info, p, count)) |e| {
-            const l = e - p;
-            if (l > best_len) {
-                best_len = l;
-                best_type = khmer_syllable_consonant;
-            }
-        }
-        {
-            const l = matchKhmerBrokenCluster(info, p, count) - p;
-            if (l > best_len) {
-                best_len = l;
-                best_type = khmer_syllable_broken;
-            }
-        }
-        if (best_len == 0) best_len = 1; // `other`: no rule matched even one glyph.
-        const start = p;
-        const end = p + best_len;
-        for (info[start..end]) |*gi| gi.indic_syllable = (serial << 4) | best_type;
-        serial += 1;
-        if (serial == 16) serial = 1;
-        p = end;
-    }
-}
 
 pub fn collectFeaturesKhmer(map_builder: *MapBuilder) !void {
     const manual_joiners_syllable = MapFeatureFlags{ .manual_zwnj = true, .manual_zwj = true, .per_syllable = true };
@@ -317,7 +191,7 @@ fn reorderKhmerSyllable(buffer: *Buffer, map: Map, start: usize, end: usize) voi
 /// doc comment for why).
 pub fn setupMasksKhmer(buffer: *Buffer, map: Map, cmap: ?Cmap) !void {
     for (buffer.info.items) |*info| info.indic_category = @intCast(indicGetCategories(info.codepoint) & 0xFF);
-    findSyllablesKhmer(buffer);
+    indic_mod.findSyllables(buffer.info.items, syllable_machines.khmer);
     _ = try common.insertDottedCircles(buffer, cmap, khmer_syllable_broken, ic_dottedcircle, null, null, false);
 
     var start: usize = 0;
