@@ -1978,10 +1978,18 @@ fn applyLookup(
 
     if (table_index == 0) buffer.clearOutput();
     while (buffer.idx < buffer.len()) {
+        // hb's `apply_forward`: find the next applicable glyph in a tight
+        // loop, then move the rejected run to the output in one step.
+        const infos = buffer.info.items;
+        var next = buffer.idx;
+        while (next < infos.len) : (next += 1) {
+            if (infos[next].mask & entry.mask != 0 and
+                entry.digest.mayHave(infos[next].codepoint) and
+                matchesLookupProps(&infos[next], gdef, lookup_flags)) break;
+        }
+        if (next > buffer.idx) try buffer.nextGlyphs(next - buffer.idx);
+        if (buffer.idx >= buffer.len()) break;
         var applied = false;
-        if (buffer.info.items[buffer.idx].mask & entry.mask != 0 and
-            entry.digest.mayHave(buffer.info.items[buffer.idx].codepoint) and
-            matchesLookupProps(&buffer.info.items[buffer.idx], gdef, lookup_flags))
         {
             var si: u16 = 0;
             while (si < sub_count) : (si += 1) {
