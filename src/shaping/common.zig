@@ -579,10 +579,6 @@ pub const Buffer = struct {
         self.skipGlyph();
     }
 
-    pub fn resetMasks(self: *Buffer, mask: u32) void {
-        for (self.info.items) |*glyph_info| glyph_info.mask = mask;
-    }
-
     pub fn addMasks(self: *Buffer, mask: u32) void {
         for (self.info.items) |*glyph_info| glyph_info.mask |= mask;
     }

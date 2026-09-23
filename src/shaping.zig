@@ -51,7 +51,7 @@ const zeroDefaultIgnorableAdvances = apply_mod.zeroDefaultIgnorableAdvances;
 const finishGposOffsets = apply_mod.finishGposOffsets;
 const table_tag_gdef = apply_mod.table_tag_gdef;
 const normalize = normalize_mod.normalize;
-const formClusters = normalize_mod.formClusters;
+const appendCodepointsFormingClusters = normalize_mod.appendCodepointsFormingClusters;
 const mapGlyphsFast = normalize_mod.mapGlyphsFast;
 const hang_script_tag = hangul_mod.hang_script_tag;
 const collectFeaturesHangul = hangul_mod.collectFeaturesHangul;
@@ -519,10 +519,11 @@ fn shapeWithPlanImpl(
     try buffer.info.ensureTotalCapacityPrecise(allocator, codepoints.len);
     try buffer.out_info.ensureTotalCapacityPrecise(allocator, codepoints.len);
 
-    for (codepoints, 0..) |cp, i| buffer.info.appendAssumeCapacity(.{ .codepoint = cp, .cluster = @intCast(i) });
-    formClusters(&buffer);
-
     const map = plan.map;
+    // hb initializes masks before any preprocessing, so glyphs inserted or
+    // decomposed later inherit them.
+    appendCodepointsFormingClusters(&buffer, codepoints, map.global_mask);
+
     const cmap = plan.cmap;
     const indic_config = plan.indic_config;
     const is_hangul = plan.is_hangul;
@@ -533,10 +534,6 @@ fn shapeWithPlanImpl(
     const is_myanmar = plan.is_myanmar;
     const is_use = plan.is_use;
     const is_use_arabic_joining = plan.is_use_arabic_joining;
-
-    // hb initializes masks before any preprocessing, so glyphs inserted or
-    // decomposed later inherit them.
-    buffer.resetMasks(map.global_mask);
 
     // hb runs the shaper's preprocess_text (Hangul syllable decompose/
     // compose, Thai SARA AM reorder/PUA fallback - see those shapers'

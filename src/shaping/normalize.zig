@@ -448,19 +448,24 @@ pub fn normalize(buffer: *Buffer, cmap: ?Cmap, nominal_glyphs: *common.NominalGl
 /// `unicode.GraphemeBreakIterator` is the full algorithm and would merge
 /// strictly more than hb does. Runs before `normalize`, matching hb's
 /// order, so decompositions inherit the already-merged cluster.
-pub fn formClusters(buffer: *Buffer) void {
-    const infos = buffer.info.items;
+///
+/// Fused with filling the buffer (hb's `reset_masks`, which also precedes
+/// `hb_form_clusters`) so the codepoints are walked once. `buffer.info`
+/// must have capacity for `codepoints`.
+pub fn appendCodepointsFormingClusters(buffer: *Buffer, codepoints: []const u21, mask: u32) void {
     var start: usize = 0;
     var prev_continuation = false;
-    var i: usize = 1;
-    while (i <= infos.len) : (i += 1) {
-        const continuation = i < infos.len and isGraphemeContinuation(infos, i, prev_continuation);
+    for (codepoints, 0..) |cp, i| {
+        buffer.info.appendAssumeCapacity(.{ .codepoint = cp, .cluster = @intCast(i), .mask = mask });
+        if (i == 0) continue;
+        const continuation = isGraphemeContinuation(buffer.info.items, i, prev_continuation);
         if (!continuation) {
             buffer.mergeGraphemeClusters(start, i);
             start = i;
         }
         prev_continuation = continuation;
     }
+    buffer.mergeGraphemeClusters(start, codepoints.len);
 }
 
 fn isRegionalIndicator(cp: u32) bool {
