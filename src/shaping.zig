@@ -508,9 +508,15 @@ fn shapeWithPlanImpl(
     codepoints: []const u21,
     direction: Direction,
     script_tags: []const Tag,
-    normalized_coords: []const f32,
+    all_normalized_coords: []const f32,
     item: ?Item,
 ) (parsing.Font.ParseError || error{OutOfMemory})!Buffer {
+    // hb's `has_nonzero_coords`: at the default instance every variation
+    // delta is zero, so skip evaluating them.
+    const normalized_coords: []const f32 = for (all_normalized_coords) |coord| {
+        if (coord != 0) break all_normalized_coords;
+    } else &.{};
+
     var buffer = Buffer.init(allocator);
     errdefer buffer.deinit();
 
