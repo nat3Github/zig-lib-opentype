@@ -252,7 +252,9 @@ fn shouldSkipGlyph(info: *GlyphInfo, gdef: Gdef, lookup_flags: u32, skip: Skip) 
 /// without the joiner handling. `applyLookup` gates each glyph it steps
 /// over on this rather than on `shouldSkipGlyph`, because a lookup does
 /// apply at a ZWJ/ZWNJ even though matching steps over one.
-fn matchesLookupProps(info: *GlyphInfo, gdef: Gdef, lookup_flags: u32) bool {
+inline fn matchesLookupProps(info: *GlyphInfo, gdef: Gdef, lookup_flags: u32) bool {
+    // Inlined fast path for a cached non-mark: hb's single glyph_props test.
+    if (info.gdef_class_glyph == info.codepoint and info.gdef_class != 3) return !shouldSkipClass(info.gdef_class, lookup_flags);
     return !filteredByLookupProps(info, gdef, lookup_flags);
 }
 
