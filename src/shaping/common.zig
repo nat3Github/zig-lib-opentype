@@ -268,6 +268,57 @@ pub const Digest = struct {
     pub fn full() Digest {
         return .{ .masks = @splat(std.math.maxInt(u64)) };
     }
+
+    fn bitIndices(glyph: u32) [n]u32 {
+        var bits: [n]u32 = undefined;
+        inline for (shifts, 0..) |shift, i| bits[i] = @as(u32, i) * 64 + ((glyph >> shift) & mb1);
+        return bits;
+    }
+};
+
+/// A lookup's subtable digests transposed to one subtable bitset per digest
+/// bit: a word per 64 subtables instead of a digest test per subtable
+/// (Devanagari 'pres' has 114).
+pub const SubtableFilter = struct {
+    rows: []const u64,
+    words: usize,
+
+    pub const min_subtables = 16;
+
+    pub fn build(allocator: std.mem.Allocator, rows: *std.ArrayList(u64), subtables: []const SubtableInfo) error{OutOfMemory}!u32 {
+        const start: u32 = @intCast(rows.items.len);
+        const words = (subtables.len + 63) / 64;
+        try rows.appendNTimes(allocator, 0, Digest.n * 64 * words);
+        const out = rows.items[start..];
+        for (subtables, 0..) |sub, si| {
+            for (sub.digest.masks, 0..) |mask, i| {
+                var bits = mask;
+                while (bits != 0) : (bits &= bits - 1) {
+                    const row = i * 64 + @ctz(bits);
+                    out[row * words + si / 64] |= @as(u64, 1) << @intCast(si % 64);
+                }
+            }
+        }
+        return start;
+    }
+
+    pub fn next(self: SubtableFilter, glyph: u32, from: usize) ?usize {
+        const bits = Digest.bitIndices(glyph);
+        var w = from / 64;
+        var candidates = self.word(bits, w) & (~@as(u64, 0) << @intCast(from % 64));
+        while (candidates == 0) {
+            w += 1;
+            if (w >= self.words) return null;
+            candidates = self.word(bits, w);
+        }
+        return w * 64 + @ctz(candidates);
+    }
+
+    fn word(self: SubtableFilter, bits: [Digest.n]u32, w: usize) u64 {
+        var result = ~@as(u64, 0);
+        for (bits) |row| result &= self.rows[row * self.words + w];
+        return result;
+    }
 };
 
 pub const Buffer = struct {

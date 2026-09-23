@@ -1936,6 +1936,7 @@ fn applyLookup(
     table_index: u1,
     direction: Direction,
     subtables: []const common.SubtableInfo,
+    filter: ?common.SubtableFilter,
     caches: []common.SubtableCache,
 ) (parsing.Font.ParseError || error{OutOfMemory})!void {
     const lk = try layout.lookupAt(entry.index);
@@ -1975,7 +1976,6 @@ fn applyLookup(
         return;
     }
 
-
     if (table_index == 0) buffer.clearOutput();
     while (buffer.idx < buffer.len()) {
         // hb's `apply_forward`: find the next applicable glyph in a tight
@@ -1993,6 +1993,7 @@ fn applyLookup(
         {
             var si: u16 = 0;
             while (si < sub_count) : (si += 1) {
+                if (filter) |f| si = @intCast(f.next(buffer.info.items[buffer.idx].codepoint, si) orelse break);
                 var sub_type = lookup_type;
                 var sub_cov: ?*const parsing.Table.Layout.Coverage.Resolved = null;
                 var sub_cache: ?*common.SubtableCache = null;
@@ -2036,7 +2037,11 @@ pub fn applyStage(
         if (entry.mask & buffer.mask_union == 0) continue;
         if (!entry.digest.mayIntersect(buffer.digest)) continue;
         const subtables = map.subtables.items[entry.subtables_start..][0..entry.subtables_len];
-        try applyLookup(layout, entry, gdef, buffer, table_index, direction, subtables, map.subtable_caches.items);
+        const filter: ?common.SubtableFilter = if (entry.filter_start == LookupMapEntry.no_filter) null else .{
+            .rows = map.subtable_filters.items[entry.filter_start..],
+            .words = (subtables.len + 63) / 64,
+        };
+        try applyLookup(layout, entry, gdef, buffer, table_index, direction, subtables, filter, map.subtable_caches.items);
     }
 }
 

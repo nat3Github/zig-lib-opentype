@@ -205,6 +205,9 @@ fn fillLookupDigests(allocator: std.mem.Allocator, font: parsing.Font, map: *Map
                 entry.digest = try apply_mod.lookupDigest(allocator, layout, entry.index, table_index, &map.subtables, &map.subtable_caches);
                 entry.subtables_start = @intCast(start);
                 entry.subtables_len = @intCast(map.subtables.items.len - start);
+                if (entry.subtables_len >= common.SubtableFilter.min_subtables) {
+                    entry.filter_start = try common.SubtableFilter.build(allocator, &map.subtable_filters, map.subtables.items[start..]);
+                }
             }
         }
     }

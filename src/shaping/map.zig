@@ -82,11 +82,16 @@ pub const LookupMapEntry = struct {
     /// range filters nothing.
     subtables_start: u32 = 0,
     subtables_len: u32 = 0,
+    /// Start of this lookup's `common.SubtableFilter` rows in
+    /// `Map.subtable_filters`, or `no_filter`.
+    filter_start: u32 = no_filter,
     auto_zwnj: bool = true,
     auto_zwj: bool = true,
     random: bool = false,
     per_syllable: bool = false,
     feature_tag: Tag = .{ ' ', ' ', ' ', ' ' },
+
+    pub const no_filter = std.math.maxInt(u32);
 };
 
 /// hb registers a `pause_func_t` per stage; this port tags the stage
@@ -119,9 +124,11 @@ pub const Map = struct {
     stages: [2]std.ArrayList(StageMapEntry) = .{ .empty, .empty },
     subtables: std.ArrayList(common.SubtableInfo) = .empty,
     subtable_caches: std.ArrayList(common.SubtableCache) = .empty,
+    subtable_filters: std.ArrayList(u64) = .empty,
 
     pub fn deinit(self: *Map, allocator: std.mem.Allocator) void {
         self.features.deinit(allocator);
+        self.subtable_filters.deinit(allocator);
         self.subtables.deinit(allocator);
         self.subtable_caches.deinit(allocator);
         for (&self.lookups) |*l| l.deinit(allocator);
