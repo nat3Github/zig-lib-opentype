@@ -2071,12 +2071,11 @@ pub fn applyStage(
     const tag = if (table_index == 0) table_tag_gsub else table_tag_gpos;
     const data = font.tableData(tag) orelse return;
     const layout = parsing.Table.Layout{ .data = data };
-    buffer.updateDigest();
     for (map.getStageLookups(table_index, stage)) |entry| {
-        // Substitutions during this pass only ever add glyphs to the buffer
-        // digest, so a lookup skipped here could not have matched earlier in
-        // the pass either. Added glyphs copy an input glyph's mask, so the
-        // mask union never gains a feature bit within a stage.
+        // Between digest refreshes substitutions only ever add glyphs to the
+        // buffer digest, so a lookup skipped here could not have matched
+        // earlier either. Added glyphs copy an input glyph's mask, so the
+        // mask union never gains a feature bit between refreshes.
         if (entry.mask & buffer.mask_union == 0) continue;
         if (!entry.digest.mayIntersect(buffer.digest)) continue;
         const subtables = map.subtables.items[entry.subtables_start..][0..entry.subtables_len];

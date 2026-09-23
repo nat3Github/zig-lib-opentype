@@ -501,9 +501,9 @@ pub const Buffer = struct {
     }
 
     /// Rebuilds `digest` from the glyphs the buffer currently holds -- hb's
-    /// `hb_buffer_t::update_digest`, called at the start of each GSUB/GPOS
-    /// pass so stages that rewrite `codepoint` in place (glyph mapping, Thai
-    /// PUA shaping, composition, ignorable hiding) are accounted for.
+    /// `hb_buffer_t::update_digest`, called at the start of GSUB and GPOS and
+    /// after every GSUB pause, so passes that rewrite `codepoint` or masks in
+    /// place (glyph mapping, Thai PUA shaping, reordering) are accounted for.
     pub fn updateDigest(self: *Buffer) void {
         self.digest.clear();
         self.mask_union = 0;

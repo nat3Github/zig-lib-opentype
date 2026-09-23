@@ -597,6 +597,7 @@ fn shapeWithPlanImpl(
     const zero_marks_late = !(zero_marks_early or is_hangul or is_khmer or indic_config != null);
     if (zero_marks_early) zeroMarkWidthsByGdef(&buffer, gdef_classdef);
     {
+        buffer.updateDigest();
         var stage: u32 = 0;
         while (stage < map.stageCount(1)) : (stage += 1) {
             try applyStage(font, map, 1, gdef_classdef, &buffer, direction, stage);
@@ -685,10 +686,14 @@ fn applyGsub(
     consonant_positions: *common.MappingCache,
 ) (parsing.Font.ParseError || error{OutOfMemory})!void {
     apply_mod.resetGlyphClasses(buffer.info.items);
+    // hb refreshes the buffer digest only here and after a pause: in between,
+    // substitutions add their glyphs to it, so it stays a superset.
+    buffer.updateDigest();
     var stage: u32 = 0;
     while (stage < map.stageCount(0)) : (stage += 1) {
         try applyStage(font, map, 0, gdef_classdef, buffer, direction, stage);
-        switch (map.stagePause(0, stage)) {
+        const pause = map.stagePause(0, stage);
+        switch (pause) {
             .none => {},
             .indic_initial_reorder => initialReorderingIndic(font, buffer, map, indic_config.?.*, cmap, consonant_positions),
             .indic_final_reorder => finalReorderingIndic(font, buffer, map, indic_config.?.*, cmap),
@@ -701,6 +706,7 @@ fn applyGsub(
             .myanmar_reorder => try khmer_myanmar_mod.reorderMyanmar(buffer, cmap),
             .arabic_record_stch => arabic_mod.recordStch(buffer, map),
         }
+        if (pause != .none) buffer.updateDigest();
     }
 }
 
