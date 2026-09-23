@@ -213,6 +213,7 @@ fn fillLookupDigests(allocator: std.mem.Allocator, font: parsing.Font, map: *Map
 pub const Plan = struct {
     map: Map,
     cmap: ?parsing.Table.cmap.Resolved,
+    caches: *common.PlanCaches,
     /// GDEF GlyphClassDef decoded to a glyph-indexed array: every matched
     /// glyph of every lookup asks for its class, so the binary search shows
     /// up in profiles. Null when the font has no usable GlyphClassDef.
@@ -344,10 +345,13 @@ pub const Plan = struct {
             };
         } else null;
         errdefer if (gdef_classes) |d| allocator.free(d);
+        const caches = try allocator.create(common.PlanCaches);
+        caches.* = .{};
 
         return .{
             .map = map,
             .cmap = cmap,
+            .caches = caches,
             .gdef_classes = gdef_classes,
             .indic_config = indic_config,
             .is_hangul = is_hangul,
@@ -364,6 +368,7 @@ pub const Plan = struct {
     pub fn deinit(self: *Plan, allocator: std.mem.Allocator) void {
         self.map.deinit(allocator);
         if (self.gdef_classes) |d| allocator.free(d);
+        allocator.destroy(self.caches);
         self.* = undefined;
     }
 };
@@ -551,7 +556,7 @@ fn shapeWithPlanImpl(
     // compose_hebrew's presentation-form fallback: only for legacy fonts
     // that have no GPOS 'mark' feature to position the points themselves.
     const hebrew_presentation_forms = is_hebrew and map.get1Mask(.{ 'm', 'a', 'r', 'k' }) == 0;
-    try normalize(&buffer, cmap, normalization_mode, block_mark_recompose, if (indic_config != null) .indic else if (is_khmer) .khmer else .none, if (is_arabic) .arabic else if (is_hebrew) .hebrew else .none, hebrew_presentation_forms);
+    try normalize(&buffer, cmap, &plan.caches.nominal_glyphs, normalization_mode, block_mark_recompose, if (indic_config != null) .indic else if (is_khmer) .khmer else .none, if (is_arabic) .arabic else if (is_hebrew) .hebrew else .none, hebrew_presentation_forms);
 
     setupMasksFraction(&buffer, map, direction);
 
@@ -577,7 +582,7 @@ fn shapeWithPlanImpl(
             null,
     } else .{};
 
-    try applyGsub(font, map, gdef_classdef, &buffer, direction, indic_config, cmap);
+    try applyGsub(font, map, gdef_classdef, &buffer, direction, indic_config, cmap, &plan.caches.consonant_positions);
     try buffer.clearPositions();
     applyDefaultHorizontalAdvances(font, &buffer, cmap, normalized_coords);
     // hb-ot-shape.cc's `zero_width_marks` shaper property: the Indic,
@@ -673,6 +678,7 @@ fn applyGsub(
     direction: Direction,
     indic_config: ?*const indic_mod.IndicScriptConfig,
     cmap: ?parsing.Table.cmap.Resolved,
+    consonant_positions: *common.MappingCache,
 ) (parsing.Font.ParseError || error{OutOfMemory})!void {
     apply_mod.resetGlyphClasses(buffer.info.items);
     var stage: u32 = 0;
@@ -680,7 +686,7 @@ fn applyGsub(
         try applyStage(font, map, 0, gdef_classdef, buffer, direction, stage);
         switch (map.stagePause(0, stage)) {
             .none => {},
-            .indic_initial_reorder => initialReorderingIndic(font, buffer, map, indic_config.?.*, cmap),
+            .indic_initial_reorder => initialReorderingIndic(font, buffer, map, indic_config.?.*, cmap, consonant_positions),
             .indic_final_reorder => finalReorderingIndic(font, buffer, map, indic_config.?.*, cmap),
             .clear_substitution_flags => for (buffer.info.items) |*info| {
                 info.is_substituted = false;

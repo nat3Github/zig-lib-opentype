@@ -1156,6 +1156,34 @@ pub const MappingCache = struct {
     }
 };
 
+/// hb_ot_font's cmap cache (`hb_cache_t<21, 16, 8>`), misses included. Kept
+/// in the plan so it persists across shape calls the way hb's does on the
+/// font; entries are idempotent, so racing threads only lose entries.
+pub const NominalGlyphCache = struct {
+    slots: [256]u32 = @splat(empty),
+
+    const empty = std.math.maxInt(u32);
+    const found: u32 = 0x10000;
+
+    pub fn lookup(self: *NominalGlyphCache, cmap: Cmap, codepoint: u21) ?u16 {
+        const slot_ptr = &self.slots[codepoint & 0xff];
+        const key = @as(u32, codepoint >> 8) << 17;
+        const slot = @atomicLoad(u32, slot_ptr, .monotonic);
+        if (slot != empty and slot & ~(found | 0xFFFF) == key) return if (slot & found != 0) @truncate(slot) else null;
+        const glyph = cmap.lookup(codepoint);
+        @atomicStore(u32, slot_ptr, key | if (glyph) |g| found | g else 0, .monotonic);
+        return glyph;
+    }
+};
+
+/// Caches that live as long as a plan and so persist across shape calls.
+pub const PlanCaches = struct {
+    nominal_glyphs: NominalGlyphCache = .{},
+    /// glyph -> `consonantPositionFromFace`, which costs up to eight GSUB
+    /// dry-runs per consonant and depends only on the plan.
+    consonant_positions: MappingCache = .{},
+};
+
 /// hb's PairPos/LigatureSubst `external_cache_t`: glyph -> coverage index,
 /// plus glyph -> class for PairPos format 2's two ClassDefs, plus
 /// LigatureSubst's digest of every ligature's second glyph.

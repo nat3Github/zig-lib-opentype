@@ -1135,11 +1135,21 @@ pub fn setupMasksIndic(buffer: *Buffer, cmap: ?Cmap) !void {
 
 /// Ported from `initial_reordering_indic`: the GSUB pause after
 /// 'locl'/'ccmp' and before the basic-forms features.
-pub fn initialReorderingIndic(font: parsing.Font, buffer: *Buffer, map: Map, config: IndicScriptConfig, cmap: ?Cmap) void {
+pub fn initialReorderingIndic(font: parsing.Font, buffer: *Buffer, map: Map, config: IndicScriptConfig, cmap: ?Cmap, consonant_positions: *common.MappingCache) void {
     const plan = indicPlan(font, map, config, cmap);
     if (plan.virama_glyph != 0) {
         for (buffer.info.items) |*info| {
-            if (info.indic_position == ip_base_c) info.indic_position = consonantPositionFromFace(plan, info.codepoint);
+            if (info.indic_position != ip_base_c) continue;
+            if (info.codepoint > std.math.maxInt(u16)) {
+                info.indic_position = consonantPositionFromFace(plan, info.codepoint);
+                continue;
+            }
+            const glyph: u16 = @intCast(info.codepoint);
+            info.indic_position = @intCast(consonant_positions.get(glyph) orelse blk: {
+                const position = consonantPositionFromFace(plan, glyph);
+                consonant_positions.set(glyph, position);
+                break :blk position;
+            });
         }
     }
     forEachIndicSyllable(buffer, plan, initialReorderingSyllable);

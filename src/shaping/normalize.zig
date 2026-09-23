@@ -17,11 +17,7 @@ const NormalizeContext = struct {
     /// `compose_hebrew`'s fallback half, which hb runs only when the font
     /// has no GPOS 'mark' feature to position the points itself.
     hebrew_presentation_forms: bool = false,
-    cached_codepoint: [64]u21 = @splat(not_unicode),
-    cached_glyph: [64]u32 = undefined,
-
-    const not_unicode = std.math.maxInt(u21);
-    const not_found = std.math.maxInt(u32);
+    nominal_glyphs: *common.NominalGlyphCache,
 
     /// Ported from `decompose_indic`'s explicit "don't decompose these"
     /// cases: these four are letters in their own right, and splitting them
@@ -59,17 +55,9 @@ const NormalizeContext = struct {
         return resolved.lookupVariation(codepoint, selector) orelse null;
     }
 
-    /// hb's font-level nominal-glyph cache, direct-mapped: text repeats
-    /// characters and each miss is a cmap subtable search.
     fn nominalGlyph(self: *NormalizeContext, codepoint: u21) ?u32 {
         const resolved = self.cmap orelse return null;
-        const slot = codepoint & 0x3F;
-        if (self.cached_codepoint[slot] != codepoint) {
-            self.cached_codepoint[slot] = codepoint;
-            self.cached_glyph[slot] = resolved.lookup(codepoint) orelse not_found;
-        }
-        const glyph = self.cached_glyph[slot];
-        return if (glyph == not_found) null else glyph;
+        return self.nominal_glyphs.lookup(resolved, codepoint) orelse null;
     }
 };
 
@@ -403,11 +391,11 @@ fn normalizeRecomposeRound(ctx: *NormalizeContext, buffer: *Buffer, block_mark_r
 pub const Mode = enum { none, composed_diacritics, composed_diacritics_no_short_circuit };
 pub const ReorderMarks = enum { none, arabic, hebrew };
 
-pub fn normalize(buffer: *Buffer, cmap: ?Cmap, mode: Mode, block_mark_recompose: bool, decompose_override: DecomposeOverride, reorder_marks: ReorderMarks, hebrew_presentation_forms: bool) !void {
+pub fn normalize(buffer: *Buffer, cmap: ?Cmap, nominal_glyphs: *common.NominalGlyphCache, mode: Mode, block_mark_recompose: bool, decompose_override: DecomposeOverride, reorder_marks: ReorderMarks, hebrew_presentation_forms: bool) !void {
     if (buffer.info.items.len == 0) return;
     const always_short_circuit = mode == .none;
     const might_short_circuit = mode != .composed_diacritics_no_short_circuit;
-    var ctx_storage = NormalizeContext{ .cmap = cmap, .decompose_override = decompose_override, .hebrew_presentation_forms = hebrew_presentation_forms };
+    var ctx_storage = NormalizeContext{ .cmap = cmap, .nominal_glyphs = nominal_glyphs, .decompose_override = decompose_override, .hebrew_presentation_forms = hebrew_presentation_forms };
     const ctx = &ctx_storage;
 
     var all_simple = true;
