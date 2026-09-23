@@ -46,6 +46,10 @@ fn packedContains(table: []const u32, codepoint: u21) bool {
     return packedLookup(table, codepoint) == 1;
 }
 
+fn bmpSetContains(index: *const [1024]u8, words: []const u64, codepoint: u16) bool {
+    return words[index[codepoint >> 6]] >> @intCast(codepoint & 63) & 1 != 0;
+}
+
 pub const BidiClass = enum {
     l,
     r,
@@ -2064,6 +2068,7 @@ pub fn useCategory(codepoint: u21) u8 {
 /// Canonical_Combining_Class (UnicodeData.txt field 3); 0 for every
 /// codepoint not explicitly assigned a nonzero class.
 pub fn combiningClass(codepoint: u21) u8 {
+    if (codepoint <= 0xFFFF) return tables.combining_class_bmp_blocks[@as(usize, tables.combining_class_bmp_index[codepoint >> 5]) * 32 + (codepoint & 31)];
     const class = packedLookup(&tables.combining_class_ranges, codepoint);
     return if (class == no_class) 0 else class;
 }
@@ -2111,11 +2116,13 @@ pub fn modifiedCombiningClass(codepoint: u21) u8 {
 
 /// General_Category is Mn, Mc, or Me.
 pub fn isUnicodeMark(codepoint: u21) bool {
+    if (codepoint <= 0xFFFF) return bmpSetContains(&tables.unicode_mark_bmp_index, &tables.unicode_mark_bmp_words, @intCast(codepoint));
     return packedContains(&tables.unicode_mark_ranges, codepoint);
 }
 
 /// Bidi_Mirroring_Glyph, or `codepoint` itself when it has none.
 pub fn bidiMirror(codepoint: u21) u21 {
+    if (codepoint <= 0xFFFF and !bmpSetContains(&tables.bidi_mirroring_bmp_index, &tables.bidi_mirroring_bmp_words, @intCast(codepoint))) return codepoint;
     const table = &tables.bidi_mirroring;
     var lo: usize = 0;
     var hi: usize = table.len;
@@ -2137,6 +2144,7 @@ pub fn bidiMirror(codepoint: u21) u21 {
 /// hb's `HB_ARABIC_GENERAL_CATEGORY_IS_WORD`: letters other than cased
 /// ones, marks, numbers, symbols, and unassigned/private-use codepoints.
 pub fn isArabicWordCategory(codepoint: u21) bool {
+    if (codepoint <= 0xFFFF) return bmpSetContains(&tables.arabic_word_bmp_index, &tables.arabic_word_bmp_words, @intCast(codepoint));
     return packedContains(&tables.arabic_word_ranges, codepoint);
 }
 
@@ -2192,6 +2200,7 @@ pub const ArabicJoiningType = enum(u8) {
 /// General_Category Mn/Me/Cf (combining marks, format controls — invisible
 /// to joining), else `.non_joining` — mirrors hb's `get_joining_type`.
 pub fn arabicJoiningType(codepoint: u21) ArabicJoiningType {
+    if (codepoint <= 0xFFFF) return @enumFromInt(tables.arabic_joining_bmp_blocks[@as(usize, tables.arabic_joining_bmp_index[codepoint >> 5]) * 32 + (codepoint & 31)]);
     const joining_type = packedLookup(&tables.arabic_joining_ranges, codepoint);
     if (joining_type != no_class) return @enumFromInt(joining_type);
     if (packedContains(&tables.arabic_transparent_ranges, codepoint)) return .transparent;
@@ -2324,6 +2333,7 @@ pub fn decomposeCanonical(codepoint: u21) ?Decomposition {
         const lv_index = s_index - (s_index % hangul_t_count);
         return .{ .first = hangul_s_base + lv_index, .second = hangul_t_base + (s_index % hangul_t_count) };
     }
+    if (codepoint <= 0xFFFF and !bmpSetContains(&tables.canonical_decomposition_bmp_index, &tables.canonical_decomposition_bmp_words, @intCast(codepoint))) return null;
 
     var lo: usize = 0;
     var hi: usize = tables.canonical_decomposition_entries.len;
