@@ -4,6 +4,8 @@ const unicode = @import("../unicode.zig");
 const common = @import("common.zig");
 const map_mod = @import("map.zig");
 const arabic_mod = @import("arabic.zig");
+const indic_mod = @import("indic.zig");
+const syllable_machines = @import("syllable_machines.zig");
 const Buffer = common.Buffer;
 const GlyphInfo = common.GlyphInfo;
 const Cmap = common.Cmap;
@@ -27,11 +29,8 @@ const MapFeatureFlags = map_mod.MapFeatureFlags;
 // once (see [[project_opentype_renderer_plan]]). See that script's module
 // doc comment for the full reasoning.
 //
-// Syllabification (`findSyllablesUse`) hand-ports the Ragel scanner
-// grammar in hb-ot-shaper-use-machine.rl (not the generated .hh state
-// tables, an unreadable merged DFA) as a greedy longest-match recursive
-// matcher, same technique as the Indic/Khmer/Myanmar sections use for
-// their own `.rl` grammars.
+// Syllabification (`findSyllablesUse`) runs hb's generated ragel tables
+// from hb-ot-shaper-use-machine.hh (see syllable_machines.zig).
 //
 // Reordering (`reorderUseSyllable`) is hb's `reorder_syllable_use` ported
 // directly - it's simpler than Indic's (no base-consonant search, no
@@ -218,26 +217,13 @@ const joining_form_none: u8 = 4;
 // is what populates `GlyphInfo.indic_category` (reused storage, not a new
 // field - same convention the Khmer/Myanmar section already established)
 // for this shaper.
-const O: u8 = 0;
 const B: u8 = 1;
 const N: u8 = 4;
-const GB: u8 = 5;
-const SUB: u8 = 11;
 const H: u8 = 12;
-const HN: u8 = 13;
 const ZWNJ: u8 = 14;
 const R: u8 = 18;
-const CS: u8 = 43;
 const IS: u8 = 44;
-const Sk: u8 = 48;
-const G: u8 = 49;
-const J: u8 = 50;
-const SB: u8 = 51;
-const SE: u8 = 52;
 const HVM: u8 = 53;
-const HM: u8 = 54;
-const HR: u8 = 55;
-const RK: u8 = 56;
 const FAbv: u8 = 24;
 const FBlw: u8 = 25;
 const FPst: u8 = 26;
@@ -245,8 +231,6 @@ const MAbv: u8 = 27;
 const MBlw: u8 = 28;
 const MPst: u8 = 29;
 const MPre: u8 = 30;
-const CMAbv: u8 = 31;
-const CMBlw: u8 = 32;
 const VAbv: u8 = 33;
 const VBlw: u8 = 34;
 const VPst: u8 = 35;
@@ -255,258 +239,9 @@ const VMAbv: u8 = 37;
 const VMBlw: u8 = 38;
 const VMPst: u8 = 39;
 const VMPre: u8 = 23;
-const SMAbv: u8 = 41;
-const SMBlw: u8 = 42;
 const FMAbv: u8 = 45;
 const FMBlw: u8 = 46;
 const FMPst: u8 = 47;
-
-fn isH(cat: u8) bool {
-    return cat == H or cat == HVM or cat == IS or cat == Sk;
-}
-
-/// Ported from `consonant_modifiers = CMAbv* CMBlw* ((h B | SUB) CMAbv* CMBlw*)*`.
-fn matchConsonantModifiers(info: []const GlyphInfo, p: usize, end: usize) usize {
-    var q = p;
-    while (q < end and info[q].indic_category == CMAbv) q += 1;
-    while (q < end and info[q].indic_category == CMBlw) q += 1;
-    while (true) {
-        var r: usize = undefined;
-        if (q < end and isH(info[q].indic_category) and q + 1 < end and info[q + 1].indic_category == B) {
-            r = q + 2;
-        } else if (q < end and info[q].indic_category == SUB) {
-            r = q + 1;
-        } else break;
-        while (r < end and info[r].indic_category == CMAbv) r += 1;
-        while (r < end and info[r].indic_category == CMBlw) r += 1;
-        q = r;
-    }
-    return q;
-}
-
-/// Ported from `medial_consonants = MPre? MAbv? MBlw? MPst?`.
-fn matchMedialConsonants(info: []const GlyphInfo, p: usize, end: usize) usize {
-    var q = p;
-    if (q < end and info[q].indic_category == MPre) q += 1;
-    if (q < end and info[q].indic_category == MAbv) q += 1;
-    if (q < end and info[q].indic_category == MBlw) q += 1;
-    if (q < end and info[q].indic_category == MPst) q += 1;
-    return q;
-}
-
-/// Ported from `dependent_vowels = VPre* VAbv* VBlw* VPst* | H`.
-fn matchDependentVowels(info: []const GlyphInfo, p: usize, end: usize) usize {
-    var q = p;
-    while (q < end and info[q].indic_category == VPre) q += 1;
-    while (q < end and info[q].indic_category == VAbv) q += 1;
-    while (q < end and info[q].indic_category == VBlw) q += 1;
-    while (q < end and info[q].indic_category == VPst) q += 1;
-    if (q == p and q < end and info[q].indic_category == H) q += 1;
-    return q;
-}
-
-/// Ported from `vowel_modifiers = HVM? VMPre* VMAbv* VMBlw* VMPst*`.
-fn matchVowelModifiers(info: []const GlyphInfo, p: usize, end: usize) usize {
-    var q = p;
-    if (q < end and info[q].indic_category == HVM) q += 1;
-    while (q < end and info[q].indic_category == VMPre) q += 1;
-    while (q < end and info[q].indic_category == VMAbv) q += 1;
-    while (q < end and info[q].indic_category == VMBlw) q += 1;
-    while (q < end and info[q].indic_category == VMPst) q += 1;
-    return q;
-}
-
-/// Ported from `final_consonants = FAbv* FBlw* FPst*`.
-fn matchFinalConsonants(info: []const GlyphInfo, p: usize, end: usize) usize {
-    var q = p;
-    while (q < end and info[q].indic_category == FAbv) q += 1;
-    while (q < end and info[q].indic_category == FBlw) q += 1;
-    while (q < end and info[q].indic_category == FPst) q += 1;
-    return q;
-}
-
-/// Ported from `final_modifiers = FMAbv* FMBlw* | FMPst?`.
-fn matchFinalModifiers(info: []const GlyphInfo, p: usize, end: usize) usize {
-    var q = p;
-    while (q < end and info[q].indic_category == FMAbv) q += 1;
-    while (q < end and info[q].indic_category == FMBlw) q += 1;
-    if (q == p and q < end and info[q].indic_category == FMPst) q += 1;
-    return q;
-}
-
-/// Ported from `complex_syllable_start = (R | CS)? (B | GB)`.
-fn matchComplexSyllableStart(info: []const GlyphInfo, p: usize, end: usize) ?usize {
-    var q = p;
-    if (q < end and (info[q].indic_category == R or info[q].indic_category == CS)) q += 1;
-    if (!(q < end and (info[q].indic_category == B or info[q].indic_category == GB))) return null;
-    return q + 1;
-}
-
-/// Ported from `complex_syllable_middle = consonant_modifiers
-/// medial_consonants dependent_vowels vowel_modifiers (Sk B)*`.
-fn matchComplexSyllableMiddle(info: []const GlyphInfo, p: usize, end: usize) usize {
-    var q = matchConsonantModifiers(info, p, end);
-    q = matchMedialConsonants(info, q, end);
-    q = matchDependentVowels(info, q, end);
-    q = matchVowelModifiers(info, q, end);
-    while (q + 1 < end and info[q].indic_category == Sk and info[q + 1].indic_category == B) q += 2;
-    return q;
-}
-
-/// Ported from `complex_syllable_tail = complex_syllable_middle
-/// final_consonants final_modifiers`.
-fn matchComplexSyllableTail(info: []const GlyphInfo, p: usize, end: usize) usize {
-    var q = matchComplexSyllableMiddle(info, p, end);
-    q = matchFinalConsonants(info, q, end);
-    q = matchFinalModifiers(info, q, end);
-    return q;
-}
-
-/// Ported from `virama_terminated_cluster_tail = consonant_modifiers (IS | RK)`.
-fn matchViramaTerminatedClusterTail(info: []const GlyphInfo, p: usize, end: usize) ?usize {
-    const q = matchConsonantModifiers(info, p, end);
-    if (q < end and (info[q].indic_category == IS or info[q].indic_category == RK)) return q + 1;
-    return null;
-}
-
-/// Ported from `virama_terminated_cluster = complex_syllable_start
-/// virama_terminated_cluster_tail`.
-fn matchViramaTerminatedCluster(info: []const GlyphInfo, p: usize, end: usize) ?usize {
-    const s = matchComplexSyllableStart(info, p, end) orelse return null;
-    return matchViramaTerminatedClusterTail(info, s, end);
-}
-
-/// Ported from `sakot_terminated_cluster_tail = complex_syllable_middle Sk`.
-fn matchSakotTerminatedClusterTail(info: []const GlyphInfo, p: usize, end: usize) ?usize {
-    const q = matchComplexSyllableMiddle(info, p, end);
-    if (q < end and info[q].indic_category == Sk) return q + 1;
-    return null;
-}
-
-/// Ported from `sakot_terminated_cluster = complex_syllable_start
-/// sakot_terminated_cluster_tail`.
-fn matchSakotTerminatedCluster(info: []const GlyphInfo, p: usize, end: usize) ?usize {
-    const s = matchComplexSyllableStart(info, p, end) orelse return null;
-    return matchSakotTerminatedClusterTail(info, s, end);
-}
-
-/// Ported from `standard_cluster = complex_syllable_start complex_syllable_tail`.
-fn matchStandardCluster(info: []const GlyphInfo, p: usize, end: usize) ?usize {
-    const s = matchComplexSyllableStart(info, p, end) orelse return null;
-    return matchComplexSyllableTail(info, s, end);
-}
-
-/// Ported from `number_joiner_terminated_cluster_tail = (HN N)* HN`.
-fn matchNumberJoinerTerminatedClusterTail(info: []const GlyphInfo, p: usize, end: usize) ?usize {
-    var q = p;
-    while (q + 1 < end and info[q].indic_category == HN and info[q + 1].indic_category == N) q += 2;
-    if (q < end and info[q].indic_category == HN) return q + 1;
-    return null;
-}
-
-/// Ported from `numeral_cluster_tail = (HN N)+`.
-fn matchNumeralClusterTail(info: []const GlyphInfo, p: usize, end: usize) ?usize {
-    var q = p;
-    var matched = false;
-    while (q + 1 < end and info[q].indic_category == HN and info[q + 1].indic_category == N) {
-        q += 2;
-        matched = true;
-    }
-    if (!matched) return null;
-    return q;
-}
-
-/// Ported from `symbol_cluster_tail = SMAbv+ SMBlw* | SMBlw+`.
-fn matchSymbolClusterTail(info: []const GlyphInfo, p: usize, end: usize) ?usize {
-    var q = p;
-    var n: usize = 0;
-    while (q < end and info[q].indic_category == SMAbv) {
-        q += 1;
-        n += 1;
-    }
-    if (n > 0) {
-        while (q < end and info[q].indic_category == SMBlw) q += 1;
-        return q;
-    }
-    q = p;
-    n = 0;
-    while (q < end and info[q].indic_category == SMBlw) {
-        q += 1;
-        n += 1;
-    }
-    if (n > 0) return q;
-    return null;
-}
-
-/// Ported from `tail = complex_syllable_tail | sakot_terminated_cluster_tail
-/// | symbol_cluster_tail | virama_terminated_cluster_tail` - returns the
-/// longest of the four alternatives (complex_syllable_tail always
-/// "matches", possibly zero-length, since every one of its components is
-/// optional/star).
-fn matchTailBest(info: []const GlyphInfo, p: usize, end: usize) usize {
-    var best = matchComplexSyllableTail(info, p, end);
-    if (matchSakotTerminatedClusterTail(info, p, end)) |q| best = @max(best, q);
-    if (matchSymbolClusterTail(info, p, end)) |q| best = @max(best, q);
-    if (matchViramaTerminatedClusterTail(info, p, end)) |q| best = @max(best, q);
-    return best;
-}
-
-/// Ported from `broken_cluster = R? (tail | number_joiner_terminated_cluster_tail | numeral_cluster_tail)`.
-fn matchBrokenCluster(info: []const GlyphInfo, p: usize, end: usize) usize {
-    var q = p;
-    if (q < end and info[q].indic_category == R) q += 1;
-    var best = matchTailBest(info, q, end);
-    if (matchNumberJoinerTerminatedClusterTail(info, q, end)) |e| best = @max(best, e);
-    if (matchNumeralClusterTail(info, q, end)) |e| best = @max(best, e);
-    return best;
-}
-
-/// Ported from `number_joiner_terminated_cluster = N number_joiner_terminated_cluster_tail`.
-fn matchNumberJoinerTerminatedCluster(info: []const GlyphInfo, p: usize, end: usize) ?usize {
-    if (!(p < end and info[p].indic_category == N)) return null;
-    return matchNumberJoinerTerminatedClusterTail(info, p + 1, end);
-}
-
-/// Ported from `numeral_cluster = N numeral_cluster_tail?`.
-fn matchNumeralCluster(info: []const GlyphInfo, p: usize, end: usize) ?usize {
-    if (!(p < end and info[p].indic_category == N)) return null;
-    if (matchNumeralClusterTail(info, p + 1, end)) |q| return q;
-    return p + 1;
-}
-
-/// Ported from `symbol_cluster = (O | GB | SB) tail?`.
-fn matchSymbolCluster(info: []const GlyphInfo, p: usize, end: usize) ?usize {
-    if (!(p < end and (info[p].indic_category == O or info[p].indic_category == GB or info[p].indic_category == SB))) return null;
-    return matchTailBest(info, p + 1, end);
-}
-
-/// Ported from `SB* G HR? HM? SE*` (the repeated unit inside hieroglyph_cluster).
-fn matchHieroglyphGroup(info: []const GlyphInfo, p: usize, end: usize) ?usize {
-    var q = p;
-    while (q < end and info[q].indic_category == SB) q += 1;
-    if (!(q < end and info[q].indic_category == G)) return null;
-    q += 1;
-    if (q < end and info[q].indic_category == HR) q += 1;
-    if (q < end and info[q].indic_category == HM) q += 1;
-    while (q < end and info[q].indic_category == SE) q += 1;
-    return q;
-}
-
-/// Ported from `hieroglyph_cluster = SB* G HR? HM? SE* (J SB* (G HR? HM? SE*)?)*`.
-fn matchHieroglyphCluster(info: []const GlyphInfo, p: usize, end: usize) ?usize {
-    var q = matchHieroglyphGroup(info, p, end) orelse return null;
-    while (q < end and info[q].indic_category == J) {
-        var r = q + 1;
-        while (r < end and info[r].indic_category == SB) r += 1;
-        q = matchHieroglyphGroup(info, r, end) orelse r;
-    }
-    return q;
-}
-
-fn consumeOptionalZwnj(info: []const GlyphInfo, p: usize, end: usize) usize {
-    if (p < end and info[p].indic_category == ZWNJ) return p + 1;
-    return p;
-}
 
 /// Same order as `use_syllable_type_t` in hb-ot-shaper-use-machine.rl.
 const use_virama_terminated_cluster: u8 = 0;
@@ -519,15 +254,11 @@ const use_hieroglyph_cluster: u8 = 6;
 const use_broken_cluster: u8 = 7;
 const use_non_cluster: u8 = 8;
 
-/// Ported from `find_syllables_use`: at each position, tries every
-/// top-level alternative in the `main := |* ... *|` Ragel scanner (each
-/// optionally followed by ZWNJ) and picks the longest match, first-listed
-/// rule wins ties, falling back to a single-glyph `other` match. Requires
-/// `GlyphInfo.indic_category` to already hold each glyph's USE category
-/// (via `unicode.useCategory`).
+/// Ported from `find_syllables_use`. Requires `GlyphInfo.indic_category`
+/// to already hold each glyph's USE category (via `unicode.useCategory`).
 fn findSyllablesUse(buffer: *Buffer) !void {
     const info = buffer.info.items;
-    if (!hasMachineHiddenGlyph(info)) return findSyllablesUseIn(info);
+    if (!hasMachineHiddenGlyph(info)) return indic_mod.findSyllables(info, syllable_machines.use);
 
     // hb runs the machine over a filtered view; each syllable then spans
     // original indices up to the next visible glyph, hidden ones included.
@@ -542,7 +273,7 @@ fn findSyllablesUse(buffer: *Buffer) !void {
         visible[visible_count] = glyph_info;
         visible_count += 1;
     }
-    findSyllablesUseIn(visible[0..visible_count]);
+    indic_mod.findSyllables(visible[0..visible_count], syllable_machines.use);
     for (info[0..if (visible_count == 0) info.len else visible_index[0]]) |*glyph_info| glyph_info.indic_syllable = 0;
     for (0..visible_count) |v| {
         const range_end = if (v + 1 < visible_count) visible_index[v + 1] else info.len;
@@ -566,90 +297,6 @@ fn hiddenFromMachine(info: []const GlyphInfo, i: usize) bool {
 fn hasMachineHiddenGlyph(info: []const GlyphInfo) bool {
     for (0..info.len) |i| if (hiddenFromMachine(info, i)) return true;
     return false;
-}
-
-fn findSyllablesUseIn(info: []GlyphInfo) void {
-    const count = info.len;
-    var p: usize = 0;
-    var serial: u8 = 1;
-    while (p < count) {
-        // 0 is a sentinel meaning "no rule has matched yet" - `other` (any
-        // single glyph, `use_non_cluster`) is the Ragel scanner's *last*-
-        // listed alternative, so it must lose every tie, not win them; a
-        // stray combining mark with no base (e.g. an isolated USE(VMAbv))
-        // matches `broken_cluster` at length 1 too, and that earlier-listed
-        // rule has to take the tie so it gets flagged broken (and later
-        // gets a dotted circle) instead of silently falling through as an
-        // ordinary non_cluster glyph.
-        var best_len: usize = 0;
-        var best_type: u8 = use_non_cluster;
-
-        if (matchViramaTerminatedCluster(info, p, count)) |e0| {
-            const e = consumeOptionalZwnj(info, e0, count);
-            if (e - p > best_len) {
-                best_len = e - p;
-                best_type = use_virama_terminated_cluster;
-            }
-        }
-        if (matchSakotTerminatedCluster(info, p, count)) |e0| {
-            const e = consumeOptionalZwnj(info, e0, count);
-            if (e - p > best_len) {
-                best_len = e - p;
-                best_type = use_sakot_terminated_cluster;
-            }
-        }
-        if (matchStandardCluster(info, p, count)) |e0| {
-            const e = consumeOptionalZwnj(info, e0, count);
-            if (e - p > best_len) {
-                best_len = e - p;
-                best_type = use_standard_cluster;
-            }
-        }
-        if (matchNumberJoinerTerminatedCluster(info, p, count)) |e0| {
-            const e = consumeOptionalZwnj(info, e0, count);
-            if (e - p > best_len) {
-                best_len = e - p;
-                best_type = use_number_joiner_terminated_cluster;
-            }
-        }
-        if (matchNumeralCluster(info, p, count)) |e0| {
-            const e = consumeOptionalZwnj(info, e0, count);
-            if (e - p > best_len) {
-                best_len = e - p;
-                best_type = use_numeral_cluster;
-            }
-        }
-        if (matchSymbolCluster(info, p, count)) |e0| {
-            const e = consumeOptionalZwnj(info, e0, count);
-            if (e - p > best_len) {
-                best_len = e - p;
-                best_type = use_symbol_cluster;
-            }
-        }
-        if (matchHieroglyphCluster(info, p, count)) |e0| {
-            const e = consumeOptionalZwnj(info, e0, count);
-            if (e - p > best_len) {
-                best_len = e - p;
-                best_type = use_hieroglyph_cluster;
-            }
-        }
-        {
-            const e0 = matchBrokenCluster(info, p, count);
-            const e = consumeOptionalZwnj(info, e0, count);
-            if (e - p > best_len) {
-                best_len = e - p;
-                best_type = use_broken_cluster;
-            }
-        }
-        if (best_len == 0) best_len = 1; // `other`: no rule matched even one glyph.
-
-        const start = p;
-        const end = p + best_len;
-        for (info[start..end]) |*gi| gi.indic_syllable = (serial << 4) | best_type;
-        serial += 1;
-        if (serial == 16) serial = 1;
-        p = end;
-    }
 }
 
 fn isPostBaseUse(cat: u8) bool {
