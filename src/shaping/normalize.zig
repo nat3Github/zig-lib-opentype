@@ -499,6 +499,7 @@ pub fn setJoinerFlags(buffer: *Buffer) void {
         info.is_zwj = cp == 0x200D;
         info.is_zwnj = cp == 0x200C;
         info.is_default_ignorable = unicode.isDefaultIgnorable(@intCast(cp));
+        buffer.has_default_ignorables = buffer.has_default_ignorables or info.is_default_ignorable;
         // A CGJ's hidden bit was already decided by `hideBlockingCgjs`.
         if (cp != 0x034F) info.is_hidden = (cp >= 0x180B and cp <= 0x180D) or cp == 0x180F or (cp >= 0xE0020 and cp <= 0xE007F);
     }

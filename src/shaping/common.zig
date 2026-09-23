@@ -341,6 +341,8 @@ pub const Buffer = struct {
     idx: usize = 0,
     have_output: bool = false,
     have_positions: bool = false,
+    /// hb's HB_BUFFER_SCRATCH_FLAG_HAS_DEFAULT_IGNORABLES.
+    has_default_ignorables: bool = false,
     cluster_level: ClusterLevel = .monotone_graphemes,
     /// Operation budget consumed by cluster/flag-propagation work, mirroring
     /// hb's max_ops guard against O(n^2)-ish blowup on adversarial buffers.

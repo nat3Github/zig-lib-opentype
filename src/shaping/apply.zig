@@ -2189,6 +2189,7 @@ pub fn featureWouldSubstitute(
 /// zeroed advance draws a visible box on top of the following glyph (U+FE0F
 /// after an emoji base).
 pub fn hideDefaultIgnorables(buffer: *Buffer, cmap: ?Cmap) void {
+    if (!buffer.has_default_ignorables) return;
     if (cmap) |resolved| if (resolved.lookup(' ')) |space_glyph| {
         for (buffer.info.items) |*info| {
             if (common.isIgnorable(info.*)) info.codepoint = space_glyph;
@@ -2212,6 +2213,7 @@ pub fn hideDefaultIgnorables(buffer: *Buffer, cmap: ?Cmap) void {
 /// after GPOS so its advance/offset overrides whatever positioning the
 /// substituted space glyph picked up (kerning, mark attachment, ...).
 pub fn zeroDefaultIgnorableAdvances(buffer: *Buffer, direction: Direction) void {
+    if (!buffer.has_default_ignorables) return;
     const horizontal = direction == .left_to_right or direction == .right_to_left;
     for (buffer.info.items, buffer.pos.items) |glyph_info, *pos| {
         if (!common.isIgnorable(glyph_info)) continue;
