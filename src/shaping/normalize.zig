@@ -490,21 +490,6 @@ fn isGraphemeContinuation(infos: []const GlyphInfo, i: usize, prev_continuation:
     return (cp >= 0xFF9E and cp <= 0xFF9F) or (cp >= 0xE0020 and cp <= 0xE007F);
 }
 
-/// Ported from hb_set_unicode_props's ignorable half. Must run after `normalize` (which may
-/// insert/reorder/delete glyphs) and before `mapGlyphsFast` overwrites
-/// `codepoint` with a glyph id.
-pub fn setJoinerFlags(buffer: *Buffer) void {
-    for (buffer.info.items) |*info| {
-        const cp = info.codepoint;
-        info.is_zwj = cp == 0x200D;
-        info.is_zwnj = cp == 0x200C;
-        info.is_default_ignorable = unicode.isDefaultIgnorable(@intCast(cp));
-        buffer.has_default_ignorables = buffer.has_default_ignorables or info.is_default_ignorable;
-        // A CGJ's hidden bit was already decided by `hideBlockingCgjs`.
-        if (cp != 0x034F) info.is_hidden = (cp >= 0x180B and cp <= 0x180D) or cp == 0x180F or (cp >= 0xE0020 and cp <= 0xE007F);
-    }
-}
-
 /// hb's post-reorder CGJ check: a CGJ that actually kept marks from
 /// reordering across it stays hidden (unskippable); any other is skippable.
 fn hideBlockingCgjs(buffer: *Buffer) void {
@@ -517,11 +502,27 @@ fn hideBlockingCgjs(buffer: *Buffer) void {
     }
 }
 
-/// Ported from hb_ot_map_glyphs_fast: normalize() stashed each glyph's
-/// resolved font glyph id in `var1` (see GlyphInfo's doc comment) while
-/// `codepoint` still held the Unicode value for is_unicode_mark/
-/// combining-class lookups; this is the point where `codepoint` becomes
-/// the real glyph id GSUB/GPOS operate on.
+/// Ported from hb_ot_map_glyphs_fast, fused with hb_set_unicode_props's
+/// ignorable half: normalize() stashed each glyph's resolved font glyph id
+/// in `var1` (see GlyphInfo's doc comment) while `codepoint` still held the
+/// Unicode value for is_unicode_mark/combining-class lookups; the joiner and
+/// ignorable flags are read off that Unicode value one last time before
+/// `codepoint` becomes the real glyph id GSUB/GPOS operate on. Must run
+/// after `normalize` (which may insert/reorder/delete glyphs).
 pub fn mapGlyphsFast(buffer: *Buffer) void {
-    for (buffer.info.items) |*info| info.codepoint = @bitCast(info.var1);
+    var has_default_ignorables = false;
+    for (buffer.info.items) |*info| {
+        const cp = info.codepoint;
+        info.codepoint = @bitCast(info.var1);
+        // Nothing below U+00AD is a joiner, ignorable or hidden, and no
+        // earlier pass sets these flags on one.
+        if (cp < 0xAD) continue;
+        info.is_zwj = cp == 0x200D;
+        info.is_zwnj = cp == 0x200C;
+        info.is_default_ignorable = unicode.isDefaultIgnorable(@intCast(cp));
+        has_default_ignorables = has_default_ignorables or info.is_default_ignorable;
+        // A CGJ's hidden bit was already decided by `hideBlockingCgjs`.
+        if (cp != 0x034F) info.is_hidden = (cp >= 0x180B and cp <= 0x180D) or cp == 0x180F or (cp >= 0xE0020 and cp <= 0xE007F);
+    }
+    buffer.has_default_ignorables = buffer.has_default_ignorables or has_default_ignorables;
 }

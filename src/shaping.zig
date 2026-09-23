@@ -51,7 +51,6 @@ const zeroDefaultIgnorableAdvances = apply_mod.zeroDefaultIgnorableAdvances;
 const finishGposOffsets = apply_mod.finishGposOffsets;
 const table_tag_gdef = apply_mod.table_tag_gdef;
 const normalize = normalize_mod.normalize;
-const setJoinerFlags = normalize_mod.setJoinerFlags;
 const formClusters = normalize_mod.formClusters;
 const mapGlyphsFast = normalize_mod.mapGlyphsFast;
 const hang_script_tag = hangul_mod.hang_script_tag;
@@ -570,7 +569,6 @@ fn shapeWithPlanImpl(
     if (is_myanmar) setupMasksMyanmar(&buffer);
     if (is_use) try setupMasksUse(&buffer, map, is_use_arabic_joining);
 
-    setJoinerFlags(&buffer);
     mapGlyphsFast(&buffer);
 
     const gdef_data = font.tableData(table_tag_gdef);
