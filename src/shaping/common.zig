@@ -1157,11 +1157,13 @@ pub const MappingCache = struct {
 };
 
 /// hb's PairPos/LigatureSubst `external_cache_t`: glyph -> coverage index,
-/// plus glyph -> class for PairPos format 2's two ClassDefs.
+/// plus glyph -> class for PairPos format 2's two ClassDefs, plus
+/// LigatureSubst's digest of every ligature's second glyph.
 pub const SubtableCache = struct {
     coverage: MappingCache = .{},
     first: MappingCache = .{},
     second: MappingCache = .{},
+    seconds: Digest = .full(),
 };
 
 pub fn combiningClassOf(info: *GlyphInfo) u8 {

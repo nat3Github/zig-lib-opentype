@@ -738,6 +738,47 @@ fn applyGposCursive(
     return true;
 }
 
+/// hb's `LigatureSet::collect_seconds` over every set of the subtable.
+/// Walking stops after `budget` ligatures (offsets may repeat, so the font's
+/// counts alone don't bound it) and yields a full digest, which rejects
+/// nothing.
+fn ligatureSeconds(reader: parsing.Table.Layout.SubtableReader, budget: usize) common.Digest {
+    return collectLigatureSeconds(reader, budget) catch .full();
+}
+
+fn collectLigatureSeconds(reader: parsing.Table.Layout.SubtableReader, budget: usize) (parsing.Font.ParseError || error{Unfilterable})!common.Digest {
+    var seconds: common.Digest = .{};
+    var remaining = budget;
+    const set_count = try reader.u16At(4);
+    for (0..set_count) |set_index| {
+        const ligset = try reader.subReaderAt(6 + set_index * 2);
+        const lig_count = try ligset.u16At(0);
+        for (0..lig_count) |lig_index| {
+            if (remaining == 0) return error.Unfilterable;
+            remaining -= 1;
+            const lig = try ligset.subReaderAt(2 + lig_index * 2);
+            if (try lig.u16At(2) <= 1) return .full();
+            seconds.add(try lig.u16At(4));
+        }
+    }
+    return seconds;
+}
+
+/// hb's `LigatureSet::apply` fast path: the glyph every ligature's second
+/// component would be matched against, or null when that glyph is absent or
+/// skippable and each ligature has to be matched in full.
+fn ligatureSecondGlyph(buffer: *const Buffer, gdef: Gdef, lookup_flags: u32, skip: Skip) ?u32 {
+    var i = buffer.idx + 1;
+    while (i < buffer.info.items.len) : (i += 1) {
+        const info = &buffer.info.items[i];
+        if (!matchesLookupProps(info, gdef, lookup_flags)) continue;
+        if (skip.syllable != 0 and info.indic_syllable != skip.syllable) return null;
+        if (maybeSkippable(info.*, skip)) return null;
+        return info.codepoint;
+    }
+    return null;
+}
+
 /// hb's `Coverage::get_coverage (glyph, cache)`: `max_value` caches "not
 /// covered", and indices that don't fit the slot are never cached.
 fn cachedCoverage(cov: parsing.Table.Layout.Coverage.Resolved, glyph: u16, cache: ?*common.MappingCache) parsing.Font.ParseError!?u16 {
@@ -1481,6 +1522,8 @@ fn applyGsubSubtable(
             if (idx >= set_count) return false;
             const ligset = try reader.subReaderAt(6 + @as(usize, idx) * 2);
             const lig_count = try ligset.u16At(0);
+            const second = if (lig_count > 1) ligatureSecondGlyph(buffer, gdef, lookup_flags, joiners.direct(0)) else null;
+            if (second) |glyph_second| if (cache) |c| if (!c.seconds.mayHave(glyph_second)) return false;
             var li: usize = 0;
             while (li < lig_count) : (li += 1) {
                 const lig = try ligset.subReaderAt(2 + li * 2);
@@ -1492,6 +1535,9 @@ fn applyGsubSubtable(
                 // 64 is hb's own `HB_MAX_CONTEXT_LENGTH` cap on `match_input`.
                 if (component_count == 0 or component_count > max_ligature_components) continue;
                 const comp_count_m1 = component_count - 1;
+                // The full match below would test its first component against
+                // exactly `second`, so a mismatch here can't ligate.
+                if (second) |glyph_second| if (comp_count_m1 > 0 and try lig.u16At(4) != glyph_second) continue;
 
                 // Components are matched across `lookup_flags`-skipped
                 // glyphs (an Arabic `rlig` with IgnoreMarks has to see
@@ -1867,7 +1913,9 @@ fn collectSubtableDigests(
         var cache_index: u32 = common.SubtableInfo.no_cache;
         if (cached) {
             cache_index = @intCast(caches.items.len);
-            try caches.append(allocator, .{});
+            try caches.append(allocator, .{
+                .seconds = if (table_index == 0) ligatureSeconds(reader, layout.data.len / 2) else .full(),
+            });
         }
         subtables.appendAssumeCapacity(.{
             .digest = sub_digest,
