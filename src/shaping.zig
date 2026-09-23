@@ -520,7 +520,7 @@ fn shapeWithPlanImpl(
     try buffer.info.ensureTotalCapacityPrecise(allocator, codepoints.len);
     try buffer.out_info.ensureTotalCapacityPrecise(allocator, codepoints.len);
 
-    for (codepoints, 0..) |cp, i| try buffer.add(cp, @intCast(i));
+    for (codepoints, 0..) |cp, i| buffer.info.appendAssumeCapacity(.{ .codepoint = cp, .cluster = @intCast(i) });
     formClusters(&buffer);
 
     const map = plan.map;
