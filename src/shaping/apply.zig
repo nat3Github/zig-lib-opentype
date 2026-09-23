@@ -786,7 +786,7 @@ fn cachedCoverage(cov: parsing.Table.Layout.Coverage.Resolved, glyph: u16, cache
     if (c.get(glyph)) |value| return if (value == common.MappingCache.max_value) null else value;
     const index = try cov.get(glyph);
     if (index) |i| {
-        if (i < common.MappingCache.max_value) c.set(glyph, @intCast(i));
+        if (i < common.MappingCache.max_value) c.set(glyph, i);
     } else c.set(glyph, common.MappingCache.max_value);
     return index;
 }
@@ -795,7 +795,7 @@ fn cachedClass(class_def: parsing.Table.Layout.ClassDef, glyph: u16, cache: ?*co
     const c = cache orelse return class_def.getClass(glyph);
     if (c.get(glyph)) |value| return value;
     const class = try class_def.getClass(glyph);
-    if (class <= common.MappingCache.max_value) c.set(glyph, @intCast(class));
+    if (class <= common.MappingCache.max_value) c.set(glyph, class);
     return class;
 }
 

@@ -1134,25 +1134,25 @@ pub const SubtableInfo = struct {
     pub const no_cache = std.math.maxInt(u32);
 };
 
-/// hb's `hb_cache_t<16, 8, 8>` (`hb_ot_layout_mapping_cache_t`): 256
-/// direct-mapped slots, each packing a glyph's high byte above an 8-bit
-/// value. Lives in the plan and so persists across shape calls, like hb's
-/// per-accelerator caches; entries are idempotent, so threads racing on a
-/// shared plan only lose entries.
+/// hb's `hb_ot_layout_mapping_cache_t` widened to 16-bit values: hb's 8-bit
+/// slot can't hold big kern subtables' coverage indices (Inter's are mostly
+/// >255), so those were re-searched every call. Lives in the plan; entries
+/// are idempotent, so threads racing on a shared plan only lose entries.
 pub const MappingCache = struct {
-    slots: [256]u16 = @splat(empty),
+    slots: [256]u32 = @splat(empty),
 
-    const empty = std.math.maxInt(u16);
-    pub const max_value = 255;
+    const empty = std.math.maxInt(u32);
+    pub const max_value = std.math.maxInt(u16) - 1;
 
-    pub fn get(self: *const MappingCache, key: u16) ?u8 {
-        const slot = @atomicLoad(u16, &self.slots[key & 0xff], .monotonic);
-        if (slot == empty or slot >> 8 != key >> 8) return null;
+    pub fn get(self: *const MappingCache, key: u16) ?u16 {
+        const slot = @atomicLoad(u32, &self.slots[key & 0xff], .monotonic);
+        if (slot == empty or slot >> 16 != key) return null;
         return @truncate(slot);
     }
 
-    pub fn set(self: *MappingCache, key: u16, value: u8) void {
-        @atomicStore(u16, &self.slots[key & 0xff], (key & 0xff00) | value, .monotonic);
+    pub fn set(self: *MappingCache, key: u16, value: u16) void {
+        std.debug.assert(value <= max_value);
+        @atomicStore(u32, &self.slots[key & 0xff], @as(u32, key) << 16 | value, .monotonic);
     }
 };
 
