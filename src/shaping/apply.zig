@@ -1932,7 +1932,9 @@ pub fn applyStage(
     for (map.getStageLookups(table_index, stage)) |entry| {
         // Substitutions during this pass only ever add glyphs to the buffer
         // digest, so a lookup skipped here could not have matched earlier in
-        // the pass either.
+        // the pass either. Added glyphs copy an input glyph's mask, so the
+        // mask union never gains a feature bit within a stage.
+        if (entry.mask & buffer.mask_union == 0) continue;
         if (!entry.digest.mayIntersect(buffer.digest)) continue;
         const subtables = map.subtables.items[entry.subtables_start..][0..entry.subtables_len];
         try applyLookup(layout, entry, gdef, buffer, table_index, direction, subtables);

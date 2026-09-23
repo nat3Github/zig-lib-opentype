@@ -275,6 +275,8 @@ pub const Buffer = struct {
     /// Glyph ids currently in `info`/`out_info`; ANDed against a lookup's own
     /// digest to skip lookups that cannot match anything in this run.
     digest: Digest = .{},
+    /// OR of every glyph's mask as of the last `updateDigest`.
+    mask_union: u32 = 0,
     info: std.ArrayList(GlyphInfo) = .empty,
     /// Backing store for the output half only once it has split from
     /// `info`; read it through `outItems()`, never directly.
@@ -451,8 +453,15 @@ pub const Buffer = struct {
     /// PUA shaping, composition, ignorable hiding) are accounted for.
     pub fn updateDigest(self: *Buffer) void {
         self.digest.clear();
-        for (self.info.items) |glyph_info| self.digest.add(glyph_info.codepoint);
-        for (self.outItems()) |glyph_info| self.digest.add(glyph_info.codepoint);
+        self.mask_union = 0;
+        for (self.info.items) |glyph_info| {
+            self.digest.add(glyph_info.codepoint);
+            self.mask_union |= glyph_info.mask;
+        }
+        for (self.outItems()) |glyph_info| {
+            self.digest.add(glyph_info.codepoint);
+            self.mask_union |= glyph_info.mask;
+        }
     }
 
     /// Copies the glyph at idx to output without advancing idx.
