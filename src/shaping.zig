@@ -34,6 +34,7 @@ pub const GlyphMetrics = metrics_mod.GlyphMetrics;
 
 pub const Map = map_mod.Map;
 pub const Digest = common.Digest;
+pub const MappingCache = common.MappingCache;
 pub const MapBuilder = map_mod.MapBuilder;
 pub const MapFeatureFlags = map_mod.MapFeatureFlags;
 pub const FeatureMapEntry = map_mod.FeatureMapEntry;
@@ -201,7 +202,7 @@ fn fillLookupDigests(allocator: std.mem.Allocator, font: parsing.Font, map: *Map
             const layout = parsing.Table.Layout{ .data = data };
             for (map.lookups[table_index].items) |*entry| {
                 const start = map.subtables.items.len;
-                entry.digest = try apply_mod.lookupDigest(allocator, layout, entry.index, table_index, &map.subtables);
+                entry.digest = try apply_mod.lookupDigest(allocator, layout, entry.index, table_index, &map.subtables, &map.subtable_caches);
                 entry.subtables_start = @intCast(start);
                 entry.subtables_len = @intCast(map.subtables.items.len - start);
             }

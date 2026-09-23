@@ -1128,6 +1128,40 @@ pub const SubtableInfo = struct {
     /// (Context/ChainContext format 3 keeps its coverage elsewhere), and the
     /// applier falls back to reading it from the table.
     coverage: parsing.Table.Layout.Coverage.Resolved = .{},
+    /// Index into `Map.subtable_caches`, or `no_cache`.
+    cache: u32 = no_cache,
+
+    pub const no_cache = std.math.maxInt(u32);
+};
+
+/// hb's `hb_cache_t<16, 8, 8>` (`hb_ot_layout_mapping_cache_t`): 256
+/// direct-mapped slots, each packing a glyph's high byte above an 8-bit
+/// value. Lives in the plan and so persists across shape calls, like hb's
+/// per-accelerator caches; entries are idempotent, so threads racing on a
+/// shared plan only lose entries.
+pub const MappingCache = struct {
+    slots: [256]u16 = @splat(empty),
+
+    const empty = std.math.maxInt(u16);
+    pub const max_value = 255;
+
+    pub fn get(self: *const MappingCache, key: u16) ?u8 {
+        const slot = @atomicLoad(u16, &self.slots[key & 0xff], .monotonic);
+        if (slot == empty or slot >> 8 != key >> 8) return null;
+        return @truncate(slot);
+    }
+
+    pub fn set(self: *MappingCache, key: u16, value: u8) void {
+        @atomicStore(u16, &self.slots[key & 0xff], (key & 0xff00) | value, .monotonic);
+    }
+};
+
+/// hb's PairPos/LigatureSubst `external_cache_t`: glyph -> coverage index,
+/// plus glyph -> class for PairPos format 2's two ClassDefs.
+pub const SubtableCache = struct {
+    coverage: MappingCache = .{},
+    first: MappingCache = .{},
+    second: MappingCache = .{},
 };
 
 pub fn combiningClassOf(info: *GlyphInfo) u8 {

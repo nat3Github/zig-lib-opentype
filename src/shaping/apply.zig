@@ -738,6 +738,26 @@ fn applyGposCursive(
     return true;
 }
 
+/// hb's `Coverage::get_coverage (glyph, cache)`: `max_value` caches "not
+/// covered", and indices that don't fit the slot are never cached.
+fn cachedCoverage(cov: parsing.Table.Layout.Coverage.Resolved, glyph: u16, cache: ?*common.MappingCache) parsing.Font.ParseError!?u16 {
+    const c = cache orelse return cov.get(glyph);
+    if (c.get(glyph)) |value| return if (value == common.MappingCache.max_value) null else value;
+    const index = try cov.get(glyph);
+    if (index) |i| {
+        if (i < common.MappingCache.max_value) c.set(glyph, @intCast(i));
+    } else c.set(glyph, common.MappingCache.max_value);
+    return index;
+}
+
+fn cachedClass(class_def: parsing.Table.Layout.ClassDef, glyph: u16, cache: ?*common.MappingCache) parsing.Font.ParseError!u16 {
+    const c = cache orelse return class_def.getClass(glyph);
+    if (c.get(glyph)) |value| return value;
+    const class = try class_def.getClass(glyph);
+    if (class <= common.MappingCache.max_value) c.set(glyph, @intCast(class));
+    return class;
+}
+
 fn valueRecordSize(format: u16) usize {
     return @as(usize, @popCount(@as(u8, @truncate(format)))) * 2;
 }
@@ -1009,9 +1029,9 @@ fn applyLookupOnce(
     while (si < sub_count) : (si += 1) {
         const sub_off = try lk.subtableOffset(si);
         const applied = if (table_index == 0)
-            try applyGsubSubtable(layout, lookup_type, sub_off, null, lookup_mask, random, joiners, buffer, gdef, lookup_flags, depth - 1)
+            try applyGsubSubtable(layout, lookup_type, sub_off, null, null, lookup_mask, random, joiners, buffer, gdef, lookup_flags, depth - 1)
         else
-            try applyGposSubtable(layout, lookup_type, sub_off, null, joiners, gdef, lookup_flags, buffer, direction, depth - 1);
+            try applyGposSubtable(layout, lookup_type, sub_off, null, null, joiners, gdef, lookup_flags, buffer, direction, depth - 1);
         if (applied) return true;
     }
     return false;
@@ -1351,6 +1371,7 @@ fn applyGsubSubtable(
     lookup_type: u16,
     sub_off: usize,
     cov0: ?*const parsing.Table.Layout.Coverage.Resolved,
+    cache: ?*common.SubtableCache,
     lookup_mask: u32,
     random: bool,
     lookup_joiners: Joiners,
@@ -1455,7 +1476,7 @@ fn applyGsubSubtable(
         gsub_tag_ligature => {
             if (format != 1) return false;
             const cov = try reader.coverageAt(2);
-            const idx = try cov.get(gid) orelse return false;
+            const idx = try cachedCoverage(cov, gid, if (cache) |c| &c.coverage else null) orelse return false;
             const set_count = try reader.u16At(4);
             if (idx >= set_count) return false;
             const ligset = try reader.subReaderAt(6 + @as(usize, idx) * 2);
@@ -1592,7 +1613,7 @@ fn applyGsubSubtable(
         },
         gsub_tag_extension => {
             const unwrapped = try unwrapExtension(reader, gsub_tag_extension) orelse return false;
-            return applyGsubSubtable(layout, unwrapped.lookup_type, unwrapped.sub_off, null, lookup_mask, random, joiners, buffer, gdef, lookup_flags, depth);
+            return applyGsubSubtable(layout, unwrapped.lookup_type, unwrapped.sub_off, null, null, lookup_mask, random, joiners, buffer, gdef, lookup_flags, depth);
         },
         else => return false,
     }
@@ -1603,6 +1624,7 @@ fn applyGposSubtable(
     lookup_type: u16,
     sub_off: usize,
     cov0: ?*const parsing.Table.Layout.Coverage.Resolved,
+    cache: ?*common.SubtableCache,
     joiners: Joiners,
     gdef: Gdef,
     lookup_flags: u32,
@@ -1642,7 +1664,7 @@ fn applyGposSubtable(
         gpos_tag_pair => {
             if (format != 1 and format != 2) return false;
             const cov = try reader.coverageAt(2);
-            const idx = try cov.get(gid) orelse return false;
+            const idx = try cachedCoverage(cov, gid, if (cache) |c| &c.coverage else null) orelse return false;
             const next = nextUnskipped(buffer, gdef, lookup_flags, joiners.direct(1), buffer.idx + 1) orelse return false;
             const second_glyph = buffer.info.items[next].codepoint;
             if (second_glyph > std.math.maxInt(u16)) return false;
@@ -1683,8 +1705,8 @@ fn applyGposSubtable(
                     const cd2 = try reader.classDefAt(10);
                     const class1count = try reader.u16At(12);
                     const class2count = try reader.u16At(14);
-                    const k1 = try cd1.getClass(gid);
-                    const k2 = try cd2.getClass(second_gid);
+                    const k1 = try cachedClass(cd1, gid, if (cache) |c| &c.first else null);
+                    const k2 = try cachedClass(cd2, second_gid, if (cache) |c| &c.second else null);
                     if (k1 >= class1count or k2 >= class2count) return false;
                     const len1 = valueRecordSize(vf1);
                     const len2 = valueRecordSize(vf2);
@@ -1738,7 +1760,7 @@ fn applyGposSubtable(
         },
         gpos_tag_extension => {
             const unwrapped = try unwrapExtension(reader, gpos_tag_extension) orelse return false;
-            return applyGposSubtable(layout, unwrapped.lookup_type, unwrapped.sub_off, null, joiners, gdef, lookup_flags, buffer, direction, depth);
+            return applyGposSubtable(layout, unwrapped.lookup_type, unwrapped.sub_off, null, null, joiners, gdef, lookup_flags, buffer, direction, depth);
         },
         else => return false,
     }
@@ -1777,10 +1799,13 @@ pub fn lookupDigest(
     lookup_index: u16,
     table_index: u1,
     subtables: *std.ArrayList(common.SubtableInfo),
+    caches: *std.ArrayList(common.SubtableCache),
 ) error{OutOfMemory}!common.Digest {
     const start = subtables.items.len;
-    const digest = collectSubtableDigests(allocator, layout, lookup_index, table_index, subtables) catch |err| {
+    const caches_start = caches.items.len;
+    const digest = collectSubtableDigests(allocator, layout, lookup_index, table_index, subtables, caches) catch |err| {
         subtables.shrinkRetainingCapacity(start);
+        caches.shrinkRetainingCapacity(caches_start);
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .full();
     };
@@ -1793,6 +1818,7 @@ fn collectSubtableDigests(
     lookup_index: u16,
     table_index: u1,
     subtables: *std.ArrayList(common.SubtableInfo),
+    caches: *std.ArrayList(common.SubtableCache),
 ) (parsing.Font.ParseError || error{ OutOfMemory, Unfilterable })!common.Digest {
     const extension_tag: u16 = if (table_index == 0) gsub_tag_extension else gpos_tag_extension;
     const context_tag: u16 = if (table_index == 0) gsub_tag_context else gpos_tag_context;
@@ -1833,11 +1859,22 @@ fn collectSubtableDigests(
         try cov.collectRanges(&sub_digest);
         digest.unionWith(sub_digest);
         if (reader.offset > std.math.maxInt(u32)) return error.InvalidTableFormat;
+        // hb gives the first 8 subtables of a lookup an external cache.
+        const cached = si < 8 and if (table_index == 0)
+            effective_type == gsub_tag_ligature and format == 1
+        else
+            effective_type == gpos_tag_pair and format <= 2;
+        var cache_index: u32 = common.SubtableInfo.no_cache;
+        if (cached) {
+            cache_index = @intCast(caches.items.len);
+            try caches.append(allocator, .{});
+        }
         subtables.appendAssumeCapacity(.{
             .digest = sub_digest,
             .offset = @intCast(reader.offset),
             .lookup_type = effective_type,
             .coverage = if (coverage_rel == 2) try cov.resolve() else .{},
+            .cache = cache_index,
         });
     }
     return digest;
@@ -1851,6 +1888,7 @@ fn applyLookup(
     table_index: u1,
     direction: Direction,
     subtables: []const common.SubtableInfo,
+    caches: []common.SubtableCache,
 ) (parsing.Font.ParseError || error{OutOfMemory})!void {
     const lk = try layout.lookupAt(entry.index);
     const lookup_type = try lk.lookupType();
@@ -1871,13 +1909,15 @@ fn applyLookup(
                 while (si < sub_count) : (si += 1) {
                     var sub_type = lookup_type;
                     var sub_cov: ?*const parsing.Table.Layout.Coverage.Resolved = null;
+                    var sub_cache: ?*common.SubtableCache = null;
                     const sub_off = if (si < subtables.len) blk: {
                         if (!subtables[si].digest.mayHave(buffer.info.items[idx].codepoint)) continue;
                         sub_type = subtables[si].lookup_type;
                         if (subtables[si].coverage.format != 0) sub_cov = &subtables[si].coverage;
+                        if (subtables[si].cache != common.SubtableInfo.no_cache) sub_cache = &caches[subtables[si].cache];
                         break :blk @as(usize, subtables[si].offset);
                     } else try lk.subtableOffset(si);
-                    if (try applyGsubSubtable(layout, sub_type, sub_off, sub_cov, entry.mask, entry.random, joiners, buffer, gdef, lookup_flags, max_nesting_level)) break;
+                    if (try applyGsubSubtable(layout, sub_type, sub_off, sub_cov, sub_cache, entry.mask, entry.random, joiners, buffer, gdef, lookup_flags, max_nesting_level)) break;
                 }
             }
             if (idx == 0) break;
@@ -1886,6 +1926,7 @@ fn applyLookup(
         buffer.idx = 0;
         return;
     }
+
 
     if (table_index == 0) buffer.clearOutput();
     while (buffer.idx < buffer.len()) {
@@ -1898,16 +1939,18 @@ fn applyLookup(
             while (si < sub_count) : (si += 1) {
                 var sub_type = lookup_type;
                 var sub_cov: ?*const parsing.Table.Layout.Coverage.Resolved = null;
+                var sub_cache: ?*common.SubtableCache = null;
                 const sub_off = if (si < subtables.len) blk: {
                     if (!subtables[si].digest.mayHave(buffer.info.items[buffer.idx].codepoint)) continue;
                     sub_type = subtables[si].lookup_type;
                     if (subtables[si].coverage.format != 0) sub_cov = &subtables[si].coverage;
+                    if (subtables[si].cache != common.SubtableInfo.no_cache) sub_cache = &caches[subtables[si].cache];
                     break :blk @as(usize, subtables[si].offset);
                 } else try lk.subtableOffset(si);
                 applied = if (table_index == 0)
-                    try applyGsubSubtable(layout, sub_type, sub_off, sub_cov, entry.mask, entry.random, joiners, buffer, gdef, lookup_flags, max_nesting_level)
+                    try applyGsubSubtable(layout, sub_type, sub_off, sub_cov, sub_cache, entry.mask, entry.random, joiners, buffer, gdef, lookup_flags, max_nesting_level)
                 else
-                    try applyGposSubtable(layout, sub_type, sub_off, sub_cov, joiners, gdef, lookup_flags, buffer, direction, max_nesting_level);
+                    try applyGposSubtable(layout, sub_type, sub_off, sub_cov, sub_cache, joiners, gdef, lookup_flags, buffer, direction, max_nesting_level);
                 if (applied) break;
             }
         }
@@ -1937,7 +1980,7 @@ pub fn applyStage(
         if (entry.mask & buffer.mask_union == 0) continue;
         if (!entry.digest.mayIntersect(buffer.digest)) continue;
         const subtables = map.subtables.items[entry.subtables_start..][0..entry.subtables_len];
-        try applyLookup(layout, entry, gdef, buffer, table_index, direction, subtables);
+        try applyLookup(layout, entry, gdef, buffer, table_index, direction, subtables, map.subtable_caches.items);
     }
 }
 

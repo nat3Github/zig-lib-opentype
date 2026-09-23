@@ -118,10 +118,12 @@ pub const Map = struct {
     lookups: [2]std.ArrayList(LookupMapEntry) = .{ .empty, .empty },
     stages: [2]std.ArrayList(StageMapEntry) = .{ .empty, .empty },
     subtables: std.ArrayList(common.SubtableInfo) = .empty,
+    subtable_caches: std.ArrayList(common.SubtableCache) = .empty,
 
     pub fn deinit(self: *Map, allocator: std.mem.Allocator) void {
         self.features.deinit(allocator);
         self.subtables.deinit(allocator);
+        self.subtable_caches.deinit(allocator);
         for (&self.lookups) |*l| l.deinit(allocator);
         for (&self.stages) |*s| s.deinit(allocator);
         self.* = undefined;
