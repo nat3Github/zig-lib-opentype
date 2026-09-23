@@ -656,8 +656,8 @@ fn setupMasksFraction(buffer: *Buffer, map: map_mod.Map, direction: Direction) v
 fn mirrorChars(buffer: *Buffer, cmap: ?parsing.Table.cmap.Resolved, rtlm_mask: u32) void {
     for (buffer.info.items) |*info| {
         const mirrored = unicode.bidiMirror(@intCast(info.codepoint));
-        const covered = if (cmap) |resolved| resolved.lookup(mirrored) != null else false;
-        if (mirrored != info.codepoint and covered) info.codepoint = mirrored else info.mask |= rtlm_mask;
+        const covered = mirrored != info.codepoint and if (cmap) |resolved| resolved.lookup(mirrored) != null else false;
+        if (covered) info.codepoint = mirrored else info.mask |= rtlm_mask;
     }
 }
 

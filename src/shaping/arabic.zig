@@ -146,9 +146,11 @@ pub fn collectFeaturesArabic(map_builder: *MapBuilder, is_arabic_script: bool) !
 /// constraint as `setupMasksHangul` above.
 pub fn setupMasksArabic(buffer: *Buffer, map: Map) void {
     arabicJoining(buffer);
+    var masks: [arabic_feature_tags.len]u32 = undefined;
+    for (&masks, arabic_feature_tags) |*mask, tag| mask.* = map.get1Mask(tag);
     for (buffer.info.items) |*info| {
         const action = info.arabic_shaping_action;
-        if (action < arabic_feature_tags.len) info.mask |= map.get1Mask(arabic_feature_tags[action]);
+        if (action < masks.len) info.mask |= masks[action];
         info.is_arabic_word = unicode.isArabicWordCategory(@intCast(info.codepoint));
     }
 }
