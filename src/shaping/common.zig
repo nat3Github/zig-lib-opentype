@@ -81,7 +81,7 @@ pub const GlyphInfo = struct {
     /// to `.none` (no positional substitution) for non-joining glyphs.
     arabic_shaping_action: u8 = @intFromEnum(ArabicAction.none),
     /// Indic complex shaper: category/position/syllable-id `setIndicProperties`/
-    /// `findSyllablesIndic` assign per glyph before `reorderIndicSyllable`
+    /// `findSyllables` assign per glyph before `reorderIndicSyllable`
     /// consumes them - see that section's doc comment. Also reused verbatim
     /// by the Khmer/Myanmar shapers below (`setupMasksKhmer`/`setupMasksMyanmar`)
     /// - this mirrors hb itself, which aliases the exact same buffer-var slots

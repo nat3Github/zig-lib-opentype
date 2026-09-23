@@ -24,14 +24,8 @@ const MapFeatureFlags = map_mod.MapFeatureFlags;
 // port of the generated packtab lookup in hb-ot-shaper-indic-table.cc -
 // mechanical and low-risk since it's a pure data-table decode.
 //
-// Syllabification (`findSyllablesIndic`) hand-ports the Ragel scanner
-// grammar in hb-ot-shaper-indic-machine.rl (not the generated .hh state
-// tables, which are an unreadable merged Ragel DFA shared with
-// khmer/myanmar) as a greedy longest-match recursive matcher - the .rl
-// grammar is a plain regex over category codes with no backtracking
-// ambiguity that matters here, so per-rule maximal-munch matching plus
-// "longest match across rules, first-listed wins ties" reproduces the
-// scanner semantics.
+// Syllabification (`findSyllables`) runs hb's generated ragel tables
+// from hb-ot-shaper-indic-machine.hh (see syllable_machines.zig).
 //
 // Reordering follows hb's two-phase shape: `initialReorderingIndic` runs as
 // a GSUB pause after 'locl'/'ccmp' and `finalReorderingIndic` as one after
@@ -251,202 +245,6 @@ pub fn isIndicJoiner(cat: u8) bool {
     return cat == ic_zwj or cat == ic_zwnj;
 }
 
-/// Ported from `reph = (Ra H | Repha)`.
-fn matchIndicReph(info: []const GlyphInfo, p: usize, end: usize) ?usize {
-    if (p < end and info[p].indic_category == ic_repha) return p + 1;
-    if (p < end and info[p].indic_category == ic_ra and p + 1 < end and info[p + 1].indic_category == ic_h) return p + 2;
-    return null;
-}
-
-/// Ported from `n = ((ZWNJ?.RS)? (N.N?)?)`.
-fn matchIndicN(info: []const GlyphInfo, p: usize, end: usize) usize {
-    var q = p;
-    {
-        var r = q;
-        if (r < end and info[r].indic_category == ic_zwnj) r += 1;
-        if (r < end and info[r].indic_category == ic_rs) {
-            q = r + 1;
-        } else if (q < end and info[q].indic_category == ic_rs) {
-            q = q + 1;
-        }
-    }
-    if (q < end and info[q].indic_category == ic_n) {
-        q += 1;
-        if (q < end and info[q].indic_category == ic_n) q += 1;
-    }
-    return q;
-}
-
-/// Ported from `cn = c.ZWJ?.n?`.
-fn matchIndicCn(info: []const GlyphInfo, p: usize, end: usize) ?usize {
-    if (!(p < end and (info[p].indic_category == ic_c or info[p].indic_category == ic_ra))) return null;
-    var q = p + 1;
-    if (q < end and info[q].indic_category == ic_zwj) q += 1;
-    return matchIndicN(info, q, end);
-}
-
-fn matchIndicSymbol(info: []const GlyphInfo, p: usize, end: usize) ?usize {
-    if (!(p < end and info[p].indic_category == ic_symbol)) return null;
-    var q = p + 1;
-    if (q < end and info[q].indic_category == ic_n) q += 1;
-    return q;
-}
-
-/// Ported from `matra_group = z*.(M | sm? MPst).N?.H?`.
-fn matchIndicMatraGroup(info: []const GlyphInfo, p: usize, end: usize) ?usize {
-    var q = p;
-    while (q < end and isIndicJoiner(info[q].indic_category)) q += 1;
-    if (q < end and info[q].indic_category == ic_m) {
-        q += 1;
-    } else {
-        var r = q;
-        if (r < end and (info[r].indic_category == ic_sm or info[r].indic_category == ic_smpst)) r += 1;
-        if (r < end and info[r].indic_category == ic_mpst) {
-            q = r + 1;
-        } else return null;
-    }
-    if (q < end and info[q].indic_category == ic_n) q += 1;
-    if (q < end and info[q].indic_category == ic_h) q += 1;
-    return q;
-}
-
-/// Ported from `syllable_tail = (z?.sm.sm?.ZWNJ?)? (A | VD)*` (A and VD
-/// share category value 9, see `ic_*`'s doc comment).
-fn matchIndicSyllableTail(info: []const GlyphInfo, p: usize, end: usize) usize {
-    var q = p;
-    {
-        var r = q;
-        if (r < end and isIndicJoiner(info[r].indic_category)) r += 1;
-        if (r < end and (info[r].indic_category == ic_sm or info[r].indic_category == ic_smpst)) {
-            r += 1;
-            if (r < end and (info[r].indic_category == ic_sm or info[r].indic_category == ic_smpst)) r += 1;
-            if (r < end and info[r].indic_category == ic_zwnj) r += 1;
-            q = r;
-        }
-    }
-    while (q < end and info[q].indic_category == 9) q += 1;
-    return q;
-}
-
-/// Ported from `halant_group = (z?.H.(ZWJ.N?)?)`.
-fn matchIndicHalantGroup(info: []const GlyphInfo, p: usize, end: usize) ?usize {
-    var h_pos: ?usize = null;
-    if (p < end and isIndicJoiner(info[p].indic_category) and p + 1 < end and info[p + 1].indic_category == ic_h) {
-        h_pos = p + 2;
-    } else if (p < end and info[p].indic_category == ic_h) {
-        h_pos = p + 1;
-    }
-    var q = h_pos orelse return null;
-    if (q < end and info[q].indic_category == ic_zwj) {
-        var r = q + 1;
-        if (r < end and info[r].indic_category == ic_n) r += 1;
-        q = r;
-    }
-    return q;
-}
-
-/// Ported from `final_halant_group = halant_group | H.ZWNJ`.
-fn matchIndicFinalHalantGroup(info: []const GlyphInfo, p: usize, end: usize) ?usize {
-    const a = matchIndicHalantGroup(info, p, end);
-    var b: ?usize = null;
-    if (p < end and info[p].indic_category == ic_h and p + 1 < end and info[p + 1].indic_category == ic_zwnj) b = p + 2;
-    if (a == null and b == null) return null;
-    return @max(a orelse 0, b orelse 0);
-}
-
-fn matchIndicMedialGroup(info: []const GlyphInfo, p: usize, end: usize) usize {
-    if (p < end and info[p].indic_category == ic_cm) return p + 1;
-    return p;
-}
-
-/// Ported from `halant_or_matra_group = (final_halant_group | matra_group*)`.
-fn matchIndicHalantOrMatraGroup(info: []const GlyphInfo, p: usize, end: usize) usize {
-    var best = p;
-    {
-        var q = p;
-        while (matchIndicMatraGroup(info, q, end)) |nq| {
-            if (nq == q) break;
-            q = nq;
-        }
-        if (q > best) best = q;
-    }
-    if (matchIndicFinalHalantGroup(info, p, end)) |q| {
-        if (q > best) best = q;
-    }
-    return best;
-}
-
-/// Ported from `complex_syllable_tail = (halant_group.cn)* medial_group
-/// halant_or_matra_group syllable_tail`.
-fn matchIndicComplexSyllableTail(info: []const GlyphInfo, p: usize, end: usize) usize {
-    var q = p;
-    while (true) {
-        const hg = matchIndicHalantGroup(info, q, end) orelse break;
-        const cn = matchIndicCn(info, hg, end) orelse break;
-        q = cn;
-    }
-    q = matchIndicMedialGroup(info, q, end);
-    q = matchIndicHalantOrMatraGroup(info, q, end);
-    q = matchIndicSyllableTail(info, q, end);
-    return q;
-}
-
-/// Ported from `consonant_syllable = (Repha|CS)? cn complex_syllable_tail`.
-fn matchIndicConsonantSyllable(info: []const GlyphInfo, p: usize, end: usize) ?usize {
-    var q = p;
-    if (q < end and (info[q].indic_category == ic_repha or info[q].indic_category == ic_cs)) q += 1;
-    const cn = matchIndicCn(info, q, end) orelse return null;
-    return matchIndicComplexSyllableTail(info, cn, end);
-}
-
-/// Ported from `vowel_syllable = reph? V.n? (ZWJ | complex_syllable_tail)`.
-fn matchIndicVowelSyllable(info: []const GlyphInfo, p: usize, end: usize) ?usize {
-    var q = p;
-    if (matchIndicReph(info, q, end)) |r| q = r;
-    if (!(q < end and info[q].indic_category == ic_v)) return null;
-    q += 1;
-    q = matchIndicN(info, q, end);
-    var best = matchIndicComplexSyllableTail(info, q, end);
-    if (q < end and info[q].indic_category == ic_zwj) best = @max(best, q + 1);
-    return best;
-}
-
-/// Ported from `standalone_cluster = ((Repha|CS)? PLACEHOLDER | reph?
-/// DOTTEDCIRCLE).n? complex_syllable_tail`.
-fn matchIndicStandaloneCluster(info: []const GlyphInfo, p: usize, end: usize) ?usize {
-    var q: ?usize = null;
-    {
-        var r = p;
-        if (r < end and (info[r].indic_category == ic_repha or info[r].indic_category == ic_cs)) r += 1;
-        if (r < end and info[r].indic_category == ic_placeholder) q = r + 1;
-    }
-    {
-        var r = p;
-        if (matchIndicReph(info, r, end)) |rr| r = rr;
-        if (r < end and info[r].indic_category == ic_dottedcircle) {
-            const alt = r + 1;
-            if (q == null or alt > q.?) q = alt;
-        }
-    }
-    var qq = q orelse return null;
-    qq = matchIndicN(info, qq, end);
-    return matchIndicComplexSyllableTail(info, qq, end);
-}
-
-/// Ported from `symbol_cluster = symbol syllable_tail`.
-fn matchIndicSymbolCluster(info: []const GlyphInfo, p: usize, end: usize) ?usize {
-    const s = matchIndicSymbol(info, p, end) orelse return null;
-    return matchIndicSyllableTail(info, s, end);
-}
-
-/// Ported from `broken_cluster = reph? n? complex_syllable_tail`.
-fn matchIndicBrokenCluster(info: []const GlyphInfo, p: usize, end: usize) usize {
-    var q = p;
-    if (matchIndicReph(info, q, end)) |r| q = r;
-    q = matchIndicN(info, q, end);
-    return matchIndicComplexSyllableTail(info, q, end);
-}
-
 /// Same order as `indic_syllable_type_t`.
 const indic_syllable_consonant: u8 = 0;
 const indic_syllable_vowel: u8 = 1;
@@ -454,71 +252,6 @@ const indic_syllable_standalone: u8 = 2;
 const indic_syllable_symbol: u8 = 3;
 const indic_syllable_broken: u8 = 4;
 const indic_syllable_non_indic: u8 = 5;
-
-/// Ported from `find_syllables_indic`: at each position, tries every
-/// alternative in the `main := |* ... *|` Ragel scanner and picks the
-/// longest match (first-listed rule wins ties), falling back to a
-/// single-glyph `other` match. Requires `setIndicProperties` to have
-/// already run on every glyph in the buffer.
-fn findSyllablesIndic(buffer: *Buffer) void {
-    const info = buffer.info.items;
-    const count = info.len;
-    var p: usize = 0;
-    var serial: u8 = 1;
-    while (p < count) {
-        // 0 is a sentinel meaning "no rule matched yet" - `other` is the
-        // Ragel scanner's last-listed alternative and must lose ties, not
-        // win them; see the matching comment in use.zig's findSyllablesUse
-        // for why this matters (a lone broken-cluster glyph must not fall
-        // through to non_indic_cluster on a length tie).
-        var best_len: usize = 0;
-        var best_type: u8 = indic_syllable_non_indic;
-        if (matchIndicConsonantSyllable(info, p, count)) |e| {
-            const l = e - p;
-            if (l > best_len) {
-                best_len = l;
-                best_type = indic_syllable_consonant;
-            }
-        }
-        if (matchIndicVowelSyllable(info, p, count)) |e| {
-            const l = e - p;
-            if (l > best_len) {
-                best_len = l;
-                best_type = indic_syllable_vowel;
-            }
-        }
-        if (matchIndicStandaloneCluster(info, p, count)) |e| {
-            const l = e - p;
-            if (l > best_len) {
-                best_len = l;
-                best_type = indic_syllable_standalone;
-            }
-        }
-        if (matchIndicSymbolCluster(info, p, count)) |e| {
-            const l = e - p;
-            if (l > best_len) {
-                best_len = l;
-                best_type = indic_syllable_symbol;
-            }
-        }
-        {
-            const e = matchIndicBrokenCluster(info, p, count);
-            const l = e - p;
-            if (l > best_len) {
-                best_len = l;
-                best_type = indic_syllable_broken;
-            }
-        }
-        if (best_len == 0) best_len = 1; // `other`: no rule matched even one glyph.
-
-        const start = p;
-        const end = p + best_len;
-        for (info[start..end]) |*gi| gi.indic_syllable = (serial << 4) | best_type;
-        serial += 1;
-        if (serial == 16) serial = 1;
-        p = end;
-    }
-}
 
 /// hb's ragel scanner loop (`write exec` in hb-ot-shaper-*-machine.hh),
 /// run over one machine's tables: longest match across the grammar's
@@ -1190,7 +923,7 @@ fn indicPlan(font: parsing.Font, map: Map, config: IndicScriptConfig, cmap: ?Cma
 /// not glyphs.
 pub fn setupMasksIndic(buffer: *Buffer, cmap: ?Cmap) !void {
     for (buffer.info.items) |*info| setIndicProperties(info);
-    findSyllablesIndic(buffer);
+    findSyllables(buffer.info.items, syllable_machines.indic);
     _ = try common.insertDottedCircles(buffer, cmap, indic_syllable_broken, ic_dottedcircle, ic_repha, ip_end, false);
 
     var start: usize = 0;
