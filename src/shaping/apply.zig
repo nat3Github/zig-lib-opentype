@@ -1317,6 +1317,25 @@ fn applyRuleBasedContext(
     const ruleset = try reader.subReaderAt(ruleset_count_off + 2 + @as(usize, rule_index) * 2);
     const rule_count = try ruleset.u16At(0);
 
+    // hb's `RuleSet`/`ChainRuleSet::apply` fast path: large sets pre-match
+    // each rule's next two positions against the next two context glyphs.
+    // ponytail: hb's skip-ahead over rules sharing input[0] is not ported.
+    var prefilter = rule_count > 4;
+    var first: ?GlyphInfo = null;
+    var second: ?GlyphInfo = null;
+    if (prefilter) {
+        const infos = buffer.info.items;
+        const context_skip = joiners.contextual(table_index);
+        if (try matchForward(infos, gdef, lookup_flags, context_skip, buffer.idx + 1, AnyGlyph{})) |i| {
+            first = infos[i];
+            if (maybeSkippable(infos[i], context_skip)) {
+                prefilter = false;
+            } else if (try matchForward(infos, gdef, lookup_flags, context_skip, i + 1, AnyGlyph{})) |j| {
+                if (maybeSkippable(infos[j], context_skip)) prefilter = false else second = infos[j];
+            }
+        }
+    }
+
     var ri: u16 = 0;
     while (ri < rule_count) : (ri += 1) {
         const rule = try ruleset.subReaderAt(2 + @as(usize, ri) * 2);
@@ -1324,9 +1343,33 @@ fn applyRuleBasedContext(
             try readChainRuleOffsets(rule, backtrack_mode, input_mode, lookahead_mode)
         else
             try readRuleOffsets(rule, input_mode);
+        if (prefilter and !try rulePrefilterPasses(rule, offs, first, second)) continue;
         if (try applyContextCore(layout, rule, offs, lookup_flags, lookup_mask, random, joiners, gdef, buffer, table_index, direction, depth)) return true;
     }
     return false;
+}
+
+const AnyGlyph = struct {
+    fn matches(_: AnyGlyph, _: GlyphInfo) error{}!bool {
+        return true;
+    }
+};
+
+/// `first == null` means no glyph follows, so only rules with no further
+/// input or lookahead can match.
+fn rulePrefilterPasses(rule: parsing.Table.Layout.SubtableReader, offs: ContextOffsets, first: ?GlyphInfo, second: ?GlyphInfo) parsing.Font.ParseError!bool {
+    const input_len = @max(offs.input_count, 1);
+    const first_glyph = first orelse return input_len == 1 and offs.lookahead_count == 0;
+    const input = SlotMatcher{ .reader = rule, .mode = offs.input_mode, .off = offs.input_base + 2 };
+    const lookahead = SlotMatcher{ .reader = rule, .mode = offs.lookahead_mode, .off = offs.lookahead_base };
+    if (input_len > 1) {
+        if (!try input.matches(first_glyph)) return false;
+    } else if (offs.lookahead_count != 0 and !try lookahead.matches(first_glyph)) return false;
+    const second_glyph = second orelse return true;
+    if (input_len > 2) return (SlotMatcher{ .reader = rule, .mode = offs.input_mode, .off = offs.input_base + 4 }).matches(second_glyph);
+    const lookahead_index = 2 - input_len;
+    if (offs.lookahead_count <= lookahead_index) return true;
+    return (SlotMatcher{ .reader = rule, .mode = offs.lookahead_mode, .off = offs.lookahead_base + lookahead_index * 2 }).matches(second_glyph);
 }
 
 /// Ports `ReverseChainSingleSubstFormat1::apply` (OT spec 6.4): format
