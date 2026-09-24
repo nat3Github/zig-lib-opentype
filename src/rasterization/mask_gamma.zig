@@ -23,6 +23,12 @@ pub const CoverageContrast = struct {
         return buildContrastLut(self.effectiveContrast());
     }
 
+    /// `lut()` at the default `contrast` for `ppem`, prebuilt: the
+    /// effective contrast only takes three values across all ppem.
+    pub fn defaultLut(ppem: f32) *const [256]u8 {
+        return &default_luts[if (ppem >= 28) 2 else if (ppem >= 24) 1 else 0];
+    }
+
     pub fn remap(self: CoverageContrast, coverage: u8) u8 {
         if (coverage == 0 or !self.enabled) return coverage;
         return self.lut()[coverage];
@@ -35,6 +41,13 @@ pub const CoverageContrast = struct {
             if (pixel.* != 0) pixel.* = table[pixel.*];
         }
     }
+};
+
+const default_luts = default_luts: {
+    @setEvalBranchQuota(20_000);
+    var tables: [3][256]u8 = undefined;
+    for (&tables, [_]f32{ 16, 24, 28 }) |*table, ppem| table.* = (CoverageContrast{ .ppem = ppem }).lut();
+    break :default_luts tables;
 };
 
 fn identityLut() [256]u8 {
@@ -78,4 +91,12 @@ test "coverage contrast tapers at high ppem" {
     const small = (CoverageContrast{ .ppem = 16 }).effectiveContrast();
     const large = (CoverageContrast{ .ppem = 32 }).effectiveContrast();
     try std.testing.expect(small > large);
+}
+
+test "prebuilt default luts match lut()" {
+    var ppem: f32 = 1;
+    while (ppem < 100) : (ppem += 0.25) {
+        const cc: CoverageContrast = .{ .ppem = ppem };
+        try std.testing.expectEqualSlices(u8, &cc.lut(), CoverageContrast.defaultLut(ppem));
+    }
 }

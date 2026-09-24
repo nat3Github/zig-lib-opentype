@@ -212,7 +212,8 @@ const GridFit = struct {
 /// `rasterizeGlyf`/`rasterizeGlyfAffine`/`rasterizeGlyfHinted` once each has
 /// produced its own scaled point set.
 pub fn renderScaledPoints(
-    allocator: std.mem.Allocator,
+    scratch_allocator: std.mem.Allocator,
+    output_allocator: std.mem.Allocator,
     points: []ScaledPoint,
     end_points_of_contours: []const u16,
     want_pixels: bool,
@@ -235,14 +236,14 @@ pub fn renderScaledPoints(
     const width = fit.width;
     const height = fit.height;
     if (width <= 0 or height <= 0) {
-        return .{ .width = 0, .rows = 0, .left = x_min_px, .top = y_max_px, .pixels_row_major = try allocator.alloc(u8, 0) };
+        return .{ .width = 0, .rows = 0, .left = x_min_px, .top = y_max_px, .pixels_row_major = try output_allocator.alloc(u8, 0) };
     }
 
     // Grid fit above is the whole answer for a metrics-only caller; the
     // returned `width`/`rows` are the real dimensions, but `pixels_row_major`
     // is empty rather than `width * rows` bytes.
     if (!want_pixels) {
-        return .{ .width = @intCast(width), .rows = @intCast(height), .left = x_min_px, .top = y_max_px, .pixels_row_major = try allocator.alloc(u8, 0) };
+        return .{ .width = @intCast(width), .rows = @intCast(height), .left = x_min_px, .top = y_max_px, .pixels_row_major = try output_allocator.alloc(u8, 0) };
     }
 
     for (points) |*sp| {
@@ -250,7 +251,7 @@ pub fn renderScaledPoints(
         sp.p.y -= 64 * y_min_px;
     }
 
-    var raster = try Rasterizer.init(allocator, width, height);
+    var raster = try Rasterizer.init(scratch_allocator, width, height);
     defer raster.deinit();
 
     // parsing.zig rejects non-monotonic end points, but composite glyphs
@@ -263,7 +264,7 @@ pub fn renderScaledPoints(
         try decomposeContour(&raster, contour);
     }
 
-    const pixels = try allocator.alloc(u8, @as(usize, @intCast(width)) * @as(usize, @intCast(height)));
+    const pixels = try output_allocator.alloc(u8, @as(usize, @intCast(width)) * @as(usize, @intCast(height)));
     @memset(pixels, 0);
     raster.sweep(pixels, width);
 
@@ -280,7 +281,7 @@ pub fn renderScaledPoints(
 /// and sweeps them into an AA coverage bitmap — the CFF/cubic analogue of
 /// `renderScaledPoints`, shared by `rasterizeCff` and `rasterizeCffHinted`
 /// once each has produced its own scaled segment list.
-pub fn renderScaledCffSegments(allocator: std.mem.Allocator, segments: []IScaledCffSegment, want_pixels: bool) RasterizeError!Bitmap8bit {
+pub fn renderScaledCffSegments(scratch_allocator: std.mem.Allocator, output_allocator: std.mem.Allocator, segments: []IScaledCffSegment, want_pixels: bool) RasterizeError!Bitmap8bit {
     var cbox_min_x: i32 = std.math.maxInt(i32);
     var cbox_min_y: i32 = std.math.maxInt(i32);
     var cbox_max_x: i32 = std.math.minInt(i32);
@@ -304,12 +305,12 @@ pub fn renderScaledCffSegments(allocator: std.mem.Allocator, segments: []IScaled
     const width = fit.width;
     const height = fit.height;
     if (width <= 0 or height <= 0) {
-        return .{ .width = 0, .rows = 0, .left = x_min_px, .top = y_max_px, .pixels_row_major = try allocator.alloc(u8, 0) };
+        return .{ .width = 0, .rows = 0, .left = x_min_px, .top = y_max_px, .pixels_row_major = try output_allocator.alloc(u8, 0) };
     }
 
     // See `renderScaledPoints`: metrics-only callers stop at the grid fit.
     if (!want_pixels) {
-        return .{ .width = @intCast(width), .rows = @intCast(height), .left = x_min_px, .top = y_max_px, .pixels_row_major = try allocator.alloc(u8, 0) };
+        return .{ .width = @intCast(width), .rows = @intCast(height), .left = x_min_px, .top = y_max_px, .pixels_row_major = try output_allocator.alloc(u8, 0) };
     }
 
     for (segments) |*segment| {
@@ -324,12 +325,12 @@ pub fn renderScaledCffSegments(allocator: std.mem.Allocator, segments: []IScaled
         }
     }
 
-    var raster = try Rasterizer.init(allocator, width, height);
+    var raster = try Rasterizer.init(scratch_allocator, width, height);
     defer raster.deinit();
 
     try Rasterizer.decomposeCffSegments(&raster, segments);
 
-    const pixels = try allocator.alloc(u8, @as(usize, @intCast(width)) * @as(usize, @intCast(height)));
+    const pixels = try output_allocator.alloc(u8, @as(usize, @intCast(width)) * @as(usize, @intCast(height)));
     @memset(pixels, 0);
     raster.sweep(pixels, width);
 

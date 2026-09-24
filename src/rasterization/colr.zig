@@ -433,7 +433,7 @@ fn rasterizeGlyfAffine(alloc: Allocator, outline: parsing.Table.glyf.Outline, ma
         scaled_points[i] = .{ .p = sp, .on = pt.on_curve };
     }
 
-    return common.renderScaledPoints(alloc, scaled_points, outline.end_points_of_contours, true);
+    return common.renderScaledPoints(alloc, alloc, scaled_points, outline.end_points_of_contours, true);
 }
 
 /// Same pipeline as `rasterizeCff`, under an arbitrary `Affine` — see

@@ -132,6 +132,7 @@ pub const Renderer = struct {
     cblc_data: ?[]const u8,
     cbdt_data: ?[]const u8,
     ppem: f32,
+    coverage_lut: *const [256]u8,
     normalized: []const f32,
     gvar_header: ?parsing.Table.gvar.Header,
     gvar_data: []const u8,
@@ -220,6 +221,7 @@ pub const Renderer = struct {
             .cblc_data = font.tableData(.{ 'C', 'B', 'L', 'C' }),
             .cbdt_data = font.tableData(.{ 'C', 'B', 'D', 'T' }),
             .ppem = ppem,
+            .coverage_lut = undefined,
             .num_glyphs = maxp.num_glyphs,
             .normalized = &.{},
             .gvar_header = gvar_header,
@@ -260,6 +262,9 @@ pub const Renderer = struct {
         if (self.normalized.len != 0) state_allocator.free(self.normalized);
         self.normalized = normalized;
         self.ppem = ppem;
+        self.coverage_lut = rasterization.CoverageContrast.defaultLut(ppem);
+        // `finishOutlineMask` remaps zero coverage through the table too.
+        std.debug.assert(self.coverage_lut[0] == 0);
         self.vary = self.gvar_header != null and anyNonDefault(normalized);
 
         if (options.hint_glyf and self.glyf_data != null and ppem < glyf_hinting_ppem_threshold and !self.vary) {
@@ -313,16 +318,6 @@ pub const Renderer = struct {
         return false;
     }
 
-    fn contrastedCoverage(self: Renderer, mask: rasterization.Bitmap8bit, output_allocator: std.mem.Allocator) std.mem.Allocator.Error!rasterization.Bitmap8bit {
-        const contrast: rasterization.CoverageContrast = .{ .ppem = self.ppem };
-        const lut = contrast.lut();
-        const pixels = try output_allocator.alloc(u8, @as(usize, mask.width) * mask.rows);
-        for (pixels, mask.pixels_row_major[0..pixels.len]) |*pixel, coverage| {
-            pixel.* = if (coverage == 0) 0 else lut[coverage];
-        }
-        return .{ .width = mask.width, .rows = mask.rows, .left = mask.left, .top = mask.top, .pixels_row_major = pixels };
-    }
-
     fn colrOutlineSource(self: Renderer) ?rasterization.OutlineSource {
         if (self.glyf_data) |glyf_table| {
             const loca_table = self.loca_data orelse return null;
@@ -338,23 +333,9 @@ pub const Renderer = struct {
         return null;
     }
 
-    /// Metrics-only callers get the grid-fit box the rasterizer computes
-    /// before scan conversion; the coverage-contrast pass and the pixel
-    /// allocation only happen when `want_pixels` is set.
-    fn finishOutlineMask(
-        self: Renderer,
-        mask: rasterization.Bitmap8bit,
-        output_allocator: std.mem.Allocator,
-        want_pixels: bool,
-    ) std.mem.Allocator.Error!rasterization.Bitmap8bit {
-        if (!want_pixels) return .{
-            .width = mask.width,
-            .rows = mask.rows,
-            .left = mask.left,
-            .top = mask.top,
-            .pixels_row_major = rasterization.Bitmap8bit.empty.pixels_row_major,
-        };
-        return self.contrastedCoverage(mask, output_allocator);
+    fn finishOutlineMask(self: Renderer, mask: rasterization.Bitmap8bit) rasterization.Bitmap8bit {
+        for (mask.pixels_row_major) |*coverage| coverage.* = self.coverage_lut[coverage.*];
+        return mask;
     }
 
     fn renderOutline(
@@ -373,6 +354,7 @@ pub const Renderer = struct {
             if (self.glyf_interp) |*interp| {
                 const mask = try rasterization.rasterizeGlyfHinted(
                     scratch_allocator,
+                    output_allocator,
                     interp,
                     glyf_table,
                     loca_table,
@@ -388,8 +370,7 @@ pub const Renderer = struct {
                     phase,
                     want_pixels,
                 );
-                defer mask.deinit(scratch_allocator);
-                return self.finishOutlineMask(mask, output_allocator, want_pixels);
+                return self.finishOutlineMask(mask);
             }
             const outline = if (vary) try parsing.Table.glyf.outlineVaried(
                 scratch_allocator,
@@ -411,26 +392,22 @@ pub const Renderer = struct {
             );
             defer scratch_allocator.free(outline.points);
             defer scratch_allocator.free(outline.end_points_of_contours);
-            const mask = try rasterization.rasterizeTrueTypeGlyfOutline(scratch_allocator, outline, units_per_em, self.ppem, phase, want_pixels);
-            defer mask.deinit(scratch_allocator);
-            return self.finishOutlineMask(mask, output_allocator, want_pixels);
+            const mask = try rasterization.rasterizeTrueTypeGlyfOutline(scratch_allocator, output_allocator, outline, units_per_em, self.ppem, phase, want_pixels);
+            return self.finishOutlineMask(mask);
         } else if (self.cff_context) |ctx| {
             if (self.ppem < cff_hinting_ppem_threshold) {
-                const mask = try rasterization.rasterizeCffOutlineHintedWithContext(scratch_allocator, ctx, glyph_id, units_per_em, self.ppem, phase, true, want_pixels);
-                defer mask.deinit(scratch_allocator);
-                return self.finishOutlineMask(mask, output_allocator, want_pixels);
+                const mask = try rasterization.rasterizeCffOutlineHintedWithContext(scratch_allocator, output_allocator, ctx, glyph_id, units_per_em, self.ppem, phase, true, want_pixels);
+                return self.finishOutlineMask(mask);
             }
             const outline = try ctx.outline(scratch_allocator, glyph_id);
             defer scratch_allocator.free(outline.segments);
-            const mask = try rasterization.rasterizeCffOutline(scratch_allocator, outline, units_per_em, self.ppem, phase, want_pixels);
-            defer mask.deinit(scratch_allocator);
-            return self.finishOutlineMask(mask, output_allocator, want_pixels);
+            const mask = try rasterization.rasterizeCffOutline(scratch_allocator, output_allocator, outline, units_per_em, self.ppem, phase, want_pixels);
+            return self.finishOutlineMask(mask);
         } else if (self.cff2_data) |cff2_table| {
             const outline = try parsing.Table.cff2.outline(scratch_allocator, cff2_table, glyph_id);
             defer scratch_allocator.free(outline.segments);
-            const mask = try rasterization.rasterizeCffOutline(scratch_allocator, outline, units_per_em, self.ppem, phase, want_pixels);
-            defer mask.deinit(scratch_allocator);
-            return self.finishOutlineMask(mask, output_allocator, want_pixels);
+            const mask = try rasterization.rasterizeCffOutline(scratch_allocator, output_allocator, outline, units_per_em, self.ppem, phase, want_pixels);
+            return self.finishOutlineMask(mask);
         } else {
             return error.InvalidTableFormat;
         }

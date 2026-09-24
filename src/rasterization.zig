@@ -76,6 +76,7 @@ pub const SubpixelOffset = struct { x: i32 = 0, y: i32 = 0 };
 /// glyph's box (text layout/atlas placement) and not its coverage.
 pub fn rasterizeCffOutline(
     alloc: Allocator,
+    output_allocator: Allocator,
     outline: parsing.Table.cff.Outline,
     units_per_em: u16,
     ppem: f32,
@@ -126,7 +127,7 @@ pub fn rasterizeCffOutline(
         }
     }
 
-    return common.renderScaledCffSegments(alloc, scaled, want_pixels);
+    return common.renderScaledCffSegments(alloc, output_allocator, scaled, want_pixels);
 }
 
 pub const CffHintError = RasterizeError || cff_hint.interp.InterpError || parsing.Font.ParseError;
@@ -141,6 +142,7 @@ fn fixed16ToF26Dot6(x: i32) i32 {
 
 pub fn rasterizeCffOutlineHinted(
     alloc: Allocator,
+    output_allocator: Allocator,
     cff_data: []const u8,
     glyph_id: u16,
     units_per_em: u16,
@@ -150,13 +152,14 @@ pub fn rasterizeCffOutlineHinted(
     want_pixels: bool,
 ) CffHintError!Bitmap8bit {
     var ctx = try parsing.Table.cff.Context.init(cff_data);
-    return rasterizeCffOutlineHintedWithContext(alloc, &ctx, glyph_id, units_per_em, ppem, phase, darken, want_pixels);
+    return rasterizeCffOutlineHintedWithContext(alloc, output_allocator, &ctx, glyph_id, units_per_em, ppem, phase, darken, want_pixels);
 }
 
 /// Like `rasterizeCffOutlineHinted`, but reuses a caller-owned per-font CFF
 /// context instead of re-parsing the font's INDEXes/DICTs for every glyph.
 pub fn rasterizeCffOutlineHintedWithContext(
     alloc: Allocator,
+    output_allocator: Allocator,
     ctx: *parsing.Table.cff.Context,
     glyph_id: u16,
     units_per_em: u16,
@@ -197,11 +200,12 @@ pub fn rasterizeCffOutlineHintedWithContext(
         };
     }
 
-    return common.renderScaledCffSegments(alloc, scaled, want_pixels);
+    return common.renderScaledCffSegments(alloc, output_allocator, scaled, want_pixels);
 }
 
 pub fn rasterizeTrueTypeGlyfOutline(
     alloc: Allocator,
+    output_allocator: Allocator,
     outline: parsing.Table.glyf.Outline,
     units_per_em: u16,
     ppem: f32,
@@ -222,7 +226,7 @@ pub fn rasterizeTrueTypeGlyfOutline(
         scaled_points[i] = .{ .p = .{ .x = sx, .y = sy }, .on = pt.on_curve };
     }
 
-    return common.renderScaledPoints(alloc, scaled_points, outline.end_points_of_contours, want_pixels);
+    return common.renderScaledPoints(alloc, output_allocator, scaled_points, outline.end_points_of_contours, want_pixels);
 }
 
 pub const HintError = RasterizeError || hinting.Error || parsing.Font.ParseError;
@@ -563,6 +567,7 @@ fn hintGlyphComponentRek(
 /// without vertical metrics (phantom points 3/4 then default to `{0, 0}`).
 pub fn rasterizeGlyfHinted(
     alloc: Allocator,
+    output_allocator: Allocator,
     interp: *hinting.Interpreter,
     glyf_data: []const u8,
     loca_data: []const u8,
@@ -608,7 +613,7 @@ pub fn rasterizeGlyfHinted(
         scaled_points[i] = .{ .p = .{ .x = p.x - pp1_x, .y = p.y }, .on = (tag & hinting.on_curve) != 0 };
     }
 
-    return common.renderScaledPoints(alloc, scaled_points, result.contours, want_pixels);
+    return common.renderScaledPoints(alloc, output_allocator, scaled_points, result.contours, want_pixels);
 }
 
 pub const VerticalOrigin = struct {
