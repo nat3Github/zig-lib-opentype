@@ -178,11 +178,7 @@ pub const Renderer = struct {
 
         var gvar_header: ?parsing.Table.gvar.Header = null;
         const gvar_data = font.tableData(.{ 'g', 'v', 'a', 'r' }) orelse &.{};
-        if (gvar_data.len != 0) gvar_header = try parsing.Table.gvar.parseHeader(state_allocator, gvar_data);
-        errdefer if (gvar_header) |h| {
-            state_allocator.free(h.glyph_offsets);
-            if (h.shared_tuples.len != 0) state_allocator.free(h.shared_tuples);
-        };
+        if (gvar_data.len != 0) gvar_header = try parsing.Table.gvar.parseHeader(gvar_data);
 
         var hmtx_data: []const u8 = &.{};
         var number_of_h_metrics: u16 = 0;
@@ -329,10 +325,6 @@ pub const Renderer = struct {
     /// `state_allocator` must be the same allocator passed to `init`.
     pub fn deinit(self: *Renderer, state_allocator: std.mem.Allocator) void {
         if (self.normalized.len != 0) state_allocator.free(self.normalized);
-        if (self.gvar_header) |h| {
-            state_allocator.free(h.glyph_offsets);
-            if (h.shared_tuples.len != 0) state_allocator.free(h.shared_tuples);
-        }
         self.dropGlyfHinting(state_allocator);
         if (self.cff_context) |ctx| state_allocator.destroy(ctx);
     }

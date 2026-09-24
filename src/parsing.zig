@@ -2086,9 +2086,11 @@ pub const Table = struct {
         pub const Header = struct {
             axis_count: u16,
             glyph_count: u16,
-            glyph_offsets: []const u32,
+            long_offsets: bool,
+            array_offset: u32,
+            offset_bytes: []const u8,
             shared_tuple_count: u16,
-            shared_tuples: []const f32,
+            shared_tuple_bytes: []const u8,
         };
 
         const tuples_share_point_numbers: u16 = 0x8000;
@@ -2098,7 +2100,7 @@ pub const Table = struct {
         const private_point_numbers: u16 = 0x2000;
         const tuple_index_mask: u16 = 0x0FFF;
 
-        pub fn parseHeader(alloc: Allocator, data: []const u8) (Font.ParseError || error{OutOfMemory})!Header {
+        pub fn parseHeader(data: []const u8) Font.ParseError!Header {
             if (data.len < 20) return error.InvalidTableFormat;
             const major_version = std.mem.readInt(u16, data[0..2], .big);
             if (major_version != 1) return error.InvalidTableFormat;
@@ -2112,49 +2114,42 @@ pub const Table = struct {
             const long_offsets = (flags & 1) != 0;
             const entry_size: usize = if (long_offsets) 4 else 2;
             const offsets_start = 20;
-            const offsets_count = @as(usize, glyph_count) + 1;
-            if (offsets_start + offsets_count * entry_size > data.len) return error.InvalidTableFormat;
+            const offsets_len = (@as(usize, glyph_count) + 1) * entry_size;
+            if (offsets_start + offsets_len > data.len) return error.InvalidTableFormat;
 
-            const glyph_offsets = try alloc.alloc(u32, offsets_count);
-            errdefer alloc.free(glyph_offsets);
-            for (glyph_offsets, 0..) |*o, i| {
-                const pos = offsets_start + i * entry_size;
-                const raw: u32 = if (long_offsets)
-                    std.mem.readInt(u32, data[pos..][0..4], .big)
-                else
-                    @as(u32, std.mem.readInt(u16, data[pos..][0..2], .big)) * 2;
-                const abs = @as(u64, array_offset) + raw;
-                if (abs > data.len) return error.InvalidTableFormat;
-                o.* = @intCast(abs);
-            }
-
-            var shared_tuples: []const f32 = &.{};
+            var shared_tuple_bytes: []const u8 = &.{};
             if (shared_tuple_count > 0) {
-                const count = @as(usize, shared_tuple_count) * axis_count;
-                if (@as(u64, shared_tuples_offset) + @as(u64, count) * 2 > data.len) return error.InvalidTableFormat;
-                const buf = try alloc.alloc(f32, count);
-                for (buf, 0..) |*v, i| {
-                    const pos = shared_tuples_offset + i * 2;
-                    v.* = f2dot14ToF32(std.mem.readInt(i16, data[pos..][0..2], .big));
-                }
-                shared_tuples = buf;
+                const shared_tuples_len = @as(usize, shared_tuple_count) * axis_count * 2;
+                if (@as(u64, shared_tuples_offset) + shared_tuples_len > data.len) return error.InvalidTableFormat;
+                shared_tuple_bytes = data[shared_tuples_offset..][0..shared_tuples_len];
             }
 
             return .{
                 .axis_count = axis_count,
                 .glyph_count = glyph_count,
-                .glyph_offsets = glyph_offsets,
+                .long_offsets = long_offsets,
+                .array_offset = array_offset,
+                .offset_bytes = data[offsets_start..][0..offsets_len],
                 .shared_tuple_count = shared_tuple_count,
-                .shared_tuples = shared_tuples,
+                .shared_tuple_bytes = shared_tuple_bytes,
             };
         }
 
+        // Out-of-range offsets clamp to the table end like FT's ft_var_load_gvar instead of rejecting the table.
         pub fn glyphVariationData(header: Header, data: []const u8, glyph_id: u16) []const u8 {
-            if (@as(usize, glyph_id) + 1 >= header.glyph_offsets.len) return &.{};
-            const start = header.glyph_offsets[glyph_id];
-            const end = header.glyph_offsets[glyph_id + 1];
-            if (start >= end or end > data.len) return &.{};
+            if (glyph_id >= header.glyph_count) return &.{};
+            const start: usize = @intCast(@min(glyphDataOffset(header, glyph_id), data.len));
+            const end: usize = @intCast(@min(glyphDataOffset(header, @as(usize, glyph_id) + 1), data.len));
+            if (start >= end) return &.{};
             return data[start..end];
+        }
+
+        fn glyphDataOffset(header: Header, index: usize) u64 {
+            const raw: u32 = if (header.long_offsets)
+                std.mem.readInt(u32, header.offset_bytes[index * 4 ..][0..4], .big)
+            else
+                @as(u32, std.mem.readInt(u16, header.offset_bytes[index * 2 ..][0..2], .big)) * 2;
+            return @as(u64, header.array_offset) + raw;
         }
 
         fn f2dot14ToF32(v: i16) f32 {
@@ -2432,7 +2427,10 @@ pub const Table = struct {
                 } else {
                     const idx = tuple_index & tuple_index_mask;
                     if (idx >= header.shared_tuple_count) return error.InvalidTableFormat;
-                    tuple_coords = header.shared_tuples[@as(usize, idx) * header.axis_count ..][0..header.axis_count];
+                    const tuple_bytes = header.shared_tuple_bytes[@as(usize, idx) * header.axis_count * 2 ..];
+                    for (peak_buf, 0..) |*v, j|
+                        v.* = f2dot14ToF32(std.mem.readInt(i16, tuple_bytes[j * 2 ..][0..2], .big));
+                    tuple_coords = peak_buf;
                 }
 
                 if (tuple_index & intermediate_tuple != 0) {
