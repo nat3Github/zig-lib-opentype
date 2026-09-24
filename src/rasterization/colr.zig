@@ -433,7 +433,7 @@ fn rasterizeGlyfAffine(alloc: Allocator, outline: parsing.Table.glyf.Outline, ma
         scaled_points[i] = .{ .p = sp, .on = pt.on_curve };
     }
 
-    return common.renderScaledPoints(alloc, alloc, scaled_points, outline.end_points_of_contours, true);
+    return common.renderScaledPoints(alloc, alloc, scaled_points, outline.end_points_of_contours, true, null);
 }
 
 /// Same pipeline as `rasterizeCff`, under an arbitrary `Affine` — see
@@ -518,7 +518,7 @@ fn rasterizeCffAffine(alloc: Allocator, outline: parsing.Table.cff.Outline, matr
     const pixels = try alloc.alloc(u8, @as(usize, @intCast(width)) * @as(usize, @intCast(height)));
     errdefer alloc.free(pixels);
     @memset(pixels, 0);
-    try Rasterizer.render(alloc, pixels, width, height, common.CffSegments{ .segments = scaled });
+    try Rasterizer.render(alloc, pixels, width, height, common.CffSegments{ .segments = scaled }, &common.identity_coverage_lut);
 
     return .{ .width = @intCast(width), .rows = @intCast(height), .left = x_min_px, .top = y_max_px, .pixels_row_major = pixels };
 }

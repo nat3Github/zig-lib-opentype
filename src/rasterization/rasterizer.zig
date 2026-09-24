@@ -35,7 +35,8 @@ pub const Rasterizer = struct {
     /// `gray_raster_render` + `gray_convert_glyph`: sweeps `outline` into
     /// `pixels` (`width * height`, zeroed by the caller). `outline` provides
     /// `decompose(*Rasterizer) OverflowError!void`, replayed once per band.
-    pub fn render(scratch_allocator: std.mem.Allocator, pixels: []u8, width: i32, height: i32, outline: anytype) std.mem.Allocator.Error!void {
+    /// Swept coverage is written through `coverage_lut`, which must map 0 to 0.
+    pub fn render(scratch_allocator: std.mem.Allocator, pixels: []u8, width: i32, height: i32, outline: anytype, coverage_lut: *const [256]u8) std.mem.Allocator.Error!void {
         const estimate = (@as(usize, @intCast(width)) + @as(usize, @intCast(height))) * 10;
         var stack_cells: [max_stack_cells]Cell = undefined;
         const heap_cells: ?[]Cell = if (estimate > max_stack_cells) try scratch_allocator.alloc(Cell, estimate) else null;
@@ -65,7 +66,7 @@ pub const Rasterizer = struct {
             raster.overflow = false;
 
             if (outline.decompose(&raster)) {
-                raster.sweep(pixels, width);
+                raster.sweep(pixels, width, coverage_lut);
                 if (band_count == 0) return;
                 raster.max_ey = raster.min_ey;
                 band_count -= 1;
@@ -415,7 +416,7 @@ pub const Rasterizer = struct {
 
     /// `gray_sweep` over the current band. Row 0 of `pixels` is the top of
     /// the glyph; cell-space `y` increases upward from the bottom row.
-    fn sweep(self: *Rasterizer, pixels: []u8, width: i32) void {
+    fn sweep(self: *Rasterizer, pixels: []u8, width: i32, coverage_lut: *const [256]u8) void {
         var y: i32 = self.min_ey;
         while (y < self.max_ey) : (y += 1) {
             const pixel_row: usize = @intCast(self.pixel_rows - 1 - y);
@@ -426,20 +427,20 @@ pub const Rasterizer = struct {
             var cell = self.ycells[@intCast(y - self.min_ey)];
             while (cell != self.cell_null) : (cell = cell.next) {
                 if (cover != 0 and cell.x > x) {
-                    fillSpan(row, x, cell.x - x, fillRuleNonZero(cover));
+                    fillSpan(row, x, cell.x - x, coverage_lut[fillRuleNonZero(cover)]);
                 }
 
                 cover += @as(i64, cell.cover) * (one_pixel * 2);
                 const area = cover - cell.area;
                 if (area != 0 and cell.x >= 0) {
-                    row[@intCast(cell.x)] = fillRuleNonZero(area);
+                    row[@intCast(cell.x)] = coverage_lut[fillRuleNonZero(area)];
                 }
 
                 x = cell.x + 1;
             }
 
             if (cover != 0) {
-                fillSpan(row, x, self.max_ex - x, fillRuleNonZero(cover));
+                fillSpan(row, x, self.max_ex - x, coverage_lut[fillRuleNonZero(cover)]);
             }
         }
     }

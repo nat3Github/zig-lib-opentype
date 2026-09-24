@@ -157,6 +157,12 @@ pub fn ftPixRound(x: i32) i32 {
 }
 /// Coverage byte from accumulated cell area, non-zero winding fill rule
 /// (`FT_FILL_RULE` with `fill = INT_MIN`). `glyf` never sets even-odd fill.
+pub const identity_coverage_lut: [256]u8 = blk: {
+    var table: [256]u8 = undefined;
+    for (&table, 0..) |*entry, i| entry.* = i;
+    break :blk table;
+};
+
 pub fn fillRuleNonZero(area: i64) u8 {
     var coverage = area >> (pixel_bits * 2 + 1 - 8);
     if (coverage < 0) coverage = ~coverage;
@@ -217,6 +223,7 @@ pub fn renderScaledPoints(
     points: []ScaledPoint,
     end_points_of_contours: []const u16,
     want_pixels: bool,
+    coverage_lut: ?*const [256]u8,
 ) RasterizeError!Bitmap8bit {
     var cbox_min_x: i32 = std.math.maxInt(i32);
     var cbox_min_y: i32 = std.math.maxInt(i32);
@@ -254,7 +261,7 @@ pub fn renderScaledPoints(
     const pixels = try output_allocator.alloc(u8, @as(usize, @intCast(width)) * @as(usize, @intCast(height)));
     errdefer output_allocator.free(pixels);
     @memset(pixels, 0);
-    try Rasterizer.render(scratch_allocator, pixels, width, height, GlyfContours{ .points = points, .end_points_of_contours = end_points_of_contours });
+    try Rasterizer.render(scratch_allocator, pixels, width, height, GlyfContours{ .points = points, .end_points_of_contours = end_points_of_contours }, coverage_lut orelse &identity_coverage_lut);
 
     return .{
         .width = @intCast(width),
@@ -269,7 +276,7 @@ pub fn renderScaledPoints(
 /// and sweeps them into an AA coverage bitmap — the CFF/cubic analogue of
 /// `renderScaledPoints`, shared by `rasterizeCff` and `rasterizeCffHinted`
 /// once each has produced its own scaled segment list.
-pub fn renderScaledCffSegments(scratch_allocator: std.mem.Allocator, output_allocator: std.mem.Allocator, segments: []IScaledCffSegment, want_pixels: bool) RasterizeError!Bitmap8bit {
+pub fn renderScaledCffSegments(scratch_allocator: std.mem.Allocator, output_allocator: std.mem.Allocator, segments: []IScaledCffSegment, want_pixels: bool, coverage_lut: ?*const [256]u8) RasterizeError!Bitmap8bit {
     var cbox_min_x: i32 = std.math.maxInt(i32);
     var cbox_min_y: i32 = std.math.maxInt(i32);
     var cbox_max_x: i32 = std.math.minInt(i32);
@@ -316,7 +323,7 @@ pub fn renderScaledCffSegments(scratch_allocator: std.mem.Allocator, output_allo
     const pixels = try output_allocator.alloc(u8, @as(usize, @intCast(width)) * @as(usize, @intCast(height)));
     errdefer output_allocator.free(pixels);
     @memset(pixels, 0);
-    try Rasterizer.render(scratch_allocator, pixels, width, height, CffSegments{ .segments = segments });
+    try Rasterizer.render(scratch_allocator, pixels, width, height, CffSegments{ .segments = segments }, coverage_lut orelse &identity_coverage_lut);
 
     return .{
         .width = @intCast(width),
