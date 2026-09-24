@@ -84,6 +84,25 @@ const DefRecord = struct {
 
 const DefKind = enum { fdef, idef };
 
+/// What `fpgm` leaves behind in a fresh interpreter (`TT_Save_Context`
+/// after `tt_size_run_fpgm`), so a re-target can restore it instead of
+/// replaying `fpgm` against state left over from the previous size.
+pub const FontProgramSnapshot = struct {
+    storage: []i32,
+    fdefs: []DefRecord,
+    idefs: []DefRecord,
+    max_func: i32,
+    max_ins: i32,
+    gs: GraphicsState,
+    twilight: Zone,
+
+    pub fn deinit(self: FontProgramSnapshot, state_allocator: std.mem.Allocator) void {
+        state_allocator.free(self.storage);
+        state_allocator.free(self.fdefs);
+        state_allocator.free(self.idefs);
+    }
+};
+
 const CallRecord = struct {
     caller_range: CodeRange,
     caller_ip: u32,
@@ -478,6 +497,36 @@ pub const Interpreter = struct {
     /// by later CVT/glyph programs.
     pub fn runFontProgram(self: *Interpreter, code: []const u8) Error!void {
         try self.run(code, .font);
+    }
+
+    pub fn saveFontProgram(self: *const Interpreter, state_allocator: std.mem.Allocator) Error!FontProgramSnapshot {
+        const storage = try state_allocator.dupe(i32, self.storage);
+        errdefer state_allocator.free(storage);
+        const fdefs = try state_allocator.dupe(DefRecord, self.fdefs[0..self.num_fdefs]);
+        errdefer state_allocator.free(fdefs);
+        const idefs = try state_allocator.dupe(DefRecord, self.idefs[0..self.num_idefs]);
+        return .{
+            .storage = storage,
+            .fdefs = fdefs,
+            .idefs = idefs,
+            .max_func = self.max_func,
+            .max_ins = self.max_ins,
+            .gs = self.gs,
+            .twilight = self.twilight,
+        };
+    }
+
+    /// `snapshot` must come from `saveFontProgram` on this interpreter.
+    pub fn restoreFontProgram(self: *Interpreter, snapshot: FontProgramSnapshot) void {
+        @memcpy(self.storage, snapshot.storage);
+        @memcpy(self.fdefs[0..snapshot.fdefs.len], snapshot.fdefs);
+        self.num_fdefs = @intCast(snapshot.fdefs.len);
+        @memcpy(self.idefs[0..snapshot.idefs.len], snapshot.idefs);
+        self.num_idefs = @intCast(snapshot.idefs.len);
+        self.max_func = snapshot.max_func;
+        self.max_ins = snapshot.max_ins;
+        self.gs = snapshot.gs;
+        self.twilight = snapshot.twilight;
     }
 
     /// Runs the CVT program (`prep`) once per (font, ppem); may mutate

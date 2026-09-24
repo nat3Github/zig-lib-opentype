@@ -155,6 +155,8 @@ pub const Renderer = struct {
     glyf_interp: ?hinting.Interpreter,
     /// Allocated with `glyf_interp`, lives as long as it does.
     glyf_twilight: ?hinting.Zone,
+    /// Taken after the first `fpgm` run, lives as long as `glyf_interp`.
+    glyf_font_program: ?hinting.FontProgramSnapshot,
     max_twilight_points: u16,
     /// From `maxp` -- guards `renderGlyph` against a glyph id from a
     /// mismatched font (stale cache entry, wrong fallback pairing upstream)
@@ -235,6 +237,7 @@ pub const Renderer = struct {
             .vary = false,
             .glyf_interp = null,
             .glyf_twilight = null,
+            .glyf_font_program = null,
             .max_twilight_points = maxp.max_twilight_points,
         };
         // gvar/cff unwind through their own errdefers above; this covers only
@@ -278,11 +281,19 @@ pub const Renderer = struct {
                 return err;
             };
 
-            // `fpgm`/`prep` persist storage and FDEFs, so a re-target has to
-            // replay them from a zeroed storage area to land where a freshly
-            // constructed interpreter would.
-            @memset(interp.storage, 0);
-            try interp.runFontProgram(self.font.tableData(.{ 'f', 'p', 'g', 'm' }) orelse &.{});
+            // `fpgm` runs once per interpreter like `tt_size_run_fpgm`; a
+            // re-target restores its end state so `prep` starts where it
+            // would in a freshly constructed interpreter.
+            if (self.glyf_font_program) |snapshot| {
+                interp.restoreFontProgram(snapshot);
+            } else {
+                @memset(interp.storage, 0);
+                try interp.runFontProgram(self.font.tableData(.{ 'f', 'p', 'g', 'm' }) orelse &.{});
+                self.glyf_font_program = interp.saveFontProgram(state_allocator) catch |err| {
+                    self.dropGlyfHinting(state_allocator);
+                    return err;
+                };
+            }
 
             interp.cur_ppem = @intFromFloat(@round(ppem));
             interp.scale = rasterization.ppemScale(self.head.units_per_em, ppem);
@@ -301,6 +312,8 @@ pub const Renderer = struct {
         self.glyf_interp = null;
         if (self.glyf_twilight) |twilight| rasterization.freeTwilightZone(state_allocator, twilight);
         self.glyf_twilight = null;
+        if (self.glyf_font_program) |snapshot| snapshot.deinit(state_allocator);
+        self.glyf_font_program = null;
     }
 
     /// Converts a raw font-unit value (e.g. an `hhea` ascender or a GPOS
