@@ -2093,6 +2093,20 @@ pub fn applyStage(
 /// lookup substitute exactly this glyph sequence, standalone? The Indic
 /// shaper asks this of a font's blwf/pstf/pref/vatu/rphf lookups to decide
 /// where the base consonant and the reph are, before any lookup has run.
+/// Applies one lookup of a GSUB table synthesized in memory (Arabic
+/// fallback), the way hb's `hb_ot_layout_substitute_lookup` does with a
+/// default apply context.
+pub fn applySynthesizedGsubLookup(
+    layout: parsing.Table.Layout,
+    lookup_index: u16,
+    mask: u32,
+    gdef: Gdef,
+    buffer: *Buffer,
+    direction: Direction,
+) (parsing.Font.ParseError || error{OutOfMemory})!void {
+    try applyLookup(layout, .{ .index = lookup_index, .mask = mask }, gdef, buffer, 0, direction, &.{}, null, &.{});
+}
+
 ///
 /// ponytail: only the four direct substitution types (plus Extension) are
 /// answered; a context lookup reports "no". Real Indic fonts put these

@@ -107,6 +107,7 @@ pub const StagePause = enum(u8) {
     use_reorder,
     myanmar_reorder,
     arabic_record_stch,
+    arabic_fallback,
 };
 
 pub const StageMapEntry = struct {

@@ -24,10 +24,6 @@ const tag_stch = Tag{ 's', 't', 'c', 'h' };
 //
 // Deliberately deferred this session (per AskUserQuestion scope choice,
 // "core joining only"), each a self-contained follow-up:
-// - arabic_fallback_shape / hb-ot-shaper-arabic-fallback.hh: synthetic
-//   isol/fina/medi/init glyph substitution for fonts lacking Arabic OT
-//   features. Only matters for such fonts; real Arabic text fonts ship the
-//   GSUB features this port already applies.
 // - mongolian_variation_selectors (copy shaping action from base to a
 //   following Mongolian variation selector) - Mongolian dispatch isn't
 //   wired in at all this session (see dispatch note below).
@@ -112,8 +108,7 @@ const arabic_feature_tags = [7]Tag{
     .{ 'i', 'n', 'i', 't' },
 };
 
-/// Ported from `collect_features_arabic`, minus the fallback-shaping pause
-/// (not ported, see this section's top doc comment). Each positional feature gets its own stage, and `ccmp`/`locl`
+/// Ported from `collect_features_arabic`. Each positional feature gets its own stage, and `ccmp`/`locl`
 /// run before all of them. `manual_zwj` sticks because `MapBuilder.compile`
 /// keeps the first registration's flags when `default_features` repeats a
 /// tag.
@@ -125,12 +120,13 @@ pub fn collectFeaturesArabic(map_builder: *MapBuilder, is_arabic_script: bool) !
     try map_builder.enableFeature(tag_locl, manual_zwj, 1);
     try map_builder.addGsubPause(.none);
     for (arabic_feature_tags) |tag| {
-        try map_builder.addFeature(tag, manual_zwj, 1);
+        const syriac = tag[3] == '2' or tag[3] == '3';
+        try map_builder.addFeature(tag, .{ .manual_zwj = true, .has_fallback = is_arabic_script and !syriac }, 1);
         try map_builder.addGsubPause(.none);
     }
     try map_builder.addGsubPause(.none);
-    try map_builder.enableFeature(tag_rlig, manual_zwj, 1);
-    if (is_arabic_script) try map_builder.addGsubPause(.none);
+    try map_builder.enableFeature(tag_rlig, .{ .manual_zwj = true, .has_fallback = true }, 1);
+    if (is_arabic_script) try map_builder.addGsubPause(.arabic_fallback);
     try map_builder.enableFeature(tag_calt, manual_zwj, 1);
     // hb pauses here unless 'rclt' was already registered, which it never
     // is this early.

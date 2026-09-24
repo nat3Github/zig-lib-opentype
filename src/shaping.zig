@@ -6,6 +6,7 @@ const common = @import("shaping/common.zig");
 const metrics_mod = @import("shaping/metrics.zig");
 const map_mod = @import("shaping/map.zig");
 const apply_mod = @import("shaping/apply.zig");
+const arabic_fallback_mod = @import("shaping/arabic_fallback.zig");
 const normalize_mod = @import("shaping/normalize.zig");
 const hangul_mod = @import("shaping/hangul.zig");
 const arabic_mod = @import("shaping/arabic.zig");
@@ -705,6 +706,7 @@ fn applyGsub(
             .use_reorder => try use_mod.reorderUse(buffer, cmap),
             .myanmar_reorder => try khmer_myanmar_mod.reorderMyanmar(buffer, cmap),
             .arabic_record_stch => arabic_mod.recordStch(buffer, map),
+            .arabic_fallback => try arabic_fallback_mod.shape(map, cmap, gdef_classdef, buffer, direction),
         }
         if (pause != .none) buffer.updateDigest();
     }
