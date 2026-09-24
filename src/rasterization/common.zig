@@ -135,11 +135,8 @@ pub fn compositeOpsToCanvas(
 
 /// `FT_MulFix`: `round(|a * b| / 65536)`, sign of `a * b`.
 pub fn ftMulFix(a: i32, b: i32) i32 {
-    const sign: i64 = if ((a < 0) != (b < 0)) -1 else 1;
-    const ua: i64 = @abs(a);
-    const ub: i64 = @abs(b);
-    const mag: i64 = @divFloor(ua * ub + 0x8000, 0x10000);
-    return @intCast(sign * mag);
+    const product = @as(i64, a) * b;
+    return @intCast((product + 0x8000 + (product >> 63)) >> 16);
 }
 
 /// `FT_DivFix`: `round(|a| * 65536 / |b|)`, sign of `a * b`.

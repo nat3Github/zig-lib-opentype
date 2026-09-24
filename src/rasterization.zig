@@ -246,62 +246,6 @@ pub fn scaleCvtFwordTableToF26Dot6Pixels(alloc: Allocator, cvt_data: []const u8,
     return out;
 }
 
-fn buildPtsVmHintZone(
-    alloc: Allocator,
-    outline: parsing.Table.glyf.Outline,
-    bounds: parsing.Table.glyf.HeaderBounds,
-    h_metric: parsing.Table.hmtx.Metric,
-    v_metric: parsing.Table.vmtx.Metric,
-    scale: i32,
-    phase: SubpixelOffset,
-) Allocator.Error!hinting.Zone {
-    const n_real = outline.points.len;
-    const n_total = n_real + 4;
-
-    const point_bufs = try alloc.alloc(hinting.Point, n_total * 3);
-    errdefer alloc.free(point_bufs);
-    const cur = point_bufs[0..n_total];
-    const org = point_bufs[n_total .. n_total * 2];
-    const orus = point_bufs[n_total * 2 .. n_total * 3];
-    const tags = try alloc.alloc(u8, n_total);
-    errdefer alloc.free(tags);
-
-    for (outline.points, 0..) |pt, i| {
-        orus[i] = .{ .x = pt.x, .y = pt.y };
-        const scaled: hinting.Point = .{
-            .x = common.ftMulFix(pt.x, scale) + phase.x,
-            .y = common.ftMulFix(pt.y, scale) + phase.y,
-        };
-        cur[i] = scaled;
-        org[i] = scaled;
-        tags[i] = if (pt.on_curve) hinting.on_curve else 0;
-    }
-
-    const phantom_orus = phantomOrusPositions(bounds, h_metric, v_metric);
-    const phantom_cur = scaleAndRoundPhantomToF26Dot6Pixels(phantom_orus, scale, phase);
-    for (phantom_orus, phantom_cur, 0..) |orus_p, cur_p, k| {
-        orus[n_real + k] = orus_p;
-        cur[n_real + k] = cur_p;
-        org[n_real + k] = cur_p;
-        tags[n_real + k] = 0;
-    }
-
-    return .{
-        .n_points = @intCast(n_total),
-        .n_contours = @intCast(outline.end_points_of_contours.len),
-        .cur = cur,
-        .org = org,
-        .orus = orus,
-        .tags = tags,
-        .contours = outline.end_points_of_contours,
-    };
-}
-
-fn freePtsVmHintZone(alloc: Allocator, zone: hinting.Zone) void {
-    alloc.free(zone.cur.ptr[0 .. zone.cur.len * 3]);
-    alloc.free(zone.tags);
-}
-
 fn phantomOrusPositions(bounds: parsing.Table.glyf.HeaderBounds, h_metric: parsing.Table.hmtx.Metric, v_metric: parsing.Table.vmtx.Metric) [4]hinting.Point {
     const pp1x: i32 = @as(i32, bounds.x_min) - h_metric.left_side_bearing;
     return .{
@@ -324,43 +268,55 @@ fn scaleAndRoundPhantomToF26Dot6Pixels(phantom_orus: [4]hinting.Point, scale: i3
     return cur;
 }
 
-fn allocTwilightZone(alloc: Allocator, n: u16) Allocator.Error!hinting.Zone {
-    const point_bufs = try alloc.alloc(hinting.Point, @as(usize, n) * 2);
-    errdefer alloc.free(point_bufs);
-    const cur = point_bufs[0..n];
-    const org = point_bufs[n .. @as(usize, n) * 2];
-    const tags = try alloc.alloc(u8, n);
-    @memset(point_bufs, .{});
-    @memset(tags, 0);
-    return .{ .n_points = n, .n_contours = 0, .cur = cur, .org = org, .tags = tags };
+/// `tt_size_init_bytecode`'s per-size twilight zone. `declared_points` is
+/// `maxp.maxTwilightPoints`; `limits.max_twilight_points` always wins over
+/// what the (attacker-controlled) font claims.
+pub fn allocTwilightZone(state_allocator: Allocator, declared_points: u16, limits: hinting.Limits) Allocator.Error!hinting.Zone {
+    const n = @min(declared_points, limits.max_twilight_points);
+    const point_bufs = try state_allocator.alloc(hinting.Point, @as(usize, n) * 2);
+    errdefer state_allocator.free(point_bufs);
+    const tags = try state_allocator.alloc(u8, n);
+    return .{ .n_points = n, .n_contours = 0, .cur = point_bufs[0..n], .org = point_bufs[n .. @as(usize, n) * 2], .tags = tags };
 }
 
-fn freeTwilightZone(alloc: Allocator, zone: hinting.Zone) void {
-    alloc.free(zone.cur.ptr[0 .. zone.cur.len * 2]);
-    alloc.free(zone.tags);
+pub fn freeTwilightZone(state_allocator: Allocator, zone: hinting.Zone) void {
+    state_allocator.free(zone.cur.ptr[0 .. zone.cur.len * 2]);
+    state_allocator.free(zone.tags);
 }
 
-const HintedComponent = struct {
-    points: []hinting.Point,
-    tags: []u8,
-    contours: []u16,
-    pp1: hinting.Point,
-    pp2: hinting.Point,
-    pp3: hinting.Point,
-    pp4: hinting.Point,
+// Every glyph program starts from a zeroed twilight zone, unlike FreeType,
+// which only zeroes it once per size before `prep`.
+fn runGlyphProgramWithZeroedTwilight(interp: *hinting.Interpreter, code: []const u8, pts: hinting.Zone, twilight: hinting.Zone, is_composite: bool) hinting.Error!void {
+    @memset(twilight.cur, .{});
+    @memset(twilight.org, .{});
+    @memset(twilight.tags, 0);
+    try interp.runGlyphProgram(code, pts, twilight, is_composite);
+}
 
-    fn deinit(self: HintedComponent, alloc: Allocator) void {
-        alloc.free(self.points);
-        alloc.free(self.tags);
-        alloc.free(self.contours);
+/// `FT_GlyphLoader`: every simple glyph appends its hinted points here and
+/// composites transform their children's range in place, so a glyph tree
+/// ends up as one outline without per-component copies. Contour end points
+/// are absolute indices into `points`.
+const HintedOutline = struct {
+    points: std.ArrayList(hinting.Point) = .empty,
+    tags: std.ArrayList(u8) = .empty,
+    contours: std.ArrayList(u16) = .empty,
+
+    fn deinit(self: *HintedOutline, scratch_allocator: Allocator) void {
+        self.points.deinit(scratch_allocator);
+        self.tags.deinit(scratch_allocator);
+        self.contours.deinit(scratch_allocator);
     }
 };
 
 const max_component_depth = 8;
 
+/// Loads `glyph_id` into `hinted` and returns its hinted phantom points.
 fn hintGlyphComponentRek(
-    alloc: Allocator,
+    scratch_allocator: Allocator,
     interp: *hinting.Interpreter,
+    twilight: hinting.Zone,
+    hinted: *HintedOutline,
     glyf_data: []const u8,
     loca_data: []const u8,
     index_to_loc_format: i16,
@@ -369,76 +325,89 @@ fn hintGlyphComponentRek(
     vmtx_data: []const u8,
     number_of_v_metrics: u16,
     glyph_id: u16,
-    max_twilight_points: u16,
     scale: i32,
     phase: SubpixelOffset,
     depth: u32,
-) HintError!HintedComponent {
+) HintError![4]hinting.Point {
     if (depth > max_component_depth) return error.RecursionLimitExceeded;
+    const no_phantoms: [4]hinting.Point = .{ .{}, .{}, .{}, .{} };
 
-    const glyph_data = try parsing.Table.glyf.readGlyph(alloc, glyf_data, loca_data, index_to_loc_format, glyph_id);
-    defer parsing.Table.glyf.freeGlyphData(alloc, glyph_data);
+    const glyph_data = try parsing.Table.glyf.readGlyph(scratch_allocator, glyf_data, loca_data, index_to_loc_format, glyph_id);
+    defer parsing.Table.glyf.freeGlyphData(scratch_allocator, glyph_data);
+    if (glyph_data == .empty) return no_phantoms;
+    if (glyph_data == .simple and glyph_data.simple.points.len == 0) return no_phantoms;
+
+    const bounds = (try parsing.Table.glyf.headerBounds(glyf_data, loca_data, index_to_loc_format, glyph_id)) orelse
+        return error.InvalidTableFormat;
+    const h_metric = parsing.Table.hmtx.metricForGlyph(hmtx_data, glyph_id, number_of_h_metrics);
+    const v_metric = if (vmtx_data.len != 0)
+        parsing.Table.vmtx.metricForGlyph(vmtx_data, glyph_id, number_of_v_metrics)
+    else
+        parsing.Table.vmtx.Metric{ .advance_height = 0, .top_side_bearing = 0 };
+    const phantom_orus = phantomOrusPositions(bounds, h_metric, v_metric);
+    const phantoms = scaleAndRoundPhantomToF26Dot6Pixels(phantom_orus, scale, phase);
 
     switch (glyph_data) {
-        .empty => return .{ .points = &.{}, .tags = &.{}, .contours = &.{}, .pp1 = .{}, .pp2 = .{}, .pp3 = .{}, .pp4 = .{} },
+        .empty => unreachable,
 
         .simple => |outline| {
-            if (outline.points.len == 0) return .{ .points = &.{}, .tags = &.{}, .contours = &.{}, .pp1 = .{}, .pp2 = .{}, .pp3 = .{}, .pp4 = .{} };
-
-            const bounds = (try parsing.Table.glyf.headerBounds(glyf_data, loca_data, index_to_loc_format, glyph_id)) orelse
-                return error.InvalidTableFormat;
-            const h_metric = parsing.Table.hmtx.metricForGlyph(hmtx_data, glyph_id, number_of_h_metrics);
-            const v_metric = if (vmtx_data.len != 0)
-                parsing.Table.vmtx.metricForGlyph(vmtx_data, glyph_id, number_of_v_metrics)
-            else
-                parsing.Table.vmtx.Metric{ .advance_height = 0, .top_side_bearing = 0 };
-
-            const pts = try buildPtsVmHintZone(alloc, outline, bounds, h_metric, v_metric, scale, phase);
-            defer freePtsVmHintZone(alloc, pts);
-
-            const twilight_n = @min(max_twilight_points, interp.limits.max_twilight_points);
-            const twilight = try allocTwilightZone(alloc, twilight_n);
-            defer freeTwilightZone(alloc, twilight);
-
-            try interp.runGlyphProgram(outline.instructions, pts, twilight, false);
-
+            const base = hinted.points.items.len;
             const n_real = outline.points.len;
-            return .{
-                .points = try alloc.dupe(hinting.Point, pts.cur[0..n_real]),
-                .tags = try alloc.dupe(u8, pts.tags[0..n_real]),
-                .contours = try alloc.dupe(u16, outline.end_points_of_contours),
-                .pp1 = pts.cur[n_real + 0],
-                .pp2 = pts.cur[n_real + 1],
-                .pp3 = pts.cur[n_real + 2],
-                .pp4 = pts.cur[n_real + 3],
-            };
+            const n_total = n_real + 4;
+            const cur = try hinted.points.addManyAsSlice(scratch_allocator, n_total);
+            const tags = try hinted.tags.addManyAsSlice(scratch_allocator, n_total);
+            for (outline.points, cur[0..n_real], tags[0..n_real]) |pt, *cur_point, *tag| {
+                cur_point.* = .{
+                    .x = common.ftMulFix(pt.x, scale) + phase.x,
+                    .y = common.ftMulFix(pt.y, scale) + phase.y,
+                };
+                tag.* = if (pt.on_curve) hinting.on_curve else 0;
+            }
+            cur[n_real..][0..4].* = phantoms;
+            @memset(tags[n_real..], 0);
+
+            // `TT_Hint_Glyph` with `n_ins == 0` leaves the scaled points as they are.
+            if (outline.instructions.len != 0) {
+                const org_and_orus = try scratch_allocator.alloc(hinting.Point, n_total * 2);
+                defer scratch_allocator.free(org_and_orus);
+                const org = org_and_orus[0..n_total];
+                const orus = org_and_orus[n_total..];
+                @memcpy(org, cur);
+                for (outline.points, orus[0..n_real]) |pt, *orus_point| orus_point.* = .{ .x = pt.x, .y = pt.y };
+                orus[n_real..][0..4].* = phantom_orus;
+
+                try runGlyphProgramWithZeroedTwilight(interp, outline.instructions, .{
+                    .n_points = @intCast(n_total),
+                    .n_contours = @intCast(outline.end_points_of_contours.len),
+                    .cur = cur,
+                    .org = org,
+                    .orus = orus,
+                    .tags = tags,
+                    .contours = outline.end_points_of_contours,
+                }, twilight, false);
+            }
+
+            const hinted_phantoms = cur[n_real..][0..4].*;
+            hinted.points.shrinkRetainingCapacity(base + n_real);
+            hinted.tags.shrinkRetainingCapacity(base + n_real);
+            const contours = try hinted.contours.addManyAsSlice(scratch_allocator, outline.end_points_of_contours.len);
+            for (outline.end_points_of_contours, contours) |end_point, *contour| {
+                contour.* = std.math.cast(u16, base + end_point) orelse return error.InvalidTableFormat;
+            }
+            return hinted_phantoms;
         },
 
         .composite => |composite| {
-            const bounds = (try parsing.Table.glyf.headerBounds(glyf_data, loca_data, index_to_loc_format, glyph_id)) orelse
-                return error.InvalidTableFormat;
-            const h_metric = parsing.Table.hmtx.metricForGlyph(hmtx_data, glyph_id, number_of_h_metrics);
-            const v_metric = if (vmtx_data.len != 0)
-                parsing.Table.vmtx.metricForGlyph(vmtx_data, glyph_id, number_of_v_metrics)
-            else
-                parsing.Table.vmtx.Metric{ .advance_height = 0, .top_side_bearing = 0 };
-            const own_phantom = scaleAndRoundPhantomToF26Dot6Pixels(phantomOrusPositions(bounds, h_metric, v_metric), scale, phase);
-            var pp1 = own_phantom[0];
-            var pp2 = own_phantom[1];
-            var pp3 = own_phantom[2];
-            var pp4 = own_phantom[3];
-
-            var points_list: std.ArrayList(hinting.Point) = .empty;
-            defer points_list.deinit(alloc);
-            var tags_list: std.ArrayList(u8) = .empty;
-            defer tags_list.deinit(alloc);
-            var contours_list: std.ArrayList(u16) = .empty;
-            defer contours_list.deinit(alloc);
+            const point_base = hinted.points.items.len;
+            const contour_base = hinted.contours.items.len;
 
             for (composite.components) |c| {
-                var child = try hintGlyphComponentRek(
-                    alloc,
+                const child_base = hinted.points.items.len;
+                _ = try hintGlyphComponentRek(
+                    scratch_allocator,
                     interp,
+                    twilight,
+                    hinted,
                     glyf_data,
                     loca_data,
                     index_to_loc_format,
@@ -447,13 +416,10 @@ fn hintGlyphComponentRek(
                     vmtx_data,
                     number_of_v_metrics,
                     c.glyph_index,
-                    max_twilight_points,
                     scale,
                     phase,
                     depth + 1,
                 );
-                defer child.deinit(alloc);
-                if (child.points.len == 0) continue;
 
                 const xx: i32 = @intFromFloat(@round(c.xx * 65536.0));
                 const xy: i32 = @intFromFloat(@round(c.xy * 65536.0));
@@ -472,106 +438,78 @@ fn hintGlyphComponentRek(
                     }
                 }
 
-                const base_point_count: u16 = @intCast(points_list.items.len);
-                for (child.points, child.tags) |p, tag| {
+                for (hinted.points.items[child_base..]) |*p| {
                     var nx = p.x;
                     var ny = p.y;
                     if (c.has_scale) {
                         nx = common.ftMulFix(p.x, xx) + common.ftMulFix(p.y, xy);
                         ny = common.ftMulFix(p.x, yx) + common.ftMulFix(p.y, yy);
                     }
-                    try points_list.append(alloc, .{ .x = nx + ox, .y = ny + oy });
-                    try tags_list.append(alloc, tag);
+                    p.* = .{ .x = nx + ox, .y = ny + oy };
                 }
-                for (child.contours) |e|
-                    try contours_list.append(alloc, e + base_point_count);
             }
 
-            if (composite.instructions.len != 0 and points_list.items.len != 0) {
-                const n_real = points_list.items.len;
-                const n_total = n_real + 4;
+            const n_real = hinted.points.items.len - point_base;
+            if (composite.instructions.len == 0 or n_real == 0) return phantoms;
 
-                const point_bufs = try alloc.alloc(hinting.Point, n_total * 3);
-                defer alloc.free(point_bufs);
-                const cur = point_bufs[0..n_total];
-                @memcpy(cur[0..n_real], points_list.items);
-                cur[n_real..][0..4].* = .{ pp1, pp2, pp3, pp4 };
+            const n_total = n_real + 4;
+            try hinted.points.appendSlice(scratch_allocator, &phantoms);
+            const cur = hinted.points.items[point_base..];
 
-                const tags = try alloc.alloc(u8, n_total);
-                defer alloc.free(tags);
-                @memcpy(tags[0..n_real], tags_list.items);
-                @memset(tags[n_real..], 0);
-
-                // `TT_Hint_Glyph`'s undocumented composite special-case:
-                // `org`/`orus` are just a copy of the already-hinted `cur`
-                // (there's no font-unit space left to refer back to at this
-                // point), and `interp.scale` is forced to identity for the
-                // duration of this run so opcodes that rescale an
-                // org/orus-derived distance by it (e.g. `SDPVTL`) leave
-                // pixel-space distances unchanged.
-                const org = point_bufs[n_total .. n_total * 2];
-                @memcpy(org, cur);
-                const orus = point_bufs[n_total * 2 .. n_total * 3];
-                @memcpy(orus, cur);
-                const contours = try alloc.dupe(u16, contours_list.items);
-                defer alloc.free(contours);
-
-                const zone: hinting.Zone = .{
-                    .n_points = @intCast(n_total),
-                    .n_contours = @intCast(contours.len),
-                    .cur = cur,
-                    .org = org,
-                    .orus = orus,
-                    .tags = tags,
-                    .contours = contours,
-                };
-
-                const twilight_n = @min(max_twilight_points, interp.limits.max_twilight_points);
-                const twilight = try allocTwilightZone(alloc, twilight_n);
-                defer freeTwilightZone(alloc, twilight);
-
-                const saved_scale = interp.scale;
-                interp.scale = 0x10000;
-                defer interp.scale = saved_scale;
-
-                try interp.runGlyphProgram(composite.instructions, zone, twilight, true);
-
-                for (points_list.items, 0..) |*p, i| p.* = zone.cur[i];
-                pp1 = zone.cur[n_real + 0];
-                pp2 = zone.cur[n_real + 1];
-                pp3 = zone.cur[n_real + 2];
-                pp4 = zone.cur[n_real + 3];
+            // `TT_Hint_Glyph`'s undocumented composite special-case:
+            // `org`/`orus` are just a copy of the already-hinted `cur`
+            // (there's no font-unit space left to refer back to at this
+            // point), and `interp.scale` is forced to identity for the
+            // duration of this run so opcodes that rescale an
+            // org/orus-derived distance by it (e.g. `SDPVTL`) leave
+            // pixel-space distances unchanged.
+            const org_and_orus = try scratch_allocator.alloc(hinting.Point, n_total * 2);
+            defer scratch_allocator.free(org_and_orus);
+            const org = org_and_orus[0..n_total];
+            const orus = org_and_orus[n_total..];
+            @memcpy(org, cur);
+            @memcpy(orus, cur);
+            // Tag edits (FLIPPT and friends) from a composite program don't
+            // reach the outline; only the moved points do.
+            const zone_tags = try scratch_allocator.alloc(u8, n_total);
+            defer scratch_allocator.free(zone_tags);
+            @memcpy(zone_tags[0..n_real], hinted.tags.items[point_base..]);
+            @memset(zone_tags[n_real..], 0);
+            const zone_contours = try scratch_allocator.alloc(u16, hinted.contours.items.len - contour_base);
+            defer scratch_allocator.free(zone_contours);
+            for (hinted.contours.items[contour_base..], zone_contours) |end_point, *zone_contour| {
+                zone_contour.* = @intCast(end_point - point_base);
             }
 
-            const points = try points_list.toOwnedSlice(alloc);
-            errdefer alloc.free(points);
-            const tags = try tags_list.toOwnedSlice(alloc);
-            errdefer alloc.free(tags);
-            const contours = try contours_list.toOwnedSlice(alloc);
-            errdefer alloc.free(contours);
+            const saved_scale = interp.scale;
+            interp.scale = 0x10000;
+            defer interp.scale = saved_scale;
 
-            return .{
-                .points = points,
-                .tags = tags,
-                .contours = contours,
-                .pp1 = pp1,
-                .pp2 = pp2,
-                .pp3 = pp3,
-                .pp4 = pp4,
-            };
+            try runGlyphProgramWithZeroedTwilight(interp, composite.instructions, .{
+                .n_points = @intCast(n_total),
+                .n_contours = @intCast(zone_contours.len),
+                .cur = cur,
+                .org = org,
+                .orus = orus,
+                .tags = zone_tags,
+                .contours = zone_contours,
+            }, twilight, true);
+
+            const hinted_phantoms = cur[n_real..][0..4].*;
+            hinted.points.shrinkRetainingCapacity(point_base + n_real);
+            return hinted_phantoms;
         },
     }
 }
 
-/// `max_twilight_points` is the font's declared `maxp.maxTwilightPoints`,
-/// clamped against `interp.limits.max_twilight_points` before allocating —
-/// the hard cap always wins regardless of what the (attacker-controlled)
-/// font claims. `vmtx_data`/`number_of_v_metrics` may be empty/0 for fonts
-/// without vertical metrics (phantom points 3/4 then default to `{0, 0}`).
+/// `twilight` is the size's zone from `allocTwilightZone`.
+/// `vmtx_data`/`number_of_v_metrics` may be empty/0 for fonts without
+/// vertical metrics (phantom points 3/4 then default to `{0, 0}`).
 pub fn rasterizeGlyfHinted(
     alloc: Allocator,
     output_allocator: Allocator,
     interp: *hinting.Interpreter,
+    twilight: hinting.Zone,
     glyf_data: []const u8,
     loca_data: []const u8,
     index_to_loc_format: i16,
@@ -580,7 +518,6 @@ pub fn rasterizeGlyfHinted(
     vmtx_data: []const u8,
     number_of_v_metrics: u16,
     glyph_id: u16,
-    max_twilight_points: u16,
     units_per_em: u16,
     ppem: f32,
     phase: SubpixelOffset,
@@ -591,9 +528,13 @@ pub fn rasterizeGlyfHinted(
     interp.cur_ppem = @intFromFloat(@round(ppem));
     interp.scale = scale;
 
-    var result = try hintGlyphComponentRek(
+    var hinted: HintedOutline = .{};
+    defer hinted.deinit(alloc);
+    const phantoms = try hintGlyphComponentRek(
         alloc,
         interp,
+        twilight,
+        &hinted,
         glyf_data,
         loca_data,
         index_to_loc_format,
@@ -602,22 +543,20 @@ pub fn rasterizeGlyfHinted(
         vmtx_data,
         number_of_v_metrics,
         glyph_id,
-        max_twilight_points,
         scale,
         phase,
         0,
     );
-    defer result.deinit(alloc);
-    if (result.points.len == 0 or result.contours.len == 0) return .empty;
+    if (hinted.points.items.len == 0 or hinted.contours.items.len == 0) return .empty;
 
-    const pp1_x = result.pp1.x;
-    const scaled_points = try alloc.alloc(ScaledPoint, result.points.len);
+    const pp1_x = phantoms[0].x;
+    const scaled_points = try alloc.alloc(ScaledPoint, hinted.points.items.len);
     defer alloc.free(scaled_points);
-    for (result.points, result.tags, 0..) |p, tag, i| {
-        scaled_points[i] = .{ .p = .{ .x = p.x - pp1_x, .y = p.y }, .on = (tag & hinting.on_curve) != 0 };
+    for (hinted.points.items, hinted.tags.items, scaled_points) |p, tag, *scaled_point| {
+        scaled_point.* = .{ .p = .{ .x = p.x - pp1_x, .y = p.y }, .on = (tag & hinting.on_curve) != 0 };
     }
 
-    return common.renderScaledPoints(alloc, output_allocator, scaled_points, result.contours, want_pixels, coverage_lut);
+    return common.renderScaledPoints(alloc, output_allocator, scaled_points, hinted.contours.items, want_pixels, coverage_lut);
 }
 
 pub const VerticalOrigin = struct {

@@ -153,6 +153,8 @@ pub const Renderer = struct {
     /// `fpgm`/`prep` have already run against it by the time `init`
     /// returns, so `renderGlyph` only has to run each glyph's own program.
     glyf_interp: ?hinting.Interpreter,
+    /// Allocated with `glyf_interp`, lives as long as it does.
+    glyf_twilight: ?hinting.Zone,
     max_twilight_points: u16,
     /// From `maxp` -- guards `renderGlyph` against a glyph id from a
     /// mismatched font (stale cache entry, wrong fallback pairing upstream)
@@ -232,13 +234,14 @@ pub const Renderer = struct {
             .number_of_v_metrics = number_of_v_metrics,
             .vary = false,
             .glyf_interp = null,
+            .glyf_twilight = null,
             .max_twilight_points = maxp.max_twilight_points,
         };
         // gvar/cff unwind through their own errdefers above; this covers only
         // what `setPpem` itself allocates.
         errdefer {
             if (renderer.normalized.len != 0) state_allocator.free(renderer.normalized);
-            if (renderer.glyf_interp) |*interp| interp.deinit();
+            renderer.dropGlyfHinting(state_allocator);
         }
 
         try renderer.setPpem(state_allocator, scratch_allocator, ppem, options);
@@ -270,6 +273,10 @@ pub const Renderer = struct {
         if (options.hint_glyf and self.glyf_data != null and ppem < glyf_hinting_ppem_threshold and !self.vary) {
             if (self.glyf_interp == null) self.glyf_interp = try hinting.Interpreter.init(state_allocator, .{});
             const interp = &self.glyf_interp.?;
+            if (self.glyf_twilight == null) self.glyf_twilight = rasterization.allocTwilightZone(state_allocator, self.max_twilight_points, interp.limits) catch |err| {
+                self.dropGlyfHinting(state_allocator);
+                return err;
+            };
 
             // `fpgm`/`prep` persist storage and FDEFs, so a re-target has to
             // replay them from a zeroed storage area to land where a freshly
@@ -284,10 +291,16 @@ pub const Renderer = struct {
             defer scratch_allocator.free(scaled_cvt);
             try interp.setCvt(scaled_cvt);
             try interp.runCvtProgram(self.font.tableData(.{ 'p', 'r', 'e', 'p' }) orelse &.{});
-        } else if (self.glyf_interp) |*interp| {
-            interp.deinit();
-            self.glyf_interp = null;
+        } else {
+            self.dropGlyfHinting(state_allocator);
         }
+    }
+
+    fn dropGlyfHinting(self: *Renderer, state_allocator: std.mem.Allocator) void {
+        if (self.glyf_interp) |*interp| interp.deinit();
+        self.glyf_interp = null;
+        if (self.glyf_twilight) |twilight| rasterization.freeTwilightZone(state_allocator, twilight);
+        self.glyf_twilight = null;
     }
 
     /// Converts a raw font-unit value (e.g. an `hhea` ascender or a GPOS
@@ -307,7 +320,7 @@ pub const Renderer = struct {
             state_allocator.free(h.glyph_offsets);
             if (h.shared_tuples.len != 0) state_allocator.free(h.shared_tuples);
         }
-        if (self.glyf_interp) |*interp| interp.deinit();
+        self.dropGlyfHinting(state_allocator);
         if (self.cff_context) |ctx| state_allocator.destroy(ctx);
     }
 
@@ -351,6 +364,7 @@ pub const Renderer = struct {
                     scratch_allocator,
                     output_allocator,
                     interp,
+                    self.glyf_twilight.?,
                     glyf_table,
                     loca_table,
                     self.head.index_to_loc_format,
@@ -359,7 +373,6 @@ pub const Renderer = struct {
                     self.vmtx_data,
                     self.number_of_v_metrics,
                     glyph_id,
-                    self.max_twilight_points,
                     units_per_em,
                     self.ppem,
                     phase,
