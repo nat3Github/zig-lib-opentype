@@ -34,7 +34,7 @@ pub const Rasterizer = struct {
 
     /// `gray_raster_render` + `gray_convert_glyph`: sweeps `outline` into
     /// `pixels` (`width * height`, zeroed by the caller). `outline` provides
-    /// `decompose(*Rasterizer) OverflowError!void`.
+    /// `decompose(*Rasterizer) OverflowError!void`, replayed once per band.
     pub fn render(scratch_allocator: std.mem.Allocator, pixels: []u8, width: i32, height: i32, outline: anytype) std.mem.Allocator.Error!void {
         const estimate = (@as(usize, @intCast(width)) + @as(usize, @intCast(height))) * 10;
         var stack_cells: [max_stack_cells]Cell = undefined;
@@ -55,11 +55,32 @@ pub const Rasterizer = struct {
             .cell_null = cell_null,
         };
 
-        const count: usize = @intCast(height);
-        @memset(raster.ycells[0..count], cell_null);
-        raster.cell_free = pool.ptr + (count * @sizeOf(*Cell) + @sizeOf(Cell) - 1) / @sizeOf(Cell);
-        outline.decompose(&raster) catch return error.OutOfMemory;
-        raster.sweep(pixels, width);
+        var bands: [32]i32 = undefined;
+        var band_count: usize = 0;
+        while (true) {
+            const count: usize = @intCast(raster.max_ey - raster.min_ey);
+            @memset(raster.ycells[0..count], cell_null);
+            raster.cell_free = pool.ptr + (count * @sizeOf(*Cell) + @sizeOf(Cell) - 1) / @sizeOf(Cell);
+            raster.cell = cell_null;
+            raster.overflow = false;
+
+            if (outline.decompose(&raster)) {
+                raster.sweep(pixels, width);
+                if (band_count == 0) return;
+                raster.max_ey = raster.min_ey;
+                band_count -= 1;
+                raster.min_ey = bands[band_count];
+                continue;
+            } else |_| {}
+
+            const half = count >> 1;
+            // Unreachable: one row holds at most `width + 1` cells and the
+            // pool is at least `10 * (width + height)`.
+            if (half == 0) return error.OutOfMemory;
+            bands[band_count] = raster.min_ey;
+            band_count += 1;
+            raster.min_ey += @intCast(half);
+        }
     }
 
     /// `gray_set_cell`: moves to (or inserts) the cell at `(ex, ey)` in the
