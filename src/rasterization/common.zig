@@ -251,22 +251,10 @@ pub fn renderScaledPoints(
         sp.p.y -= 64 * y_min_px;
     }
 
-    var raster = try Rasterizer.init(scratch_allocator, width, height);
-    defer raster.deinit();
-
-    // parsing.zig rejects non-monotonic end points, but composite glyphs
-    // assemble their own list here, so skip rather than slice-panic.
-    var contour_start: usize = 0;
-    for (end_points_of_contours) |end_index| {
-        defer contour_start = @as(usize, end_index) + 1;
-        if (end_index < contour_start or end_index >= points.len) continue;
-        const contour = points[contour_start .. @as(usize, end_index) + 1];
-        try decomposeContour(&raster, contour);
-    }
-
     const pixels = try output_allocator.alloc(u8, @as(usize, @intCast(width)) * @as(usize, @intCast(height)));
+    errdefer output_allocator.free(pixels);
     @memset(pixels, 0);
-    raster.sweep(pixels, width);
+    try Rasterizer.render(scratch_allocator, pixels, width, height, GlyfContours{ .points = points, .end_points_of_contours = end_points_of_contours });
 
     return .{
         .width = @intCast(width),
@@ -325,14 +313,10 @@ pub fn renderScaledCffSegments(scratch_allocator: std.mem.Allocator, output_allo
         }
     }
 
-    var raster = try Rasterizer.init(scratch_allocator, width, height);
-    defer raster.deinit();
-
-    try Rasterizer.decomposeCffSegments(&raster, segments);
-
     const pixels = try output_allocator.alloc(u8, @as(usize, @intCast(width)) * @as(usize, @intCast(height)));
+    errdefer output_allocator.free(pixels);
     @memset(pixels, 0);
-    raster.sweep(pixels, width);
+    try Rasterizer.render(scratch_allocator, pixels, width, height, CffSegments{ .segments = segments });
 
     return .{
         .width = @intCast(width),
@@ -427,10 +411,34 @@ pub fn lerp(a: f32, b: f32, f: f64) f32 {
     return @floatCast(@as(f64, a) + (@as(f64, b) - @as(f64, a)) * f);
 }
 
+pub const CffSegments = struct {
+    segments: []const IScaledCffSegment,
+
+    pub fn decompose(self: CffSegments, raster: *Rasterizer) Rasterizer.OverflowError!void {
+        try raster.decomposeCffSegments(self.segments);
+    }
+};
+
+const GlyfContours = struct {
+    points: []const ScaledPoint,
+    end_points_of_contours: []const u16,
+
+    pub fn decompose(self: GlyfContours, raster: *Rasterizer) Rasterizer.OverflowError!void {
+        // parsing.zig rejects non-monotonic end points, but composite glyphs
+        // assemble their own list here, so skip rather than slice-panic.
+        var contour_start: usize = 0;
+        for (self.end_points_of_contours) |end_index| {
+            defer contour_start = @as(usize, end_index) + 1;
+            if (end_index < contour_start or end_index >= self.points.len) continue;
+            try decomposeContour(raster, self.points[contour_start .. @as(usize, end_index) + 1]);
+        }
+    }
+};
+
 /// TrueType on/off-curve contour decoding (implied on-curve midpoints
 /// between consecutive off-curve points), matching `FT_Outline_Decompose`'s
 /// conic handling specialized to `glyf`'s quadratic-only outlines.
-fn decomposeContour(raster: *Rasterizer, points: []const ScaledPoint) !void {
+fn decomposeContour(raster: *Rasterizer, points: []const ScaledPoint) Rasterizer.OverflowError!void {
     const n = points.len;
     if (n == 0) return;
 

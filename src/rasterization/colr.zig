@@ -515,14 +515,10 @@ fn rasterizeCffAffine(alloc: Allocator, outline: parsing.Table.cff.Outline, matr
         }
     }
 
-    var raster = try Rasterizer.init(alloc, width, height);
-    defer raster.deinit();
-
-    try raster.decomposeCffSegments(scaled);
-
     const pixels = try alloc.alloc(u8, @as(usize, @intCast(width)) * @as(usize, @intCast(height)));
+    errdefer alloc.free(pixels);
     @memset(pixels, 0);
-    raster.sweep(pixels, width);
+    try Rasterizer.render(alloc, pixels, width, height, common.CffSegments{ .segments = scaled });
 
     return .{ .width = @intCast(width), .rows = @intCast(height), .left = x_min_px, .top = y_max_px, .pixels_row_major = pixels };
 }

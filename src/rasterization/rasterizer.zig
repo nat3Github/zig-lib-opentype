@@ -9,78 +9,96 @@ const one_pixel = common.one_pixel;
 const ScaledPoint = common.ScaledPoint;
 const fillRuleNonZero = common.fillRuleNonZero;
 
-const RowCell = struct { x: i32, cover: i32 = 0, area: i64 = 0 };
-const CellRef = struct { row: usize, index: usize };
+/// `TCell`: 24 bytes, same as FreeType's, so the pool holds as many cells.
+const Cell = struct { x: i32, cover: i32, area: i64, next: *Cell };
+
+/// `FT_RENDER_POOL_SIZE / sizeof(TCell)`.
+const max_stack_cells = 16384 / @sizeOf(Cell);
 
 pub const Rasterizer = struct {
-    allocator: std.mem.Allocator,
+    pub const OverflowError = error{RasterOverflow};
+
+    min_ey: i32,
     max_ex: i32,
     max_ey: i32,
-    rows: []std.ArrayListUnmanaged(RowCell),
+    pixel_rows: i32,
+
+    ycells: [*]*Cell,
+    cell: *Cell,
+    cell_free: [*]Cell,
+    cell_null: *Cell,
+    overflow: bool = false,
 
     x: i32 = 0,
     y: i32 = 0,
-    current: ?CellRef = null,
 
-    pub fn init(allocator: std.mem.Allocator, width: i32, height: i32) !Rasterizer {
-        const rows = try allocator.alloc(std.ArrayListUnmanaged(RowCell), @intCast(height));
-        for (rows) |*row| row.* = .empty;
-        return .{ .allocator = allocator, .max_ex = width, .max_ey = height, .rows = rows };
+    /// `gray_raster_render` + `gray_convert_glyph`: sweeps `outline` into
+    /// `pixels` (`width * height`, zeroed by the caller). `outline` provides
+    /// `decompose(*Rasterizer) OverflowError!void`.
+    pub fn render(scratch_allocator: std.mem.Allocator, pixels: []u8, width: i32, height: i32, outline: anytype) std.mem.Allocator.Error!void {
+        const estimate = (@as(usize, @intCast(width)) + @as(usize, @intCast(height))) * 10;
+        var stack_cells: [max_stack_cells]Cell = undefined;
+        const heap_cells: ?[]Cell = if (estimate > max_stack_cells) try scratch_allocator.alloc(Cell, estimate) else null;
+        defer if (heap_cells) |cells| scratch_allocator.free(cells);
+        const pool: []Cell = heap_cells orelse &stack_cells;
+
+        const cell_null = &pool[pool.len - 1];
+        cell_null.* = .{ .x = std.math.maxInt(i32), .cover = 0, .area = 0, .next = cell_null };
+        var raster: Rasterizer = .{
+            .min_ey = 0,
+            .max_ex = width,
+            .max_ey = height,
+            .pixel_rows = height,
+            .ycells = @ptrCast(pool.ptr),
+            .cell = cell_null,
+            .cell_free = pool.ptr,
+            .cell_null = cell_null,
+        };
+
+        const count: usize = @intCast(height);
+        @memset(raster.ycells[0..count], cell_null);
+        raster.cell_free = pool.ptr + (count * @sizeOf(*Cell) + @sizeOf(Cell) - 1) / @sizeOf(Cell);
+        outline.decompose(&raster) catch return error.OutOfMemory;
+        raster.sweep(pixels, width);
     }
 
-    pub fn deinit(self: *Rasterizer) void {
-        for (self.rows) |*row| row.deinit(self.allocator);
-        self.allocator.free(self.rows);
-    }
-
-    /// `gray_set_cell`: move to (or insert) the cell at `(ex, ey)`, keeping
-    /// each row's cell list sorted by `x`. Cells left of the bitmap clamp
-    /// to `x = -1` (still tracked, so their coverage contributes to the
-    /// running sweep total); cells at/right of `max_ex`, or outside the
-    /// vertical range, are dropped (`self.current = null`).
-    fn setCell(self: *Rasterizer, ex_in: i32, ey: i32) !void {
-        if (ey < 0 or ey >= self.max_ey or ex_in >= self.max_ex) {
-            self.current = null;
+    /// `gray_set_cell`: moves to (or inserts) the cell at `(ex, ey)` in the
+    /// row's x-sorted list. Cells left of the bitmap clamp to `x = -1`;
+    /// anything outside the band, or at/right of `max_ex`, goes to the
+    /// `cell_null` dumpster, as does a new cell once the pool is full.
+    fn setCell(self: *Rasterizer, ex_in: i32, ey: i32) void {
+        if (ey < self.min_ey or ey >= self.max_ey or ex_in >= self.max_ex) {
+            self.cell = self.cell_null;
             return;
         }
         const ex = @max(ex_in, -1);
-        const row_index: usize = @intCast(ey);
-        const row = &self.rows[row_index];
-
-        // Consecutive calls almost always land on the same cell, or append to
-        // the right end of the row; both skip the search entirely.
-        if (self.current) |cur| {
-            if (cur.row == row_index and row.items[cur.index].x == ex) return;
+        var link: **Cell = &self.ycells[@intCast(ey - self.min_ey)];
+        while (true) {
+            const cell = link.*;
+            if (cell.x > ex) break;
+            if (cell.x == ex) {
+                self.cell = cell;
+                return;
+            }
+            link = &cell.next;
         }
-        if (row.items.len > 0 and row.items[row.items.len - 1].x < ex) {
-            try row.append(self.allocator, .{ .x = ex });
-            self.current = .{ .row = row_index, .index = row.items.len - 1 };
+
+        if (&self.cell_free[0] == self.cell_null) {
+            self.overflow = true;
+            self.cell = self.cell_null;
             return;
         }
-
-        var lo: usize = 0;
-        var hi: usize = row.items.len;
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            if (row.items[mid].x < ex) lo = mid + 1 else hi = mid;
-        }
-        const i = lo;
-
-        if (i < row.items.len and row.items[i].x == ex) {
-            self.current = .{ .row = row_index, .index = i };
-            return;
-        }
-
-        try row.insert(self.allocator, i, .{ .x = ex });
-        self.current = .{ .row = row_index, .index = i };
+        const cell = &self.cell_free[0];
+        self.cell_free += 1;
+        cell.* = .{ .x = ex, .cover = 0, .area = 0, .next = link.* };
+        link.* = cell;
+        self.cell = cell;
     }
 
     /// `FT_INTEGRATE`.
     fn integrate(self: *Rasterizer, a: i32, b: i32) void {
-        const cur = self.current orelse return;
-        const cell = &self.rows[cur.row].items[cur.index];
-        cell.cover += a;
-        cell.area += @as(i64, a) * @as(i64, b);
+        self.cell.cover += a;
+        self.cell.area += @as(i64, a) * @as(i64, b);
     }
 
     /// `FT_UDIV`: reciprocal-multiply division used by `renderLine`'s
@@ -104,11 +122,11 @@ pub const Rasterizer = struct {
     /// builds use, since 64-bit integers are available on essentially
     /// every target today): walks cell-by-cell along the line using a
     /// side-tracking `prod` value instead of scanline decomposition.
-    fn renderLine(self: *Rasterizer, to_x: i32, to_y: i32) !void {
+    fn renderLine(self: *Rasterizer, to_x: i32, to_y: i32) void {
         var ey1 = trunc(self.y);
         const ey2 = trunc(to_y);
 
-        if ((ey1 >= self.max_ey and ey2 >= self.max_ey) or (ey1 < 0 and ey2 < 0)) {
+        if ((ey1 >= self.max_ey and ey2 >= self.max_ey) or (ey1 < self.min_ey and ey2 < self.min_ey)) {
             self.x = to_x;
             self.y = to_y;
             return;
@@ -126,7 +144,7 @@ pub const Rasterizer = struct {
         if (ex1 == ex2 and ey1 == ey2) {
             // inside one cell: nothing to do before the tail integrate.
         } else if (dy == 0) {
-            try self.setCell(ex2, ey2);
+            self.setCell(ex2, ey2);
             self.x = to_x;
             self.y = to_y;
             return;
@@ -138,7 +156,7 @@ pub const Rasterizer = struct {
                     self.integrate(fy2 - fy1, fx1 * 2);
                     fy1 = 0;
                     ey1 += 1;
-                    try self.setCell(ex1, ey1);
+                    self.setCell(ex1, ey1);
                     if (ey1 == ey2) break;
                 }
             } else {
@@ -147,7 +165,7 @@ pub const Rasterizer = struct {
                     self.integrate(fy2 - fy1, fx1 * 2);
                     fy1 = one_pixel;
                     ey1 -= 1;
-                    try self.setCell(ex1, ey1);
+                    self.setCell(ex1, ey1);
                     if (ey1 == ey2) break;
                 }
             }
@@ -196,7 +214,7 @@ pub const Rasterizer = struct {
                     ey1 -= 1;
                 }
 
-                try self.setCell(ex1, ey1);
+                self.setCell(ex1, ey1);
                 if (ex1 == ex2 and ey1 == ey2) break;
             }
         }
@@ -213,14 +231,14 @@ pub const Rasterizer = struct {
     /// arc by fixed-step DDA (the arc's second difference is constant,
     /// so each step is `P += Q; Q += R`) rather than recursive bisection.
     /// `control`/`to` are 26.6 (matching `self.x`/`self.y`, already 24.8).
-    fn renderConic(self: *Rasterizer, control: IPoint, to: IPoint) !void {
+    fn renderConic(self: *Rasterizer, control: IPoint, to: IPoint) void {
         const p0 = IPoint{ .x = self.x, .y = self.y };
         const p1 = IPoint{ .x = upscale(control.x), .y = upscale(control.y) };
         const p2 = IPoint{ .x = upscale(to.x), .y = upscale(to.y) };
 
         const above = self.max_ey;
         if ((trunc(p0.y) >= above and trunc(p1.y) >= above and trunc(p2.y) >= above) or
-            (trunc(p0.y) < 0 and trunc(p1.y) < 0 and trunc(p2.y) < 0))
+            (trunc(p0.y) < self.min_ey and trunc(p1.y) < self.min_ey and trunc(p2.y) < self.min_ey))
         {
             self.x = p2.x;
             self.y = p2.y;
@@ -237,7 +255,7 @@ pub const Rasterizer = struct {
         if (dx < dy) dx = dy;
 
         if (dx <= one_pixel / 4) {
-            try self.renderLine(p2.x, p2.y);
+            self.renderLine(p2.x, p2.y);
             return;
         }
 
@@ -267,7 +285,7 @@ pub const Rasterizer = struct {
             py += qy;
             qx += rx;
             qy += ry;
-            try self.renderLine(@intCast(px >> 32), @intCast(py >> 32));
+            self.renderLine(@intCast(px >> 32), @intCast(py >> 32));
             count -= 1;
             if (count == 0) break;
         }
@@ -308,7 +326,7 @@ pub const Rasterizer = struct {
     /// (the `FT_INT64` conic DDA trick doesn't extend to cubics — FreeType
     /// itself falls back to bisection here). `control1`/`control2`/`to` are
     /// 26.6 (matching `self.x`/`self.y`, already 24.8 after `upscale`).
-    fn renderCubic(self: *Rasterizer, control1: IPoint, control2: IPoint, to: IPoint) !void {
+    fn renderCubic(self: *Rasterizer, control1: IPoint, control2: IPoint, to: IPoint) void {
         var bez_stack: [16 * 3 + 1]IPoint = undefined;
         var arc: usize = 0;
 
@@ -320,8 +338,8 @@ pub const Rasterizer = struct {
         const above = self.max_ey;
         if ((trunc(bez_stack[0].y) >= above and trunc(bez_stack[1].y) >= above and
             trunc(bez_stack[2].y) >= above and trunc(bez_stack[3].y) >= above) or
-            (trunc(bez_stack[0].y) < 0 and trunc(bez_stack[1].y) < 0 and
-                trunc(bez_stack[2].y) < 0 and trunc(bez_stack[3].y) < 0))
+            (trunc(bez_stack[0].y) < self.min_ey and trunc(bez_stack[1].y) < self.min_ey and
+                trunc(bez_stack[2].y) < self.min_ey and trunc(bez_stack[3].y) < self.min_ey))
         {
             self.x = bez_stack[0].x;
             self.y = bez_stack[0].y;
@@ -344,45 +362,48 @@ pub const Rasterizer = struct {
                 continue;
             }
 
-            try self.renderLine(a0.x, a0.y);
+            self.renderLine(a0.x, a0.y);
             if (arc == 0) return;
             arc -= 3;
         }
     }
 
-    pub fn moveTo(self: *Rasterizer, to: IPoint) !void {
+    pub fn moveTo(self: *Rasterizer, to: IPoint) OverflowError!void {
         const x = upscale(to.x);
         const y = upscale(to.y);
-        try self.setCell(trunc(x), trunc(y));
+        self.setCell(trunc(x), trunc(y));
         self.x = x;
         self.y = y;
+        if (self.overflow) return error.RasterOverflow;
     }
 
-    pub fn lineTo(self: *Rasterizer, to: IPoint) !void {
-        try self.renderLine(upscale(to.x), upscale(to.y));
+    pub fn lineTo(self: *Rasterizer, to: IPoint) OverflowError!void {
+        self.renderLine(upscale(to.x), upscale(to.y));
+        if (self.overflow) return error.RasterOverflow;
     }
 
-    pub fn conicTo(self: *Rasterizer, control: IPoint, to: IPoint) !void {
-        try self.renderConic(control, to);
+    pub fn conicTo(self: *Rasterizer, control: IPoint, to: IPoint) OverflowError!void {
+        self.renderConic(control, to);
+        if (self.overflow) return error.RasterOverflow;
     }
 
-    fn cubicTo(self: *Rasterizer, control1: IPoint, control2: IPoint, to: IPoint) !void {
-        try self.renderCubic(control1, control2, to);
+    fn cubicTo(self: *Rasterizer, control1: IPoint, control2: IPoint, to: IPoint) OverflowError!void {
+        self.renderCubic(control1, control2, to);
+        if (self.overflow) return error.RasterOverflow;
     }
 
-    /// `gray_sweep`: turn accumulated per-cell area into gray spans.
-    /// Row 0 of `pixels` is the top of the glyph (`max_ey - 1`); cell-space
-    /// `y` increases upward from the bitmap's bottom row.
-    pub fn sweep(self: *Rasterizer, pixels: []u8, width: i32) void {
-        var y: i32 = 0;
+    /// `gray_sweep` over the current band. Row 0 of `pixels` is the top of
+    /// the glyph; cell-space `y` increases upward from the bottom row.
+    fn sweep(self: *Rasterizer, pixels: []u8, width: i32) void {
+        var y: i32 = self.min_ey;
         while (y < self.max_ey) : (y += 1) {
-            const cells = self.rows[@as(usize, @intCast(y))].items;
-            const pixel_row: usize = @intCast(self.max_ey - 1 - y);
+            const pixel_row: usize = @intCast(self.pixel_rows - 1 - y);
             const row = pixels[pixel_row * @as(usize, @intCast(width)) ..][0..@intCast(width)];
 
             var x: i32 = 0;
             var cover: i64 = 0;
-            for (cells) |cell| {
+            var cell = self.ycells[@intCast(y - self.min_ey)];
+            while (cell != self.cell_null) : (cell = cell.next) {
                 if (cover != 0 and cell.x > x) {
                     fillSpan(row, x, cell.x - x, fillRuleNonZero(cover));
                 }
@@ -411,7 +432,7 @@ pub const Rasterizer = struct {
     /// CFF Type2 charstrings never encode an explicit closing segment — a
     /// contour implicitly closes back to its `move_to` point, matching
     /// `psaux`'s `cff_builder_close_contour`.
-    pub fn decomposeCffSegments(raster: *Rasterizer, segments: []const common.IScaledCffSegment) !void {
+    pub fn decomposeCffSegments(raster: *Rasterizer, segments: []const common.IScaledCffSegment) OverflowError!void {
         var contour_start: ?IPoint = null;
         for (segments) |segment| {
             switch (segment) {
