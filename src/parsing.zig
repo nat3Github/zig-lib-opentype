@@ -553,12 +553,20 @@ pub const Table = struct {
         /// hinting-related fields — safe, since CFF glyphs never reach the
         /// TrueType bytecode interpreter.
         max_twilight_points: u16 = 0,
+        max_storage: u16 = 0,
+        max_function_defs: u16 = 0,
+        max_instruction_defs: u16 = 0,
+        max_stack_elements: u16 = 0,
 
         pub fn parse(data: []const u8) Font.ParseError!maxp {
             if (data.len < 6) return error.InvalidTableFormat;
             return .{
                 .num_glyphs = std.mem.readInt(u16, data[4..][0..2], .big),
                 .max_twilight_points = if (data.len >= 18) std.mem.readInt(u16, data[16..][0..2], .big) else 0,
+                .max_storage = if (data.len >= 20) std.mem.readInt(u16, data[18..][0..2], .big) else 0,
+                .max_function_defs = if (data.len >= 22) std.mem.readInt(u16, data[20..][0..2], .big) else 0,
+                .max_instruction_defs = if (data.len >= 24) std.mem.readInt(u16, data[22..][0..2], .big) else 0,
+                .max_stack_elements = if (data.len >= 26) std.mem.readInt(u16, data[24..][0..2], .big) else 0,
             };
         }
     };

@@ -119,6 +119,26 @@ pub const Limits = struct {
     max_call_depth: u32 = 64,
     max_twilight_points: u32 = 4096,
     max_instructions: u32 = 1_000_000,
+
+    /// FreeType's `tt_size_init_bytecode` sizing: arrays as declared in
+    /// `maxp`, the stack with 50% (at least 128) slack for fonts whose
+    /// bytecode overshoots `maxStackElements`. `caps` still bounds every
+    /// field, since `maxp` is attacker-controlled.
+    pub fn fromMaxp(
+        caps: Limits,
+        max_stack_elements: u16,
+        max_storage: u16,
+        max_function_defs: u16,
+        max_instruction_defs: u16,
+    ) Limits {
+        var limits = caps;
+        const stack_size = @as(u32, max_stack_elements) + @max(max_stack_elements / 2, 128);
+        limits.max_stack = @min(stack_size, caps.max_stack);
+        limits.max_storage = @min(max_storage, caps.max_storage);
+        limits.max_function_defs = @min(max_function_defs, caps.max_function_defs);
+        limits.max_instruction_defs = @min(max_instruction_defs, caps.max_instruction_defs);
+        return limits;
+    }
 };
 
 pub const Error = error{

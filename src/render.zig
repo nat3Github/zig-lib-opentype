@@ -158,6 +158,7 @@ pub const Renderer = struct {
     /// Taken after the first `fpgm` run, lives as long as `glyf_interp`.
     glyf_font_program: ?hinting.FontProgramSnapshot,
     max_twilight_points: u16,
+    hinting_limits: hinting.Limits,
     /// From `maxp` -- guards `renderGlyph` against a glyph id from a
     /// mismatched font (stale cache entry, wrong fallback pairing upstream)
     /// that would otherwise read past `loca`/a charstring offset array.
@@ -235,6 +236,7 @@ pub const Renderer = struct {
             .glyf_twilight = null,
             .glyf_font_program = null,
             .max_twilight_points = maxp.max_twilight_points,
+            .hinting_limits = hinting.Limits.fromMaxp(.{}, maxp.max_stack_elements, maxp.max_storage, maxp.max_function_defs, maxp.max_instruction_defs),
         };
         // gvar/cff unwind through their own errdefers above; this covers only
         // what `setPpem` itself allocates.
@@ -270,7 +272,7 @@ pub const Renderer = struct {
         self.vary = self.gvar_header != null and anyNonDefault(normalized);
 
         if (options.hint_glyf and self.glyf_data != null and ppem < glyf_hinting_ppem_threshold and !self.vary) {
-            if (self.glyf_interp == null) self.glyf_interp = try hinting.Interpreter.init(state_allocator, .{});
+            if (self.glyf_interp == null) self.glyf_interp = try hinting.Interpreter.init(state_allocator, self.hinting_limits);
             const interp = &self.glyf_interp.?;
             if (self.glyf_twilight == null) self.glyf_twilight = rasterization.allocTwilightZone(state_allocator, self.max_twilight_points, interp.limits) catch |err| {
                 self.dropGlyfHinting(state_allocator);
